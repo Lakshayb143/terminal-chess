@@ -1,6 +1,7 @@
 //! Interactive terminal input with conservative, click-only mouse tracking.
 
 use std::io::{self, Write};
+use std::time::Duration;
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -14,6 +15,8 @@ pub enum Action {
     Cancel,
     Prompt,
     Resize,
+    Tick,
+    History { older: bool },
     Quit,
 }
 
@@ -76,21 +79,30 @@ impl TerminalInput {
         Ok(())
     }
 
-    /// Block until a complete command or an event the game cares about.
-    pub fn read(&mut self) -> Result<Action, String> {
+    /// Wait for a complete command or an event the game cares about. The
+    /// timeout lets clocks advance even while nobody is pressing a key.
+    pub fn read_for(&mut self, timeout: Duration) -> Result<Action, String> {
         loop {
+            if !event::poll(timeout)
+                .map_err(|e| format!("could not poll terminal input: {}", e))?
+            {
+                return Ok(Action::Tick);
+            }
             let event =
                 event::read().map_err(|e| format!("could not read terminal input: {}", e))?;
             match event {
                 Event::Resize(_, _) => return Ok(Action::Resize),
-                Event::Mouse(mouse) => {
-                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
                         return Ok(Action::Click {
                             column: mouse.column,
                             row: mouse.row,
                         });
                     }
-                }
+                    MouseEventKind::ScrollUp => return Ok(Action::History { older: true }),
+                    MouseEventKind::ScrollDown => return Ok(Action::History { older: false }),
+                    _ => {}
+                },
                 Event::Paste(text) => {
                     for c in text.chars().take_while(|&c| c != '\r' && c != '\n') {
                         if !c.is_control() {
@@ -133,6 +145,8 @@ impl TerminalInput {
                 self.buffer.pop();
                 Some(Action::Prompt)
             }
+            KeyCode::PageUp if self.buffer.is_empty() => Some(Action::History { older: true }),
+            KeyCode::PageDown if self.buffer.is_empty() => Some(Action::History { older: false }),
             KeyCode::Char(c) if !c.is_control() => {
                 self.buffer.push(c);
                 Some(Action::Prompt)

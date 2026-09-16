@@ -249,10 +249,22 @@ impl Metrics {
     /// the status line, the notes and the prompt, plus the blank lines
     /// between them that a short window does without.
     pub fn fit(cols: usize, rows: usize, pieces: Pieces) -> Metrics {
+        Metrics::fit_with_reserve(cols, rows, pieces, 0)
+    }
+
+    /// Fit a board while reserving additional rows for a compact information
+    /// panel below it. Width only constrains the board itself; whether a side
+    /// panel fits is a separate, content-driven layout decision.
+    pub fn fit_with_reserve(
+        cols: usize,
+        rows: usize,
+        pieces: Pieces,
+        extra_rows: usize,
+    ) -> Metrics {
         let reserve = if tight(rows) { 7 } else { 11 };
+        let reserve = reserve + extra_rows;
         let mut cell_h = (rows.saturating_sub(reserve) / 8).clamp(1, 8);
-        // The panel beside the board wants about 26 columns to be worth having.
-        while cell_h > 1 && GUTTER * 2 + 8 * (2 * cell_h) + 4 + 26 > cols {
+        while cell_h > 1 && GUTTER * 2 + 8 * (2 * cell_h) + 2 > cols {
             cell_h -= 1;
         }
         let cell_w = if cell_h == 1 { 3 } else { 2 * cell_h };

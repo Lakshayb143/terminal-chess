@@ -10,7 +10,7 @@ mod sound;
 mod ui;
 
 use std::io::{self, BufRead, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use board::{Color, Move, MoveKind, Piece, PieceKind, Position, Undo};
 use input::{Action as InputAction, TerminalInput};
@@ -62,6 +62,9 @@ struct Options {
     /// Keep the old small board rather than filling the window.
     compact: bool,
     sound: sound::Mode,
+    /// Each player's starting time. `None` is an untimed game.
+    clock: Option<Duration>,
+    increment: Duration,
 }
 
 const HELP: &str = "\
@@ -77,6 +80,9 @@ GAME:
     -t, --time <SECS>    seconds the engine may think per move (default: 3)
     -d, --depth <N>      cap the search depth; without --time, search to
                          exactly this depth however long it takes
+        --clock <MINS>   starting time for each player (default: 10)
+        --increment <S>  seconds added after each move (default: 0)
+        --no-clock       play without chess clocks
         --fen <FEN>      start from a position rather than the initial one
                          (quote it: it contains spaces)
 
@@ -112,6 +118,8 @@ impl Options {
             pieces: ui::Pieces::Auto,
             compact: false,
             sound: sound::Mode::Auto,
+            clock: Some(Duration::from_secs(10 * 60)),
+            increment: Duration::ZERO,
         };
         // Tracked so that `--depth` alone means "this depth, no clock", while
         // `--depth` with `--time` means "this depth, but stop when time runs out".
@@ -177,6 +185,27 @@ impl Options {
                         options.limits.movetime = None;
                     }
                 }
+                "--clock" => {
+                    let text = value("--clock")?;
+                    let minutes: f64 = text
+                        .parse()
+                        .map_err(|_| format!("--clock wants minutes, not '{}'", text))?;
+                    if !(minutes.is_finite() && minutes > 0.0) {
+                        return Err(format!("--clock must be positive, got '{}'", text));
+                    }
+                    options.clock = Some(Duration::from_secs_f64(minutes * 60.0));
+                }
+                "--increment" => {
+                    let text = value("--increment")?;
+                    let seconds: f64 = text
+                        .parse()
+                        .map_err(|_| format!("--increment wants seconds, not '{}'", text))?;
+                    if !(seconds.is_finite() && seconds >= 0.0) {
+                        return Err(format!("--increment cannot be negative, got '{}'", text));
+                    }
+                    options.increment = Duration::from_secs_f64(seconds);
+                }
+                "--no-clock" => options.clock = None,
                 "--fen" => options.fen = Some(value("--fen")?),
                 other => return Err(format!("unknown option '{}'", other)),
             }
@@ -193,6 +222,128 @@ impl Options {
 // Game state
 // ---------------------------------------------------------------------------
 
+struct GameClock {
+    initial: Option<Duration>,
+    increment: Duration,
+    remaining: [Duration; 2],
+    running: Option<(Color, Instant)>,
+    flagged: Option<Color>,
+    shown_seconds: [u64; 2],
+}
+
+impl GameClock {
+    fn new(initial: Option<Duration>, increment: Duration, side: Color) -> GameClock {
+        let time = initial.unwrap_or(Duration::ZERO);
+        let seconds = shown_seconds(time);
+        GameClock {
+            initial,
+            increment,
+            remaining: [time; 2],
+            running: initial.map(|_| (side, Instant::now())),
+            flagged: None,
+            shown_seconds: [seconds; 2],
+        }
+    }
+
+    fn tick(&mut self) -> bool {
+        let flagged_before = self.flagged;
+        self.sync();
+        let shown = [
+            shown_seconds(self.remaining[Color::White.index()]),
+            shown_seconds(self.remaining[Color::Black.index()]),
+        ];
+        let changed = shown != self.shown_seconds || self.flagged != flagged_before;
+        self.shown_seconds = shown;
+        changed
+    }
+
+    fn complete_move(&mut self, mover: Color, next: Color) {
+        self.sync();
+        if self.flagged.is_some() || self.initial.is_none() {
+            return;
+        }
+        self.remaining[mover.index()] += self.increment;
+        self.running = Some((next, Instant::now()));
+        self.remember_shown();
+    }
+
+    fn pause(&mut self) {
+        self.sync();
+        self.running = None;
+        self.remember_shown();
+    }
+
+    fn resume(&mut self, side: Color) {
+        if self.initial.is_none() {
+            return;
+        }
+        self.flagged = None;
+        self.running = Some((side, Instant::now()));
+        self.remember_shown();
+    }
+
+    fn reset(&mut self, side: Color) {
+        let time = self.initial.unwrap_or(Duration::ZERO);
+        self.remaining = [time; 2];
+        self.flagged = None;
+        self.running = self.initial.map(|_| (side, Instant::now()));
+        self.remember_shown();
+    }
+
+    fn remaining(&self, color: Color) -> Option<Duration> {
+        self.initial?;
+        let stored = self.remaining[color.index()];
+        match self.running {
+            Some((running, since)) if running == color => {
+                Some(stored.saturating_sub(since.elapsed()))
+            }
+            _ => Some(stored),
+        }
+    }
+
+    fn format(&self, color: Color) -> String {
+        let Some(remaining) = self.remaining(color) else {
+            return "UNTIMED".to_string();
+        };
+        let total = shown_seconds(remaining);
+        if total >= 60 {
+            format!("{}:{:02}", total / 60, total % 60)
+        } else {
+            format!("0:{:02}", total)
+        }
+    }
+
+    fn low(&self, color: Color) -> bool {
+        self.remaining(color)
+            .is_some_and(|time| time <= Duration::from_secs(30))
+    }
+
+    fn sync(&mut self) {
+        let Some((color, since)) = self.running else {
+            return;
+        };
+        let remaining = &mut self.remaining[color.index()];
+        *remaining = remaining.saturating_sub(since.elapsed());
+        if remaining.is_zero() {
+            self.flagged = Some(color);
+            self.running = None;
+        } else {
+            self.running = Some((color, Instant::now()));
+        }
+    }
+
+    fn remember_shown(&mut self) {
+        self.shown_seconds = [
+            shown_seconds(self.remaining[Color::White.index()]),
+            shown_seconds(self.remaining[Color::Black.index()]),
+        ];
+    }
+}
+
+fn shown_seconds(time: Duration) -> u64 {
+    time.as_millis().div_ceil(1000).min(u64::MAX as u128) as u64
+}
+
 struct Game {
     pos: Position,
     /// The position every `new` returns to.
@@ -205,10 +356,20 @@ struct Game {
     hashes: Vec<u64>,
     /// Set when someone gives up. Nothing else ends a game early.
     resigned: Option<Color>,
+    /// A draw offer remains live until the opponent accepts or plays a move.
+    draw_offer: Option<Color>,
+    agreed_draw: bool,
+    clock: GameClock,
 }
 
 impl Game {
+    #[cfg(test)]
     fn new(start: Position) -> Game {
+        Game::with_clock(start, None, Duration::ZERO)
+    }
+
+    fn with_clock(start: Position, initial: Option<Duration>, increment: Duration) -> Game {
+        let side = start.side;
         Game {
             pos: start.clone(),
             hashes: vec![start.hash],
@@ -216,15 +377,23 @@ impl Game {
             undos: Vec::new(),
             sans: Vec::new(),
             resigned: None,
+            draw_offer: None,
+            agreed_draw: false,
+            clock: GameClock::new(initial, increment, side),
         }
     }
 
     fn play(&mut self, mv: Move) -> String {
+        let mover = self.pos.side;
+        if self.draw_offer == Some(mover.flip()) {
+            self.draw_offer = None;
+        }
         let text = to_san(&self.pos, mv);
         let undo = self.pos.make_move(mv);
         self.undos.push(undo);
         self.sans.push(text.clone());
         self.hashes.push(self.pos.hash);
+        self.clock.complete_move(mover, self.pos.side);
         text
     }
 
@@ -233,11 +402,21 @@ impl Game {
         self.pos.unmake_move(undo);
         self.hashes.pop();
         self.resigned = None;
+        self.draw_offer = None;
+        self.agreed_draw = false;
+        self.clock.resume(self.pos.side);
         self.sans.pop()
     }
 
     fn restart(&mut self) {
-        *self = Game::new(self.start.clone());
+        self.pos = self.start.clone();
+        self.undos.clear();
+        self.sans.clear();
+        self.hashes = vec![self.start.hash];
+        self.resigned = None;
+        self.draw_offer = None;
+        self.agreed_draw = false;
+        self.clock.reset(self.pos.side);
     }
 
     fn last_move(&self) -> Option<Move> {
@@ -292,6 +471,8 @@ enum Outcome {
     Checkmate(Color),
     /// Carries the side that gave up.
     Resignation(Color),
+    Timeout(Color),
+    DrawAgreement,
     Stalemate,
     FiftyMove,
     Threefold,
@@ -301,6 +482,12 @@ enum Outcome {
 fn outcome(game: &Game) -> Option<Outcome> {
     if let Some(color) = game.resigned {
         return Some(Outcome::Resignation(color));
+    }
+    if game.agreed_draw {
+        return Some(Outcome::DrawAgreement);
+    }
+    if let Some(color) = game.clock.flagged {
+        return Some(Outcome::Timeout(color));
     }
     let pos = &game.pos;
     if generate_legal(pos).is_empty() {
@@ -328,6 +515,10 @@ fn describe(result: &Outcome) -> String {
         Outcome::Resignation(loser) => {
             format!("{} resigns - {} wins", loser.name(), loser.flip().name())
         }
+        Outcome::Timeout(loser) => {
+            format!("{} runs out of time - {} wins", loser.name(), loser.flip().name())
+        }
+        Outcome::DrawAgreement => "Draw by agreement".to_string(),
         Outcome::Stalemate => "Stalemate - the game is drawn".to_string(),
         Outcome::FiftyMove => "Drawn by the fifty-move rule".to_string(),
         Outcome::Threefold => "Drawn by threefold repetition".to_string(),
@@ -335,11 +526,29 @@ fn describe(result: &Outcome) -> String {
     }
 }
 
+/// A compact result explanation for the fixed-width side panel.
+fn outcome_detail(result: &Outcome) -> String {
+    match result {
+        Outcome::Checkmate(winner) => format!("{} wins", winner.name()),
+        Outcome::Resignation(loser) => format!("{} resigned", loser.name()),
+        Outcome::Timeout(loser) => format!("{} lost on time", loser.name()),
+        Outcome::DrawAgreement => "By agreement".to_string(),
+        Outcome::Stalemate => "Stalemate".to_string(),
+        Outcome::FiftyMove => "Fifty-move rule".to_string(),
+        Outcome::Threefold => "Threefold repetition".to_string(),
+        Outcome::Insufficient => "Insufficient material".to_string(),
+    }
+}
+
 /// The PGN result tag.
 fn score_tag(game: &Game) -> &'static str {
     match outcome(game) {
-        Some(Outcome::Checkmate(Color::White)) | Some(Outcome::Resignation(Color::Black)) => "1-0",
-        Some(Outcome::Checkmate(Color::Black)) | Some(Outcome::Resignation(Color::White)) => "0-1",
+        Some(Outcome::Checkmate(Color::White))
+        | Some(Outcome::Resignation(Color::Black))
+        | Some(Outcome::Timeout(Color::Black)) => "1-0",
+        Some(Outcome::Checkmate(Color::Black))
+        | Some(Outcome::Resignation(Color::White))
+        | Some(Outcome::Timeout(Color::White)) => "0-1",
         Some(_) => "1/2-1/2",
         None => "*",
     }
@@ -350,6 +559,9 @@ fn score_tag(game: &Game) -> &'static str {
 /// never drift into different feedback behavior.
 fn play_move(game: &mut Game, mv: Move, screen: &mut Screen) -> String {
     let text = game.play(mv);
+    if outcome(game).is_some() {
+        game.clock.pause();
+    }
     screen.sound.play(sound_after_move(game));
     text
 }
@@ -392,6 +604,9 @@ struct Screen {
     cols: usize,
     rows: usize,
     metrics: ui::Metrics,
+    /// Wide layouts put game information beside the board; narrow layouts
+    /// keep the board large and stack compact information underneath.
+    wide_panel: bool,
     pieces: ui::Pieces,
     /// Hold the board at its old small size whatever the window could take.
     compact: bool,
@@ -400,6 +615,11 @@ struct Screen {
     indent: String,
     /// The playable 8x8 rectangle from the last frame, in terminal cells.
     board_hitbox: Option<BoardHitbox>,
+    body_top: usize,
+    action_hitboxes: Vec<ActionHitbox>,
+    history_offset: usize,
+    history_capacity: usize,
+    confirming: Option<UiAction>,
     /// What the engine last said, kept because the frame is redrawn often.
     analysis: Vec<String>,
     /// Feedback under the board: a complaint, a note, a list of moves.
@@ -420,6 +640,51 @@ struct Screen {
 struct Page {
     title: String,
     lines: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiAction {
+    Undo,
+    Draw,
+    Resign,
+    Restart,
+    Rematch,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActionHitbox {
+    left: usize,
+    top: usize,
+    width: usize,
+    action: UiAction,
+}
+
+impl ActionHitbox {
+    fn contains(self, column: u16, row: u16) -> bool {
+        usize::from(row) == self.top
+            && usize::from(column) >= self.left
+            && usize::from(column) < self.left + self.width
+    }
+}
+
+struct RelativeAction {
+    left: usize,
+    row: usize,
+    width: usize,
+    action: UiAction,
+}
+
+struct RenderedBody {
+    lines: Vec<String>,
+    actions: Vec<RelativeAction>,
+    history_capacity: usize,
+}
+
+struct ButtonSpec {
+    action: UiAction,
+    label: &'static str,
+    enabled: bool,
 }
 
 /// Geometry needed to turn a terminal-cell click into a chess square.
@@ -459,13 +724,23 @@ impl Screen {
         };
         self.cols = cols.max(30);
         self.rows = rows.max(12);
-        self.metrics = if live && !self.compact {
+        let preferred = if live && !self.compact {
             // Drawn pieces are made of Unicode block elements, exactly the kind
             // of character `--ascii` is there to say the terminal has not got.
             let pieces = if self.theme.ascii { ui::Pieces::Glyph } else { self.pieces };
             ui::Metrics::fit(self.cols, self.rows, pieces)
         } else {
             ui::Metrics::COMPACT
+        };
+        self.wide_panel = self
+            .cols
+            .saturating_sub(preferred.board_width() + self.gap_for(preferred) + 2)
+            >= 24;
+        self.metrics = if live && !self.compact && !self.wide_panel {
+            let pieces = if self.theme.ascii { ui::Pieces::Glyph } else { self.pieces };
+            ui::Metrics::fit_with_reserve(self.cols, self.rows, pieces, 5)
+        } else {
+            preferred
         };
         // Centre the board and its panel as one rectangle of a fixed width,
         // rather than on what happens to be written in them, so that nothing
@@ -481,7 +756,11 @@ impl Screen {
 
     /// The space between the board and the panel: wider when the squares are.
     fn gap(&self) -> usize {
-        if self.metrics.cell_w >= 6 {
+        self.gap_for(self.metrics)
+    }
+
+    fn gap_for(&self, metrics: ui::Metrics) -> usize {
+        if metrics.cell_w >= 6 {
             5
         } else {
             3
@@ -491,6 +770,9 @@ impl Screen {
     /// How much room is left beside the board. Zero means the window is too
     /// narrow to put anything there at all.
     fn panel_width(&self) -> usize {
+        if !self.wide_panel {
+            return 0;
+        }
         let left = self
             .cols
             .saturating_sub(self.metrics.board_width() + self.gap() + 2);
@@ -544,11 +826,14 @@ impl Screen {
         self.targets.clear();
         self.promotions.clear();
         self.analysis.clear();
+        self.history_offset = 0;
+        self.confirming = None;
     }
 
     fn draw(&mut self, game: &Game, mode: Mode, limits: &Limits) {
         self.measure();
         self.board_hitbox = None;
+        self.action_hitboxes.clear();
         let inline_board = if self.inline_images
             && self.pieces == ui::Pieces::Auto
             && self.page.is_none()
@@ -558,10 +843,20 @@ impl Screen {
         } else {
             None
         };
-        let body = match &self.page {
-            Some(page) => self.page_body(page),
+        let rendered = match &self.page {
+            Some(page) => RenderedBody {
+                lines: self.page_body(page),
+                actions: Vec::new(),
+                history_capacity: 0,
+            },
             None => self.board_body(game, mode, limits),
         };
+        let RenderedBody {
+            lines: body,
+            actions,
+            history_capacity,
+        } = rendered;
+        self.history_capacity = history_capacity;
 
         if !self.theme.live || !self.theme.color {
             println!();
@@ -574,8 +869,14 @@ impl Screen {
 
         let hint = if self.page.is_some() {
             "return goes back"
+        } else if outcome(game).is_some() {
+            if self.cols < 55 { "rematch or quit" } else { "choose Rematch or Quit" }
+        } else if self.confirming.is_some() {
+            if self.cols < 55 { "confirm  ·  esc" } else { "click Confirm  ·  esc cancels" }
         } else if self.selected.is_some() {
-            "click a highlighted square  \u{b7}  esc cancels"
+            if self.cols < 55 { "choose target  \u{b7}  esc" } else { "click a highlighted square  \u{b7}  esc cancels" }
+        } else if self.cols < 55 {
+            "click  \u{b7}  help"
         } else {
             "click a piece  \u{b7}  help  \u{b7}  undo  \u{b7}  quit"
         };
@@ -592,6 +893,7 @@ impl Screen {
             frame.push(String::new());
         }
         let body_start = frame.len();
+        self.body_top = body_start;
         if self.page.is_none() {
             self.board_hitbox = Some(BoardHitbox {
                 left: self.indent.len() + ui::GUTTER,
@@ -600,6 +902,15 @@ impl Screen {
                 cell_h: self.metrics.cell_h,
                 flipped: self.flipped,
             });
+            self.action_hitboxes = actions
+                .into_iter()
+                .map(|target| ActionHitbox {
+                    left: target.left,
+                    top: body_start + target.row,
+                    width: target.width,
+                    action: target.action,
+                })
+                .collect();
         }
         frame.extend(body);
         // Pad down the window so the prompt always sits on the bottom row.
@@ -636,6 +947,52 @@ impl Screen {
         }
     }
 
+    /// Update only the two player rows when a displayed second changes. This
+    /// avoids retransmitting an inline board image once a second.
+    fn draw_clock_tick(&self, game: &Game, mode: Mode, limits: &Limits) {
+        if !self.theme.live || !self.theme.color || self.page.is_some() {
+            return;
+        }
+        let mut updates: Vec<(usize, usize, usize, Color)> = Vec::new();
+        if self.wide_panel {
+            let left = self.indent.len() + self.metrics.board_width() + self.gap();
+            let width = self.panel_width();
+            let top = if self.flipped { Color::White } else { Color::Black };
+            updates.push((left, self.body_top, width, top));
+            updates.push((
+                left,
+                self.body_top + self.metrics.board_height() - 1,
+                width,
+                top.flip(),
+            ));
+        } else {
+            let first = self.body_top
+                + self.metrics.board_height()
+                + usize::from(!ui::tight(self.rows));
+            updates.push((self.indent.len(), first, self.metrics.board_width(), Color::White));
+            updates.push((
+                self.indent.len(),
+                first + 1,
+                self.metrics.board_width(),
+                Color::Black,
+            ));
+        }
+
+        let mut out = String::from("\x1b[?25l");
+        for (left, row, width, color) in updates {
+            let line = self.player_line(game, mode, limits, color, width, !self.wide_panel);
+            out.push_str(&format!(
+                "\x1b[{};{}H{}\x1b[K",
+                row + 1,
+                left + 1,
+                ui::clip(&line, width)
+            ));
+        }
+        out.push_str(&format!("\x1b[{};1H\x1b[?25h", self.rows));
+        print!("{}", out);
+        let _ = io::stdout().flush();
+    }
+
     fn board_view<'a>(&'a self, game: &'a Game) -> BoardView<'a> {
         let pos = &game.pos;
         BoardView {
@@ -657,26 +1014,82 @@ impl Screen {
         self.board_hitbox?.square_at(column, row)
     }
 
-    /// The board, the panel beside it, and the few lines underneath.
-    fn board_body(&self, game: &Game, mode: Mode, limits: &Limits) -> Vec<String> {
+    fn action_at(&self, column: u16, row: u16) -> Option<UiAction> {
+        self.action_hitboxes
+            .iter()
+            .find(|target| target.contains(column, row))
+            .map(|target| target.action)
+    }
+
+    fn scroll_history(&mut self, game: &Game, older: bool) {
+        if self.history_capacity == 0 {
+            return;
+        }
+        let len = history_lines(game).len();
+        let most = len.saturating_sub(self.history_capacity.min(len));
+        let step = self.history_capacity.clamp(1, 3);
+        let next = if older {
+            (self.history_offset + step).min(most)
+        } else {
+            self.history_offset.saturating_sub(step)
+        };
+        if next != self.history_offset {
+            self.history_offset = next;
+            self.redraw = true;
+        }
+    }
+
+    /// The board, its responsive game information, and the few lines below.
+    fn board_body(&self, game: &Game, mode: Mode, limits: &Limits) -> RenderedBody {
         let m = self.metrics;
         let view = self.board_view(game);
         let board = self.theme.board_lines(&view, m);
-        let panel_width = self.panel_width();
-        let panel = if panel_width > 0 {
-            self.panel(game, mode, limits, m.board_height(), panel_width)
+        let tight = ui::tight(self.rows);
+        let mut actions = Vec::new();
+        let history_capacity;
+
+        let mut lines = if self.wide_panel {
+            let width = self.panel_width();
+            let panel = self.panel(game, mode, limits, m.board_height(), width);
+            let panel_left = self.indent.len() + m.board_width() + self.gap();
+            actions.extend(panel.actions.into_iter().map(|target| RelativeAction {
+                left: panel_left + target.left,
+                row: target.row,
+                width: target.width,
+                action: target.action,
+            }));
+            history_capacity = panel.history_capacity;
+            ui::beside(&board, &panel.lines, m.board_width(), self.gap())
+                .iter()
+                .map(|line| format!("{}{}", self.indent, line))
+                .collect::<Vec<_>>()
         } else {
-            Vec::new()
+            let mut stacked: Vec<String> = board
+                .iter()
+                .map(|line| format!("{}{}", self.indent, line))
+                .collect();
+            let compact = self.compact_panel(game, mode, limits, m.board_width());
+            if !tight {
+                stacked.push(String::new());
+            }
+            let compact_start = stacked.len();
+            stacked.extend(
+                compact
+                    .lines
+                    .iter()
+                    .map(|line| format!("{}{}", self.indent, line)),
+            );
+            actions.extend(compact.actions.into_iter().map(|target| RelativeAction {
+                left: self.indent.len() + target.left,
+                row: compact_start + target.row,
+                width: target.width,
+                action: target.action,
+            }));
+            history_capacity = compact.history_capacity;
+            stacked
         };
 
-        let tight = ui::tight(self.rows);
-        let room = if tight { 2 } else { 3 };
-
-        let mut lines: Vec<String> = ui::beside(&board, &panel, m.board_width(), self.gap())
-            .iter()
-            .map(|line| format!("{}{}", self.indent, line))
-            .collect();
-        if !tight {
+        if !tight && self.wide_panel {
             lines.push(String::new());
         }
         lines.push(format!("{}{}", self.indent, self.state_line(game)));
@@ -684,6 +1097,7 @@ impl Screen {
             lines.push(String::new());
         }
 
+        let room = if self.wide_panel && !tight { 3 } else { 1 };
         let mut notes: Vec<String> = self
             .analysis
             .iter()
@@ -692,14 +1106,17 @@ impl Screen {
             .map(|line| format!("{}{}", self.indent, line))
             .collect();
         if self.theme.live {
-            // Always the same number of lines under the board, so a complaint
-            // arriving and leaving does not shuffle the frame up and down.
             while notes.len() < room {
                 notes.push(String::new());
             }
         }
         lines.extend(notes);
-        lines
+
+        RenderedBody {
+            lines,
+            actions,
+            history_capacity,
+        }
     }
 
     fn page_body(&self, page: &Page) -> Vec<String> {
@@ -733,8 +1150,7 @@ impl Screen {
             .collect()
     }
 
-    /// Who is playing, what they have taken, and the moves so far - laid out
-    /// so that each player's name sits on their own side of the board.
+    /// Player cards, scrollable history, and controls beside the board.
     fn panel(
         &self,
         game: &Game,
@@ -742,41 +1158,171 @@ impl Screen {
         limits: &Limits,
         height: usize,
         width: usize,
-    ) -> Vec<String> {
+    ) -> RenderedBody {
         let mut rows = vec![String::new(); height];
         if height < 6 {
-            return rows;
+            return RenderedBody {
+                lines: rows,
+                actions: Vec::new(),
+                history_capacity: 0,
+            };
         }
         let top = if self.flipped { Color::White } else { Color::Black };
         let bottom = top.flip();
-        rows[0] = self.player_line(game, mode, limits, top);
+        rows[0] = self.player_line(game, mode, limits, top, width, false);
         rows[1] = self.capture_line(game, top);
         rows[height - 2] = self.capture_line(game, bottom);
-        rows[height - 1] = self.player_line(game, mode, limits, bottom);
+        rows[height - 1] = self.player_line(game, mode, limits, bottom, width, false);
 
-        // Whatever is left in the middle goes to the move list, newest last.
-        let first = 3;
-        let slots = height.saturating_sub(3).saturating_sub(first);
-        if slots >= 2 {
-            let played = history_lines(game);
-            let shown = played.len().min(slots - 1);
-            rows[first] = self.theme.label(if played.is_empty() {
-                "NO MOVES YET"
-            } else {
-                "MOVES"
-            });
-            for (i, line) in played[played.len() - shown..].iter().enumerate() {
-                rows[first + 1 + i] = if i + 1 == shown {
-                    self.theme.bold(line)
-                } else {
-                    self.theme.dim(line)
-                };
+        if let Some(result) = outcome(game) {
+            let title = match result {
+                Outcome::Checkmate(_) => "CHECKMATE",
+                Outcome::Resignation(_) => "RESIGNED",
+                Outcome::Timeout(_) => "TIME",
+                _ => "DRAW",
+            };
+            rows[3] = self.theme.strong(self.theme.palette.accent, "GAME OVER");
+            if height > 4 {
+                rows[4] = self.theme.bold(title);
             }
+            let detail = outcome_detail(&result);
+            let score = score_tag(game);
+            if height > 5 {
+                rows[5] = self.theme.dim(&detail);
+            }
+            let detail_width = ui::width(&detail);
+            let mut result_rows = 1;
+            if detail_width + ui::width(score) + 2 <= width {
+                rows[5] = format!("{}  {}", rows[5], self.theme.accent(score));
+            } else if height > 6 {
+                rows[6] = self.theme.accent(score);
+                result_rows = 2;
+            }
+            let buttons = self.render_buttons(&self.game_over_buttons(), width);
+            let desired_start = 5 + result_rows + 1;
+            let start = desired_start.min(height.saturating_sub(buttons.lines.len() + 2));
+            let actions = buttons
+                .actions
+                .into_iter()
+                .map(|target| RelativeAction {
+                    row: start + target.row,
+                    ..target
+                })
+                .collect();
+            for (offset, line) in buttons.lines.into_iter().enumerate() {
+                if start + offset < height.saturating_sub(2) {
+                    rows[start + offset] = line;
+                }
+            }
+            return RenderedBody {
+                lines: rows.iter().map(|row| ui::clip(row, width)).collect(),
+                actions,
+                history_capacity: 0,
+            };
         }
-        rows.iter().map(|row| ui::clip(row, width)).collect()
+
+        let buttons = self.render_buttons(&self.game_buttons(game, mode), width);
+        let button_start = height.saturating_sub(buttons.lines.len() + 3);
+        let actions = buttons
+            .actions
+            .into_iter()
+            .map(|target| RelativeAction {
+                row: button_start + target.row,
+                ..target
+            })
+            .collect();
+        for (offset, line) in buttons.lines.into_iter().enumerate() {
+            rows[button_start + offset] = line;
+        }
+
+        let first = 3;
+        let history_capacity = button_start.saturating_sub(first + 1);
+        let played = history_lines(game);
+        rows[first] = self.history_heading(played.len(), history_capacity);
+        let (start, end) = self.history_bounds(played.len(), history_capacity);
+        for (i, line) in played[start..end].iter().enumerate() {
+            rows[first + 1 + i] = if self.history_offset == 0 && i + 1 == end - start {
+                self.theme.bold(line)
+            } else {
+                self.theme.dim(line)
+            };
+        }
+
+        RenderedBody {
+            lines: rows.iter().map(|row| ui::clip(row, width)).collect(),
+            actions,
+            history_capacity,
+        }
     }
 
-    fn player_line(&self, game: &Game, mode: Mode, limits: &Limits, color: Color) -> String {
+    fn compact_panel(
+        &self,
+        game: &Game,
+        mode: Mode,
+        limits: &Limits,
+        width: usize,
+    ) -> RenderedBody {
+        let mut lines = vec![
+            self.player_line(game, mode, limits, Color::White, width, true),
+            self.player_line(game, mode, limits, Color::Black, width, true),
+        ];
+        let history_capacity;
+
+        if let Some(result) = outcome(game) {
+            lines.push(self.theme.strong(
+                self.theme.palette.accent,
+                &format!("GAME OVER  {}", describe(&result)),
+            ));
+            history_capacity = 0;
+        } else {
+            let played = history_lines(game);
+            let (start, end) = self.history_bounds(played.len(), 1);
+            let history = played
+                .get(start..end)
+                .and_then(|slice| slice.first())
+                .map(String::as_str)
+                .unwrap_or("No moves yet");
+            let heading = if played.len() > 1 { "MOVES ↑↓" } else { "MOVES" };
+            lines.push(format!(
+                "{}  {}",
+                self.theme.label(heading),
+                self.theme.dim(history)
+            ));
+            history_capacity = 1;
+        }
+
+        let buttons = if outcome(game).is_some() {
+            self.render_buttons(&self.game_over_buttons(), width)
+        } else {
+            self.render_buttons(&self.game_buttons(game, mode), width)
+        };
+        let button_start = lines.len();
+        lines.extend(buttons.lines);
+        let actions = buttons
+            .actions
+            .into_iter()
+            .map(|target| RelativeAction {
+                row: button_start + target.row,
+                ..target
+            })
+            .collect();
+
+        RenderedBody {
+            lines: lines.into_iter().map(|line| ui::clip(&line, width)).collect(),
+            actions,
+            history_capacity,
+        }
+    }
+
+    fn player_line(
+        &self,
+        game: &Game,
+        mode: Mode,
+        limits: &Limits,
+        color: Color,
+        width: usize,
+        compact: bool,
+    ) -> String {
         let theme = &self.theme;
         let to_move = game.pos.side == color && outcome(game).is_none();
         let marker = match (to_move, theme.ascii) {
@@ -784,21 +1330,65 @@ impl Screen {
             (true, true) => ">",
             (true, false) => "\u{25B8}",
         };
-        let name = if to_move {
-            theme.bold(color.name())
-        } else {
-            theme.label(color.name())
+        let player = match (mode, color) {
+            (Mode::TwoPlayer, Color::White) => "Player 1",
+            (Mode::TwoPlayer, Color::Black) => "Player 2",
+            (Mode::HumanWhite, Color::White) | (Mode::HumanBlack, Color::Black) => "You",
+            _ => "Engine",
         };
-        let role = match (mode, color) {
-            (Mode::TwoPlayer, _) => String::new(),
-            (Mode::HumanWhite, Color::White) | (Mode::HumanBlack, Color::Black) => "you".to_string(),
-            _ => format!("engine, {}", budget_text(limits)),
+        let name = if to_move {
+            theme.bold(player)
+        } else {
+            theme.label(player)
+        };
+        let role = match player {
+            _ if width < 30 => String::new(),
+            "Engine" if width >= 34 => {
+                format!("{} · {}", color.name().to_ascii_uppercase(), budget_text(limits))
+            }
+            _ => color.name().to_ascii_uppercase(),
         };
         let marker = if to_move { theme.accent(marker) } else { marker.to_string() };
-        format!("{} {}  {}", marker, name, theme.dim(&role))
+        let icon = theme.piece(Piece::new(color, PieceKind::King));
+        let mut left = if role.is_empty() {
+            format!("{} {} {}", marker, icon, name)
+        } else {
+            format!("{} {} {}  {}", marker, icon, name, theme.dim(&role))
+        };
+        if compact {
+            let captures = self.capture_summary(game, color);
+            if !captures.is_empty() {
+                left.push_str("  ");
+                left.push_str(&captures);
+            }
+        }
+        let clock = game.clock.format(color);
+        let clock = if game.clock.low(color) {
+            theme.warn(&clock)
+        } else if to_move {
+            theme.strong(theme.palette.accent, &clock)
+        } else {
+            theme.label(&clock)
+        };
+        let left = ui::clip(
+            &left,
+            width.saturating_sub(ui::width(&clock) + 1),
+        );
+        let gap = width
+            .saturating_sub(ui::width(&left) + ui::width(&clock))
+            .max(1);
+        format!("{}{}{}", left, " ".repeat(gap), clock)
     }
 
     fn capture_line(&self, game: &Game, color: Color) -> String {
+        let summary = self.capture_summary(game, color);
+        if summary.is_empty() {
+            return self.theme.dim("  no captures");
+        }
+        format!("  {}", summary)
+    }
+
+    fn capture_summary(&self, game: &Game, color: Color) -> String {
         let taken: String = game
             .captured_by(color)
             .iter()
@@ -810,7 +1400,123 @@ impl Screen {
         } else {
             String::new()
         };
-        format!("  {}{}", taken, lead)
+        format!("{}{}", taken, lead)
+    }
+
+    fn history_bounds(&self, len: usize, capacity: usize) -> (usize, usize) {
+        let offset = self.history_offset.min(len.saturating_sub(capacity.min(len)));
+        let end = len.saturating_sub(offset);
+        (end.saturating_sub(capacity), end)
+    }
+
+    fn history_heading(&self, len: usize, capacity: usize) -> String {
+        if len == 0 {
+            return self.theme.label("NO MOVES YET");
+        }
+        let (start, end) = self.history_bounds(len, capacity);
+        let range = if len > capacity {
+            format!("  {}-{} / {}  ↑↓", start + 1, end, len)
+        } else {
+            String::new()
+        };
+        format!("{}{}", self.theme.label("MOVES"), self.theme.dim(&range))
+    }
+
+    fn game_buttons(&self, game: &Game, mode: Mode) -> Vec<ButtonSpec> {
+        let draw_label = match game.draw_offer {
+            Some(color) if color != game.pos.side => "Accept",
+            Some(_) => "Offered",
+            None => "Draw",
+        };
+        vec![
+            ButtonSpec {
+                action: UiAction::Undo,
+                label: "Undo",
+                enabled: !game.sans.is_empty(),
+            },
+            ButtonSpec {
+                action: UiAction::Draw,
+                label: draw_label,
+                enabled: mode == Mode::TwoPlayer && game.draw_offer != Some(game.pos.side),
+            },
+            ButtonSpec {
+                action: UiAction::Resign,
+                label: if self.confirming == Some(UiAction::Resign) {
+                    "Confirm"
+                } else {
+                    "Resign"
+                },
+                enabled: true,
+            },
+            ButtonSpec {
+                action: UiAction::Restart,
+                label: if self.confirming == Some(UiAction::Restart) {
+                    "Confirm"
+                } else {
+                    "Restart"
+                },
+                enabled: true,
+            },
+        ]
+    }
+
+    fn game_over_buttons(&self) -> Vec<ButtonSpec> {
+        vec![
+            ButtonSpec {
+                action: UiAction::Rematch,
+                label: "Rematch",
+                enabled: true,
+            },
+            ButtonSpec {
+                action: UiAction::Quit,
+                label: "Quit",
+                enabled: true,
+            },
+        ]
+    }
+
+    fn render_buttons(&self, specs: &[ButtonSpec], width: usize) -> RenderedBody {
+        let mut lines = vec![String::new()];
+        let mut actions = Vec::new();
+        let mut row = 0;
+        let mut column = 0;
+        for spec in specs {
+            let plain = format!("[ {} ]", spec.label);
+            let button_width = ui::width(&plain);
+            let gap = usize::from(column > 0) * 2;
+            if column > 0 && column + gap + button_width > width {
+                lines.push(String::new());
+                row += 1;
+                column = 0;
+            }
+            let gap = usize::from(column > 0) * 2;
+            lines[row].push_str(&" ".repeat(gap));
+            column += gap;
+            let styled = if !spec.enabled {
+                self.theme.dim(&plain)
+            } else if self.confirming == Some(spec.action)
+                || matches!(spec.action, UiAction::Resign | UiAction::Restart)
+            {
+                self.theme.warn(&plain)
+            } else {
+                self.theme.accent(&plain)
+            };
+            lines[row].push_str(&styled);
+            if spec.enabled {
+                actions.push(RelativeAction {
+                    left: column,
+                    row,
+                    width: button_width,
+                    action: spec.action,
+                });
+            }
+            column += button_width;
+        }
+        RenderedBody {
+            lines,
+            actions,
+            history_capacity: 0,
+        }
     }
 
     fn state_line(&self, game: &Game) -> String {
@@ -819,7 +1525,7 @@ impl Screen {
             return format!(
                 "{}  {}",
                 theme.strong(theme.palette.accent, &describe(&result)),
-                theme.dim("(`new` plays again)")
+                theme.dim("choose Rematch or Quit")
             );
         }
         let separator = theme.dim("  \u{b7}  ");
@@ -830,15 +1536,27 @@ impl Screen {
         if in_check(&game.pos, game.pos.side) {
             parts.push(theme.warn("check!"));
         }
+        if let Some(color) = game.draw_offer {
+            parts.push(if color == game.pos.side {
+                theme.dim("draw offered")
+            } else {
+                theme.accent("draw offer")
+            });
+        }
         parts.join(&separator)
     }
 
     fn prompt(&self, game: &Game) -> String {
         let arrow = if self.theme.ascii { ">" } else { "\u{203a}" };
+        let label = if outcome(game).is_some() {
+            "Game over"
+        } else {
+            game.pos.side.name()
+        };
         format!(
             "{}{} {} ",
             self.indent,
-            self.theme.bold(game.pos.side.name()),
+            self.theme.bold(label),
             self.theme.dim(arrow)
         )
     }
@@ -988,10 +1706,16 @@ fn play(options: Options) -> Result<(), String> {
         cols: 80,
         rows: 24,
         metrics: ui::Metrics::COMPACT,
+        wide_panel: false,
         pieces: options.pieces,
         compact: options.compact,
         indent: "  ".to_string(),
         board_hitbox: None,
+        body_top: 0,
+        action_hitboxes: Vec::new(),
+        history_offset: 0,
+        history_capacity: 0,
+        confirming: None,
         analysis: Vec::new(),
         message: Vec::new(),
         selected: None,
@@ -1021,15 +1745,24 @@ fn play(options: Options) -> Result<(), String> {
     // terminal. Piped input retains the original line-oriented interface.
     let mut terminal_input = TerminalInput::enter(screen.theme.live && screen.theme.color)?;
 
-    let mut game = Game::new(start);
+    let mut game = Game::with_clock(start, options.clock, options.increment);
     let mut engine = Search::new();
     let mut limits = options.limits;
     screen.flipped = mode == Mode::HumanBlack;
-    screen.message = vec![screen
-        .theme
-        .dim("Click a piece to see its moves, or type a move like `e4` or `Nf3`.")];
+    screen.message = vec![screen.theme.dim("Click a piece, then its target.")];
 
     loop {
+        let flag_before = game.clock.flagged;
+        if game.clock.tick() {
+            if flag_before.is_none() && game.clock.flagged.is_some() {
+                screen.sound.play(sound::Cue::GameEnd);
+                screen.clear_marks();
+                screen.page = None;
+                screen.redraw = true;
+            } else {
+                screen.draw_clock_tick(&game, mode, &limits);
+            }
+        }
         if screen.redraw {
             screen.redraw = false;
             screen.draw(&game, mode, &limits);
@@ -1049,7 +1782,7 @@ fn play(options: Options) -> Result<(), String> {
 
         let action = if terminal_input.is_active() {
             screen.draw_prompt(&game, terminal_input.buffer());
-            terminal_input.read()?
+            terminal_input.read_for(Duration::from_millis(200))?
         } else {
             let mut stdin = io::stdin().lock();
             match read_line(&mut stdin, &screen.prompt(&game))? {
@@ -1068,27 +1801,52 @@ fn play(options: Options) -> Result<(), String> {
                 screen.redraw = true;
                 continue;
             }
+            InputAction::Tick => continue,
+            InputAction::History { older } => {
+                screen.scroll_history(&game, older);
+                continue;
+            }
             InputAction::Cancel => {
                 if screen.page.take().is_some() {
                     screen.redraw = true;
-                } else if screen.selected.take().is_some()
-                    || !screen.targets.is_empty()
-                    || !screen.promotions.is_empty()
-                {
-                    screen.targets.clear();
-                    screen.promotions.clear();
-                    screen.redraw = true;
                 } else {
-                    screen.draw_prompt(&game, terminal_input.buffer());
+                    let cancelled = screen.selected.take().is_some()
+                        || !screen.targets.is_empty()
+                        || !screen.promotions.is_empty();
+                    let confirmation = screen.confirming.take().is_some();
+                    if cancelled || confirmation {
+                        screen.targets.clear();
+                        screen.promotions.clear();
+                        screen.redraw = true;
+                    } else {
+                        screen.draw_prompt(&game, terminal_input.buffer());
+                    }
                 }
                 continue;
             }
             InputAction::Click { column, row } => {
+                let flag_before = game.clock.flagged;
+                game.clock.tick();
+                if flag_before.is_none() && game.clock.flagged.is_some() {
+                    screen.sound.play(sound::Cue::GameEnd);
+                    screen.clear_marks();
+                    screen.page = None;
+                    screen.redraw = true;
+                    continue;
+                }
                 if screen.page.take().is_some() {
                     screen.redraw = true;
                     continue;
                 }
+                if let Some(action) = screen.action_at(column, row) {
+                    if handle_ui_action(action, &mut game, mode, &mut screen) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                screen.confirming = None;
                 let square = screen.square_at(column, row);
+                let finished = outcome(&game).is_some();
                 handle_board_click(&mut game, &mut screen, square, finished);
                 continue;
             }
@@ -1099,6 +1857,15 @@ fn play(options: Options) -> Result<(), String> {
             }
         };
 
+        let flag_before = game.clock.flagged;
+        game.clock.tick();
+        if flag_before.is_none() && game.clock.flagged.is_some() {
+            screen.sound.play(sound::Cue::GameEnd);
+            screen.clear_marks();
+            screen.page = None;
+            screen.redraw = true;
+        }
+        let finished = outcome(&game).is_some();
         let input = line.trim();
         // Anything at all puts an open page away and brings the board back.
         if screen.page.take().is_some() {
@@ -1214,6 +1981,10 @@ fn play(options: Options) -> Result<(), String> {
                 undo(&mut game, mode, &mut screen);
                 continue;
             }
+            "draw" => {
+                handle_ui_action(UiAction::Draw, &mut game, mode, &mut screen);
+                continue;
+            }
             "new" | "restart" => {
                 if confirm_new(&mut terminal_input, &game, &screen)? {
                     game.restart();
@@ -1228,6 +1999,7 @@ fn play(options: Options) -> Result<(), String> {
                     screen.note(screen.theme.dim("The game is already over."));
                 } else {
                     game.resigned = Some(game.pos.side);
+                    game.clock.pause();
                     screen.analysis.clear();
                     screen.sound.play(sound::Cue::GameEnd);
                     screen.redraw = true;
@@ -1264,6 +2036,66 @@ fn split_command(input: &str) -> (String, &str) {
         Some((word, rest)) => (word.to_ascii_lowercase(), rest.trim()),
         None => (input.to_ascii_lowercase(), ""),
     }
+}
+
+/// Returns true when the application should close.
+fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut Screen) -> bool {
+    match action {
+        UiAction::Undo => {
+            screen.confirming = None;
+            undo(game, mode, screen);
+        }
+        UiAction::Draw => {
+            screen.confirming = None;
+            if mode != Mode::TwoPlayer {
+                screen.note(screen.theme.dim("Draw offers are available in two-player games."));
+            } else if game.draw_offer == Some(game.pos.side.flip()) {
+                game.agreed_draw = true;
+                game.draw_offer = None;
+                game.clock.pause();
+                screen.clear_marks();
+                screen.sound.play(sound::Cue::GameEnd);
+                screen.redraw = true;
+            } else if game.draw_offer == Some(game.pos.side) {
+                screen.note(screen.theme.dim("Your draw offer is waiting for the next player."));
+            } else {
+                game.draw_offer = Some(game.pos.side);
+                screen.note(screen.theme.accent(&format!(
+                    "{} offers a draw. Play your move; the opponent can then accept.",
+                    game.pos.side.name()
+                )));
+            }
+        }
+        UiAction::Resign => {
+            if screen.confirming == Some(UiAction::Resign) {
+                game.resigned = Some(game.pos.side);
+                game.clock.pause();
+                screen.clear_marks();
+                screen.sound.play(sound::Cue::GameEnd);
+                screen.redraw = true;
+            } else {
+                screen.confirming = Some(UiAction::Resign);
+                screen.note(screen.theme.warn("Click Confirm to resign, or press Escape."));
+            }
+        }
+        UiAction::Restart => {
+            if screen.confirming == Some(UiAction::Restart) {
+                game.restart();
+                screen.clear_marks();
+                screen.note(screen.theme.good("New game."));
+            } else {
+                screen.confirming = Some(UiAction::Restart);
+                screen.note(screen.theme.warn("Click Confirm to restart, or press Escape."));
+            }
+        }
+        UiAction::Rematch => {
+            game.restart();
+            screen.clear_marks();
+            screen.note(screen.theme.good("Rematch started."));
+        }
+        UiAction::Quit => return true,
+    }
+    false
 }
 
 fn make_move(game: &mut Game, input: &str, screen: &mut Screen) {
@@ -1476,6 +2308,16 @@ fn engine_move(game: &mut Game, engine: &mut Search, limits: &Limits, screen: &m
         engine.think(pos, limits, &mut report)
     };
     screen.theme.erase_line();
+
+    let flag_before = game.clock.flagged;
+    game.clock.tick();
+    if flag_before.is_none() && game.clock.flagged.is_some() {
+        screen.sound.play(sound::Cue::GameEnd);
+        screen.clear_marks();
+        screen.page = None;
+        screen.redraw = true;
+        return;
+    }
 
     let mv = match result.best {
         Some(mv) => mv,
@@ -1831,7 +2673,7 @@ fn bare_form(text: &str) -> String {
 }
 
 /// Every command and what it does, in the order the help lists them.
-const COMMANDS: [(&str, &str); 19] = [
+const COMMANDS: [(&str, &str); 20] = [
     ("help", "this list"),
     ("board", "redraw the board"),
     ("flip", "turn the board around"),
@@ -1842,6 +2684,7 @@ const COMMANDS: [(&str, &str); 19] = [
     ("eval", "the engine's opinion"),
     ("hint", "ask for a suggestion"),
     ("undo", "take back a move"),
+    ("draw", "offer or accept a draw"),
     ("time", "seconds per move"),
     ("depth", "search depth instead"),
     ("theme", "board colours"),
@@ -1901,7 +2744,15 @@ fn help_lines(theme: &Theme) -> Vec<String> {
         theme.bold("MOUSE"),
         format!(
             "  {}",
-            theme.dim("Click a piece, then click a highlighted square. Escape cancels.")
+            theme.dim("Click a piece, then its highlighted target. Escape cancels.")
+        ),
+        format!(
+            "  {}",
+            theme.dim("Use action buttons directly; scroll the move list with the mouse wheel.")
+        ),
+        format!(
+            "  {}",
+            theme.dim("Page Up / Page Down also scroll the move list.")
         ),
         String::new(),
         theme.bold("MOVES"),
@@ -2193,10 +3044,16 @@ mod interaction_tests {
             cols: 100,
             rows: 40,
             metrics: ui::Metrics::COMPACT,
+            wide_panel: true,
             pieces: ui::Pieces::Glyph,
             compact: false,
             indent: String::new(),
             board_hitbox: None,
+            body_top: 0,
+            action_hitboxes: Vec::new(),
+            history_offset: 0,
+            history_capacity: 0,
+            confirming: None,
             analysis: Vec::new(),
             message: Vec::new(),
             selected: None,
@@ -2324,5 +3181,113 @@ mod interaction_tests {
             cue_after("8/P6k/8/8/8/8/8/4K3 w - - 0 1", "a8=Q"),
             sound::Cue::Promotion
         );
+    }
+
+    #[test]
+    fn clock_flags_the_side_that_runs_out_of_time() {
+        let mut clock = GameClock::new(
+            Some(Duration::from_secs(60)),
+            Duration::ZERO,
+            Color::White,
+        );
+        clock.remaining[Color::White.index()] = Duration::from_millis(10);
+        clock.running = Some((Color::White, Instant::now() - Duration::from_millis(20)));
+
+        assert!(clock.tick());
+        assert_eq!(clock.flagged, Some(Color::White));
+        assert_eq!(clock.format(Color::White), "0:00");
+    }
+
+    #[test]
+    fn clock_adds_increment_and_switches_sides() {
+        let mut clock = GameClock::new(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(2),
+            Color::White,
+        );
+        clock.complete_move(Color::White, Color::Black);
+
+        assert!(clock.remaining[Color::White.index()] > Duration::from_secs(61));
+        assert_eq!(clock.running.map(|(color, _)| color), Some(Color::Black));
+    }
+
+    #[test]
+    fn draw_offer_can_be_accepted_after_the_offering_move() {
+        let mut game = Game::new(Position::startpos());
+        let mut screen = screen();
+        screen.theme.live = true;
+
+        assert!(!handle_ui_action(
+            UiAction::Draw,
+            &mut game,
+            Mode::TwoPlayer,
+            &mut screen,
+        ));
+        assert_eq!(game.draw_offer, Some(Color::White));
+
+        let movement = parse_move(&game.pos, "e4").ok().unwrap();
+        game.play(movement);
+        handle_ui_action(
+            UiAction::Draw,
+            &mut game,
+            Mode::TwoPlayer,
+            &mut screen,
+        );
+        assert!(game.agreed_draw);
+        assert!(matches!(outcome(&game), Some(Outcome::DrawAgreement)));
+    }
+
+    #[test]
+    fn destructive_mouse_action_requires_confirmation() {
+        let mut game = Game::new(Position::startpos());
+        let mut screen = screen();
+        screen.theme.live = true;
+
+        handle_ui_action(
+            UiAction::Resign,
+            &mut game,
+            Mode::TwoPlayer,
+            &mut screen,
+        );
+        assert_eq!(screen.confirming, Some(UiAction::Resign));
+        assert_eq!(game.resigned, None);
+
+        handle_ui_action(
+            UiAction::Resign,
+            &mut game,
+            Mode::TwoPlayer,
+            &mut screen,
+        );
+        assert_eq!(game.resigned, Some(Color::White));
+    }
+
+    #[test]
+    fn compact_buttons_wrap_without_losing_hit_targets() {
+        let game = Game::new(Position::startpos());
+        let screen = screen();
+        let buttons = screen.render_buttons(&screen.game_buttons(&game, Mode::TwoPlayer), 24);
+
+        assert!(buttons.lines.len() >= 2);
+        assert_eq!(buttons.actions.len(), 3); // Undo starts disabled.
+        assert!(buttons
+            .actions
+            .iter()
+            .all(|target| target.left + target.width <= 24));
+    }
+
+    #[test]
+    fn move_history_scrolls_away_from_and_back_to_the_latest_move() {
+        let mut game = Game::new(Position::startpos());
+        for notation in ["e4", "e5", "Nf3", "Nc6"] {
+            let movement = parse_move(&game.pos, notation).ok().unwrap();
+            game.play(movement);
+        }
+        let mut screen = screen();
+        screen.history_capacity = 1;
+
+        screen.scroll_history(&game, true);
+        assert_eq!(screen.history_offset, 1);
+        screen.scroll_history(&game, false);
+        assert_eq!(screen.history_offset, 0);
     }
 }
