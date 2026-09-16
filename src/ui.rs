@@ -132,6 +132,16 @@ pub fn draw_inline_image(
     column: usize,
     row: usize,
 ) {
+    // iTerm receives a compressed PNG, so give it the full-resolution board.
+    // viuer's remote Kitty path sends raw RGBA bytes; cap that copy so an SSH
+    // redraw remains responsive without lowering iTerm's image quality.
+    let kitty_image;
+    let image = if viuer::is_iterm_supported() {
+        image
+    } else {
+        kitty_image = image.resize_exact(512, 512, image::imageops::FilterType::Lanczos3);
+        &kitty_image
+    };
     let config = viuer::Config {
         absolute_offset: true,
         x: column.min(u16::MAX as usize) as u16,
@@ -298,12 +308,15 @@ type Sprite = Arc<[u8]>;
 
 static SPRITES: OnceLock<Mutex<HashMap<SpriteKey, Sprite>>> = OnceLock::new();
 
-fn piece_sprite(piece: Piece, metrics: Metrics) -> Sprite {
+/// Rasterize a piece to an exact pixel size. Keeping terminal-cell metrics out
+/// of this boundary prevents callers from accidentally confusing cells with
+/// the two-by-two pixel samples used by the portable renderer.
+fn piece_sprite(piece: Piece, width: usize, height: usize) -> Sprite {
     let key = SpriteKey {
         color: piece.color.index(),
         kind: piece.kind.index(),
-        width: metrics.cell_w * 2,
-        height: metrics.cell_h * 2,
+        width,
+        height,
     };
     let sprites = SPRITES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(sprite) = sprites
@@ -443,9 +456,10 @@ fn quadrant(pixels: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3], char) {
 }
 
 fn art_row(piece: Piece, row: usize, metrics: Metrics, background: u8) -> String {
-    let sprite = piece_sprite(piece, metrics);
+    let sprite = piece_sprite(piece, metrics.cell_w * 2, metrics.cell_h * 2);
     let background = ansi256_rgb(background);
     let pixel_width = metrics.cell_w * 2;
+    debug_assert_eq!(sprite.len(), pixel_width * metrics.cell_h * 2 * 4);
     let mut output = String::with_capacity(metrics.cell_w * 34);
 
     for column in 0..metrics.cell_w {
@@ -712,18 +726,14 @@ impl Theme {
     /// graphics clients scale this clean source into the exact cell rectangle,
     /// while the ordinary renderer continues to use block elements.
     pub fn board_image(&self, view: &BoardView) -> image::DynamicImage {
-        // 32px per square keeps remote Kitty frames compact while retaining
-        // far more detail than the terminal-cell fallback can represent.
-        const TILE: usize = 32;
+        // iTerm receives this as a compressed PNG. Ninety-six pixels per
+        // square preserve the SVG curves on large and Retina displays; the
+        // raw-data Kitty path is reduced separately when it is transmitted.
+        const TILE: usize = 96;
         const BOARD: usize = TILE * 8;
 
         let mut image = image::RgbaImage::new(BOARD as u32, BOARD as u32);
         let pixels = image.as_mut();
-        let sprite_metrics = Metrics {
-            cell_w: TILE,
-            cell_h: TILE / 2,
-            art: true,
-        };
 
         for display_rank in 0..8usize {
             let rank = if view.flipped {
@@ -767,7 +777,8 @@ impl Theme {
                 }
 
                 if let Some(piece) = view.pos.at(square) {
-                    let sprite = piece_sprite(piece, sprite_metrics);
+                    let sprite = piece_sprite(piece, TILE, TILE);
+                    debug_assert_eq!(sprite.len(), TILE * TILE * 4);
                     for y in 0..TILE {
                         for x in 0..TILE {
                             let source = (y * TILE + x) * 4;
@@ -977,4 +988,26 @@ pub fn clip(text: &str, columns: usize) -> String {
     }
     out.push_str("\x1b[0m");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_board_is_a_square_opaque_raster() {
+        let position = Position::startpos();
+        let theme = Theme::new(true, false, false, THEMES[0].1);
+        let view = BoardView {
+            pos: &position,
+            flipped: false,
+            last: None,
+            check: None,
+            targets: &[],
+        };
+
+        let board = theme.board_image(&view).to_rgba8();
+        assert_eq!(board.dimensions(), (768, 768));
+        assert!(board.pixels().all(|pixel| pixel[3] == 255));
+    }
 }
