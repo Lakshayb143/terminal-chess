@@ -1,0 +1,12 @@
+Terminal Chess uses selected sounds from two Kenney asset packs:
+
+- Impact Sounds 1.0 (2019)
+- Interface Sounds 1.0 (2020)
+
+Created and distributed by Kenney (https://kenney.nl/).
+
+License: Creative Commons Zero (CC0)
+https://creativecommons.org/publicdomain/zero/1.0/
+
+This content is free to use in personal, educational, and commercial
+projects. Crediting Kenney is appreciated but not required.

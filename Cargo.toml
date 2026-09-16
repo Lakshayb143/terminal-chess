@@ -12,6 +12,7 @@ path = "src/main.rs"
 crossterm = "0.29.0"
 image = { version = "0.25.10", default-features = false }
 resvg = { version = "0.48.1", default-features = false }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "vorbis"] }
 viuer = "0.11.0"
 
 [profile.release]

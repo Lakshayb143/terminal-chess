@@ -6,12 +6,13 @@ mod input;
 mod movegen;
 mod san;
 mod search;
+mod sound;
 mod ui;
 
 use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
-use board::{Color, Move, Piece, PieceKind, Position, Undo};
+use board::{Color, Move, MoveKind, Piece, PieceKind, Position, Undo};
 use input::{Action as InputAction, TerminalInput};
 use movegen::{generate_legal, in_check};
 use san::{parse_move, to_san, to_san_with, ParseError};
@@ -60,6 +61,7 @@ struct Options {
     pieces: ui::Pieces,
     /// Keep the old small board rather than filling the window.
     compact: bool,
+    sound: sound::Mode,
 }
 
 const HELP: &str = "\
@@ -82,6 +84,8 @@ LOOK:
         --theme <NAME>   board colours: slate, wood, forest, mono
         --pieces <KIND>  art (vector pieces), glyph (figurines), or auto
         --compact        keep the small board whatever the window can take
+        --sound <MODE>   sound effects: auto, on, or off (default: auto)
+        --mute           start with sound effects off
         --ascii          letters instead of figurines, plain rules
         --no-colour      no escape codes at all (also honours NO_COLOR)
         --colour         colour even when the output is not a terminal
@@ -107,6 +111,7 @@ impl Options {
             palette: ui::THEMES[0].1,
             pieces: ui::Pieces::Auto,
             compact: false,
+            sound: sound::Mode::Auto,
         };
         // Tracked so that `--depth` alone means "this depth, no clock", while
         // `--depth` with `--time` means "this depth, but stop when time runs out".
@@ -127,6 +132,12 @@ impl Options {
                 "-2" | "--two" => options.mode = Some(Mode::TwoPlayer),
                 "--ascii" => options.ascii = true,
                 "--compact" | "--small" => options.compact = true,
+                "--mute" | "--silent" => options.sound = sound::Mode::Off,
+                "--sound" => {
+                    let name = value("--sound")?;
+                    options.sound = sound::Mode::named(&name)
+                        .ok_or(format!("--sound wants auto, on or off, not '{}'", name))?;
+                }
                 "--pieces" => {
                     let name = value("--pieces")?;
                     options.pieces = ui::pieces_named(&name)
@@ -334,12 +345,43 @@ fn score_tag(game: &Game) -> &'static str {
     }
 }
 
+/// Make one real game move and emit exactly one matching audio cue. Keeping
+/// this at the mutation boundary means mouse, keyboard, and engine moves can
+/// never drift into different feedback behavior.
+fn play_move(game: &mut Game, mv: Move, screen: &mut Screen) -> String {
+    let text = game.play(mv);
+    screen.sound.play(sound_after_move(game));
+    text
+}
+
+fn sound_after_move(game: &Game) -> sound::Cue {
+    if outcome(game).is_some() {
+        return sound::Cue::GameEnd;
+    }
+    if in_check(&game.pos, game.pos.side) {
+        return sound::Cue::Check;
+    }
+    let Some(undo) = game.undos.last() else {
+        return sound::Cue::Move;
+    };
+    if undo.mv.promo.is_some() {
+        sound::Cue::Promotion
+    } else if matches!(undo.mv.kind, MoveKind::CastleKing | MoveKind::CastleQueen) {
+        sound::Cue::Castle
+    } else if undo.captured.is_some() {
+        sound::Cue::Capture
+    } else {
+        sound::Cue::Move
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The screen
 // ---------------------------------------------------------------------------
 
 struct Screen {
     theme: Theme,
+    sound: sound::Player,
     /// A negotiated Kitty/iTerm-family image protocol. The Unicode board is
     /// always rendered underneath as a zero-risk fallback.
     inline_images: bool,
@@ -940,6 +982,7 @@ fn play(options: Options) -> Result<(), String> {
     let color = options.color.unwrap_or_else(Theme::detect_color);
     let mut screen = Screen {
         theme: Theme::new(color, options.ascii, color && Theme::detect_live(), options.palette),
+        sound: sound::Player::new(options.sound),
         inline_images: false,
         flipped: false,
         cols: 80,
@@ -1147,6 +1190,10 @@ fn play(options: Options) -> Result<(), String> {
                 set_pieces(&mut screen, rest);
                 continue;
             }
+            "sound" | "sounds" => {
+                set_sound(&mut screen, rest);
+                continue;
+            }
             "size" => {
                 set_size(&mut screen, rest);
                 continue;
@@ -1182,6 +1229,7 @@ fn play(options: Options) -> Result<(), String> {
                 } else {
                     game.resigned = Some(game.pos.side);
                     screen.analysis.clear();
+                    screen.sound.play(sound::Cue::GameEnd);
                     screen.redraw = true;
                 }
                 continue;
@@ -1222,7 +1270,7 @@ fn make_move(game: &mut Game, input: &str, screen: &mut Screen) {
     match parse_move(&game.pos, input) {
         Ok(mv) => {
             let mover = game.pos.side;
-            let text = game.play(mv);
+            let text = play_move(game, mv, screen);
             screen.clear_marks();
             screen.redraw = true;
             // Confirm sloppy input by echoing how it was read, but do not
@@ -1239,7 +1287,7 @@ fn make_move(game: &mut Game, input: &str, screen: &mut Screen) {
             // A pawn reaching the last rank without being told what to become.
             if let Some(mv) = promotion_default(&game.pos, input) {
                 let square = board::square_name(mv.to);
-                let name = game.play(mv);
+                let name = play_move(game, mv, screen);
                 screen.clear_marks();
                 screen.redraw = true;
                 screen.note(format!(
@@ -1314,7 +1362,7 @@ fn handle_board_click(
         .find(|choice| choice.square == square)
         .copied()
     {
-        game.play(choice.movement);
+        play_move(game, choice.movement, screen);
         screen.clear_marks();
         screen.redraw = true;
         return;
@@ -1340,7 +1388,7 @@ fn handle_board_click(
                 open_promotion_menu(game, screen, &choices);
                 return;
             }
-            game.play(first);
+            play_move(game, first, screen);
             screen.clear_marks();
             screen.redraw = true;
             return;
@@ -1407,7 +1455,7 @@ fn play_promotion(game: &mut Game, screen: &mut Screen, kind: PieceKind) {
         .find(|choice| choice.piece.kind == kind)
         .copied()
     {
-        game.play(choice.movement);
+        play_move(game, choice.movement, screen);
         screen.clear_marks();
         screen.redraw = true;
     }
@@ -1437,7 +1485,7 @@ fn engine_move(game: &mut Game, engine: &mut Search, limits: &Limits, screen: &m
         }
     };
     let score = white_pov(&game.pos, result.score);
-    let text = game.play(mv);
+    let text = play_move(game, mv, screen);
     screen.clear_marks();
 
     let theme = &screen.theme;
@@ -1634,6 +1682,43 @@ fn set_pieces(screen: &mut Screen, rest: &str) {
     }
 }
 
+fn set_sound(screen: &mut Screen, rest: &str) {
+    if rest.is_empty() {
+        let mode = match screen.sound.mode() {
+            sound::Mode::Auto => "auto",
+            sound::Mode::On => "on",
+            sound::Mode::Off => "off",
+        };
+        let state = if screen.sound.is_playing() {
+            "audio output is ready"
+        } else if screen.sound.mode() == sound::Mode::Off {
+            "muted"
+        } else {
+            "no local audio output was found"
+        };
+        screen.note(screen.theme.dim(&format!("Sound is `{}` - {}.", mode, state)));
+        return;
+    }
+
+    let Some(mode) = sound::Mode::named(rest) else {
+        screen.note(
+            screen
+                .theme
+                .warn(&format!("`{}` is not `auto`, `on` or `off`.", rest)),
+        );
+        return;
+    };
+    let active = screen.sound.set_mode(mode);
+    let message = match (mode, active) {
+        (sound::Mode::Off, _) => screen.theme.dim("Sound effects are off."),
+        (_, true) => screen.theme.good("Sound effects are on."),
+        _ => screen
+            .theme
+            .warn("No local audio output is available; the game will stay silent."),
+    };
+    screen.note(message);
+}
+
 /// Fill the window, or hold the board at the size it used to be.
 fn set_size(screen: &mut Screen, rest: &str) {
     let compact = match rest.to_ascii_lowercase().as_str() {
@@ -1746,7 +1831,7 @@ fn bare_form(text: &str) -> String {
 }
 
 /// Every command and what it does, in the order the help lists them.
-const COMMANDS: [(&str, &str); 18] = [
+const COMMANDS: [(&str, &str); 19] = [
     ("help", "this list"),
     ("board", "redraw the board"),
     ("flip", "turn the board around"),
@@ -1761,6 +1846,7 @@ const COMMANDS: [(&str, &str); 18] = [
     ("depth", "search depth instead"),
     ("theme", "board colours"),
     ("pieces", "drawn, or figurines"),
+    ("sound", "auto, on, or off"),
     ("size", "fill the window, or not"),
     ("new", "start again"),
     ("resign", "concede the game"),
@@ -2101,6 +2187,7 @@ mod interaction_tests {
     fn screen() -> Screen {
         Screen {
             theme: Theme::new(true, false, false, ui::THEMES[0].1),
+            sound: sound::Player::off(),
             inline_images: false,
             flipped: false,
             cols: 100,
@@ -2203,5 +2290,39 @@ mod interaction_tests {
             Some(Piece::new(Color::White, PieceKind::Bishop))
         );
         assert!(screen.promotions.is_empty());
+    }
+
+    fn cue_after(fen: &str, notation: &str) -> sound::Cue {
+        let mut game = Game::new(Position::from_fen(fen).unwrap());
+        let movement = match parse_move(&game.pos, notation) {
+            Ok(movement) => movement,
+            Err(_) => panic!("test move {notation} did not parse"),
+        };
+        game.play(movement);
+        sound_after_move(&game)
+    }
+
+    #[test]
+    fn moves_choose_their_most_meaningful_sound() {
+        assert_eq!(
+            cue_after(board::START_FEN, "e4"),
+            sound::Cue::Move
+        );
+        assert_eq!(
+            cue_after("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1", "exd5"),
+            sound::Cue::Capture
+        );
+        assert_eq!(
+            cue_after("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1", "Re7+"),
+            sound::Cue::Check
+        );
+        assert_eq!(
+            cue_after("4k3/8/8/8/8/8/8/4K2R w K - 0 1", "O-O"),
+            sound::Cue::Castle
+        );
+        assert_eq!(
+            cue_after("8/P6k/8/8/8/8/8/4K3 w - - 0 1", "a8=Q"),
+            sound::Cue::Promotion
+        );
     }
 }
