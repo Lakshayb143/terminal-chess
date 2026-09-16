@@ -9,6 +9,7 @@ name = "chess"
 path = "src/main.rs"
 
 [dependencies]
+crossterm = "0.29.0"
 image = { version = "0.25.10", default-features = false }
 resvg = { version = "0.48.1", default-features = false }
 viuer = "0.11.0"

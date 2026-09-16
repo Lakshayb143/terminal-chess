@@ -2,6 +2,7 @@
 
 mod board;
 mod eval;
+mod input;
 mod movegen;
 mod san;
 mod search;
@@ -11,6 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
 use board::{Color, Move, Piece, PieceKind, Position, Undo};
+use input::{Action as InputAction, TerminalInput};
 use movegen::{generate_legal, in_check};
 use san::{parse_move, to_san, to_san_with, ParseError};
 use search::{Limits, Search, SearchResult};
@@ -745,6 +747,12 @@ impl Screen {
             self.theme.dim(arrow)
         )
     }
+
+    /// Repaint the bottom-row command line without redrawing the board.
+    fn draw_prompt(&self, game: &Game, input: &str) {
+        print!("\r\x1b[K{}{}", self.prompt(game), input);
+        let _ = io::stdout().flush();
+    }
 }
 
 /// `1. e4 e5` lines, one per move pair, from whatever side started.
@@ -908,6 +916,11 @@ fn play(options: Options) -> Result<(), String> {
             None => return Ok(()),
         },
     };
+    drop(stdin);
+
+    // Raw events are only appropriate while we own an interactive colour
+    // terminal. Piped input retains the original line-oriented interface.
+    let mut terminal_input = TerminalInput::enter(screen.theme.live && screen.theme.color)?;
 
     let mut game = Game::new(start);
     let mut engine = Search::new();
@@ -935,10 +948,39 @@ fn play(options: Options) -> Result<(), String> {
             continue;
         }
 
-        let line = match read_line(&mut stdin, &screen.prompt(&game))? {
-            Some(line) => line,
-            // End of input, e.g. a piped session or Ctrl-D.
-            None => {
+        let action = if terminal_input.is_active() {
+            screen.draw_prompt(&game, terminal_input.buffer());
+            terminal_input.read()?
+        } else {
+            let mut stdin = io::stdin().lock();
+            match read_line(&mut stdin, &screen.prompt(&game))? {
+                Some(line) => InputAction::Submit(line),
+                None => InputAction::Quit,
+            }
+        };
+
+        let line = match action {
+            InputAction::Submit(line) => line,
+            InputAction::Prompt => {
+                screen.draw_prompt(&game, terminal_input.buffer());
+                continue;
+            }
+            InputAction::Resize => {
+                screen.redraw = true;
+                continue;
+            }
+            InputAction::Cancel => {
+                if screen.page.take().is_some() {
+                    screen.redraw = true;
+                } else {
+                    screen.draw_prompt(&game, terminal_input.buffer());
+                }
+                continue;
+            }
+            // Board clicks gain meaning in the next implementation slice.
+            InputAction::Click { .. } => continue,
+            // End of input, Ctrl-C or Ctrl-D.
+            InputAction::Quit => {
                 println!();
                 return Ok(());
             }
@@ -1043,7 +1085,7 @@ fn play(options: Options) -> Result<(), String> {
                 continue;
             }
             "new" | "restart" => {
-                if confirm_new(&mut stdin, &game, &screen)? {
+                if confirm_new(&mut terminal_input, &game, &screen)? {
                     game.restart();
                     screen.analysis.clear();
                     screen.note(screen.theme.good("New game."));
@@ -1398,7 +1440,7 @@ fn set_size(screen: &mut Screen, rest: &str) {
 }
 
 /// Throwing a game away is the one thing `undo` cannot rescue, so ask first.
-fn confirm_new(stdin: &mut io::StdinLock, game: &Game, screen: &Screen) -> Result<bool, String> {
+fn confirm_new(input: &mut TerminalInput, game: &Game, screen: &Screen) -> Result<bool, String> {
     if game.sans.is_empty() || !screen.theme.live {
         return Ok(true);
     }
@@ -1408,7 +1450,15 @@ fn confirm_new(stdin: &mut io::StdinLock, game: &Game, screen: &Screen) -> Resul
             .theme
             .warn("Start a new game and lose this one? [y/N]")
     );
-    match read_line(stdin, &prompt)? {
+    input.suspend()?;
+    let answer = {
+        let mut stdin = io::stdin().lock();
+        read_line(&mut stdin, &prompt)
+    };
+    let resumed = input.resume();
+    let line = answer?;
+    resumed?;
+    match line {
         Some(line) => Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")),
         None => Ok(false),
     }
