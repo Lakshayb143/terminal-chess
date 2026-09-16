@@ -19,8 +19,17 @@ Choose a side from the opening screen, or start directly in two-player mode:
 cargo run --release -- --two
 ```
 
-Moves can be entered as SAN (`Nf3`, `exd5`, `O-O`) or coordinates (`e2e4`).
-Type `help` during a game to see the available commands.
+Click a piece to highlight its legal moves, then click a destination to play.
+Click another friendly piece to change the selection; press Escape or click
+outside the board to cancel. Promotions open a four-piece chooser directly on
+the board.
+
+Keyboard input remains available: enter SAN (`Nf3`, `exd5`, `O-O`) or
+coordinates (`e2e4`). Type `help` during a game to see every command.
+
+Mouse input works locally and over SSH in terminals that support standard SGR
+mouse reporting, including iTerm2 and Kitty. The game captures clicks only, so
+ordinary mouse movement does not create extra SSH traffic.
 
 ## Best-looking board on macOS
 

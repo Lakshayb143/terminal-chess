@@ -88,6 +88,7 @@ LOOK:
     -h, --help           print this help
 
 IN THE GAME:
+    Click a piece, then click a highlighted square to move it.
     Type a move as SAN (Nf3, exd5, O-O, e8=Q) or as coordinates (e2e4, e7e8q).
     Type `help` at the prompt for the list of commands.
 
@@ -365,6 +366,8 @@ struct Screen {
     selected: Option<board::Square>,
     /// Squares the board should point at until the next move.
     targets: Vec<board::Square>,
+    /// Clickable pieces shown when a pawn reaches the back rank.
+    promotions: Vec<ui::PromotionOption>,
     /// A page of text - the help, the move list, the score - shown in place of
     /// the board until the next thing is typed.
     page: Option<Page>,
@@ -497,6 +500,7 @@ impl Screen {
         self.message.clear();
         self.selected = None;
         self.targets.clear();
+        self.promotions.clear();
         self.analysis.clear();
     }
 
@@ -603,6 +607,7 @@ impl Screen {
             },
             selected: self.selected,
             targets: &self.targets,
+            promotions: &self.promotions,
         }
     }
 
@@ -948,6 +953,7 @@ fn play(options: Options) -> Result<(), String> {
         message: Vec::new(),
         selected: None,
         targets: Vec::new(),
+        promotions: Vec::new(),
         page: None,
         redraw: true,
     };
@@ -978,7 +984,7 @@ fn play(options: Options) -> Result<(), String> {
     screen.flipped = mode == Mode::HumanBlack;
     screen.message = vec![screen
         .theme
-        .dim("Type a move like `e4` or `Nf3`, or `help` for the commands.")];
+        .dim("Click a piece to see its moves, or type a move like `e4` or `Nf3`.")];
 
     loop {
         if screen.redraw {
@@ -1022,8 +1028,12 @@ fn play(options: Options) -> Result<(), String> {
             InputAction::Cancel => {
                 if screen.page.take().is_some() {
                     screen.redraw = true;
-                } else if screen.selected.take().is_some() || !screen.targets.is_empty() {
+                } else if screen.selected.take().is_some()
+                    || !screen.targets.is_empty()
+                    || !screen.promotions.is_empty()
+                {
                     screen.targets.clear();
+                    screen.promotions.clear();
                     screen.redraw = true;
                 } else {
                     screen.draw_prompt(&game, terminal_input.buffer());
@@ -1056,6 +1066,19 @@ fn play(options: Options) -> Result<(), String> {
             // with a window that has been resized under it.
             screen.redraw = screen.theme.live;
             continue;
+        }
+        if !screen.promotions.is_empty() && input.len() == 1 {
+            let kind = input.chars().next().and_then(PieceKind::from_char);
+            if let Some(
+                kind @ (PieceKind::Queen
+                | PieceKind::Rook
+                | PieceKind::Bishop
+                | PieceKind::Knight),
+            ) = kind
+            {
+                play_promotion(&mut game, &mut screen, kind);
+                continue;
+            }
         }
         let (word, rest) = split_command(input);
 
@@ -1273,6 +1296,7 @@ fn handle_board_click(
         None => {
             if screen.selected.take().is_some() {
                 screen.targets.clear();
+                screen.promotions.clear();
                 screen.redraw = true;
             }
             return;
@@ -1284,6 +1308,19 @@ fn handle_board_click(
         return;
     }
 
+    if let Some(choice) = screen
+        .promotions
+        .iter()
+        .find(|choice| choice.square == square)
+        .copied()
+    {
+        game.play(choice.movement);
+        screen.clear_marks();
+        screen.redraw = true;
+        return;
+    }
+    screen.promotions.clear();
+
     let legal = generate_legal(&game.pos);
     if let Some(from) = screen.selected {
         if square == from {
@@ -1293,16 +1330,17 @@ fn handle_board_click(
             return;
         }
 
-        let mut choices = legal.iter().copied().filter(|mv| mv.from == from && mv.to == square);
+        let mut choices = legal
+            .iter()
+            .copied()
+            .filter(|mv| mv.from == from && mv.to == square);
         if let Some(first) = choices.next() {
-            // Four promotion moves share a destination. The visual chooser is
-            // added separately; until then a click follows the familiar queen
-            // default used by coordinate input.
-            let mv = std::iter::once(first)
-                .chain(choices)
-                .find(|mv| mv.promo == Some(PieceKind::Queen))
-                .unwrap_or(first);
-            game.play(mv);
+            let choices: Vec<Move> = std::iter::once(first).chain(choices).collect();
+            if choices.iter().any(|mv| mv.promo.is_some()) {
+                open_promotion_menu(game, screen, &choices);
+                return;
+            }
+            game.play(first);
             screen.clear_marks();
             screen.redraw = true;
             return;
@@ -1327,6 +1365,51 @@ fn handle_board_click(
             }
         }
         _ => {}
+    }
+}
+
+fn open_promotion_menu(game: &Game, screen: &mut Screen, moves: &[Move]) {
+    let destination = moves[0].to;
+    let file = board::file_of(destination);
+    let rank = board::rank_of(destination);
+    let step: i8 = if rank == 7 { -1 } else { 1 };
+    let kinds = [
+        PieceKind::Queen,
+        PieceKind::Rook,
+        PieceKind::Bishop,
+        PieceKind::Knight,
+    ];
+
+    screen.promotions = kinds
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, &kind)| {
+            let movement = moves.iter().find(|mv| mv.promo == Some(kind)).copied()?;
+            let display_rank = (rank as i8 + step * offset as i8) as u8;
+            Some(ui::PromotionOption {
+                square: board::sq(file, display_rank),
+                piece: Piece::new(game.pos.side, kind),
+                movement,
+            })
+        })
+        .collect();
+    screen.analysis.clear();
+    screen.message = vec![screen
+        .theme
+        .dim("Choose promotion: click a piece, or type Q, R, B or N.")];
+    screen.redraw = true;
+}
+
+fn play_promotion(game: &mut Game, screen: &mut Screen, kind: PieceKind) {
+    if let Some(choice) = screen
+        .promotions
+        .iter()
+        .find(|choice| choice.piece.kind == kind)
+        .copied()
+    {
+        game.play(choice.movement);
+        screen.clear_marks();
+        screen.redraw = true;
     }
 }
 
@@ -1729,6 +1812,12 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 fn help_lines(theme: &Theme) -> Vec<String> {
     let mut lines = vec![
+        theme.bold("MOUSE"),
+        format!(
+            "  {}",
+            theme.dim("Click a piece, then click a highlighted square. Escape cancels.")
+        ),
+        String::new(),
         theme.bold("MOVES"),
         format!(
             "  {}   {}",
@@ -2025,6 +2114,7 @@ mod interaction_tests {
             message: Vec::new(),
             selected: None,
             targets: Vec::new(),
+            promotions: Vec::new(),
             page: None,
             redraw: false,
         }
@@ -2092,5 +2182,26 @@ mod interaction_tests {
         assert_eq!(screen.targets.len(), 2);
         assert!(screen.targets.contains(&f3));
         assert!(screen.targets.contains(&board::parse_square("h3").unwrap()));
+    }
+
+    #[test]
+    fn promotion_menu_accepts_a_piece_click() {
+        let position = Position::from_fen("4k3/P7/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mut game = Game::new(position);
+        let mut screen = screen();
+        let a7 = board::parse_square("a7").unwrap();
+        let a8 = board::parse_square("a8").unwrap();
+        let bishop_choice = board::parse_square("a6").unwrap();
+
+        handle_board_click(&mut game, &mut screen, Some(a7), false);
+        handle_board_click(&mut game, &mut screen, Some(a8), false);
+        assert_eq!(screen.promotions.len(), 4);
+
+        handle_board_click(&mut game, &mut screen, Some(bishop_choice), false);
+        assert_eq!(
+            game.pos.at(a8),
+            Some(Piece::new(Color::White, PieceKind::Bishop))
+        );
+        assert!(screen.promotions.is_empty());
     }
 }

@@ -660,12 +660,13 @@ impl Theme {
     /// One row of one square: `m.cell_w` columns of background with whatever
     /// part of the piece belongs on this row sitting in the middle of it.
     fn cell(&self, view: &BoardView, s: Square, m: Metrics, row: usize) -> String {
-        let piece = view.pos.at(s);
+        let promotion = view.promotions.iter().find(|choice| choice.square == s);
+        let piece = promotion.map(|choice| choice.piece).or_else(|| view.pos.at(s));
         let light = (board::file_of(s) + board::rank_of(s)) % 2 == 1;
         let last = view.last.map_or(false, |mv| mv.from == s || mv.to == s);
         let check = view.check == Some(s);
-        let selected = view.selected == Some(s);
-        let target = view.targets.contains(&s);
+        let selected = promotion.is_none() && view.selected == Some(s);
+        let target = promotion.is_some() || view.targets.contains(&s);
 
         if !self.color {
             let glyph = match piece {
@@ -760,13 +761,17 @@ impl Theme {
                     display_file as u8
                 };
                 let square = board::sq(file, rank);
+                let promotion = view
+                    .promotions
+                    .iter()
+                    .find(|choice| choice.square == square);
                 let light = (file + rank) % 2 == 1;
                 let last = view
                     .last
                     .map_or(false, |mv| mv.from == square || mv.to == square);
                 let check = view.check == Some(square);
-                let selected = view.selected == Some(square);
-                let target = view.targets.contains(&square);
+                let selected = promotion.is_none() && view.selected == Some(square);
+                let target = promotion.is_some() || view.targets.contains(&square);
                 let p = &self.palette;
                 let background = ansi256_rgb(match (check, selected, target, last, light) {
                     (true, _, _, _, true) => p.light_check,
@@ -791,7 +796,10 @@ impl Theme {
                     }
                 }
 
-                if let Some(piece) = view.pos.at(square) {
+                let piece = promotion
+                    .map(|choice| choice.piece)
+                    .or_else(|| view.pos.at(square));
+                if let Some(piece) = piece {
                     let sprite = piece_sprite(piece, TILE, TILE);
                     debug_assert_eq!(sprite.len(), TILE * TILE * 4);
                     for y in 0..TILE {
@@ -811,6 +819,25 @@ impl Theme {
                             let dx = x as isize - center;
                             let dy = y as isize - center;
                             if dx * dx + dy * dy <= radius * radius {
+                                let destination = ((origin_y + y) * BOARD + origin_x + x) * 4;
+                                pixels[destination..destination + 3].copy_from_slice(&marker);
+                            }
+                        }
+                    }
+                }
+
+                // An occupied legal destination gets a quiet inset frame;
+                // empty destinations keep the conventional center dot above.
+                let capture = promotion.is_none() && target && view.pos.at(square).is_some();
+                if capture {
+                    let marker = ansi256_rgb(p.label);
+                    let inset = TILE / 18;
+                    let thickness = (TILE / 32).max(2);
+                    for y in inset..TILE - inset {
+                        for x in inset..TILE - inset {
+                            let on_vertical = x < inset + thickness || x >= TILE - inset - thickness;
+                            let on_horizontal = y < inset + thickness || y >= TILE - inset - thickness;
+                            if on_vertical || on_horizontal {
                                 let destination = ((origin_y + y) * BOARD + origin_x + x) * 4;
                                 pixels[destination..destination + 3].copy_from_slice(&marker);
                             }
@@ -883,6 +910,16 @@ pub struct BoardView<'a> {
     pub selected: Option<Square>,
     /// Squares to point at: where a piece can go, or a suggested move.
     pub targets: &'a [Square],
+    /// A temporary, chess-client-style promotion menu drawn over one file.
+    pub promotions: &'a [PromotionOption],
+}
+
+/// One clickable entry in the promotion menu.
+#[derive(Clone, Copy)]
+pub struct PromotionOption {
+    pub square: Square,
+    pub piece: Piece,
+    pub movement: Move,
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1059,7 @@ mod tests {
             check: None,
             selected: None,
             targets: &[],
+            promotions: &[],
         };
 
         let board = theme.board_image(&view).to_rgba8();

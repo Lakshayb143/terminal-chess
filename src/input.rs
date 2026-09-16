@@ -53,7 +53,7 @@ impl TerminalInput {
         if !self.active {
             return Ok(());
         }
-        print!("\x1b[?1006l\x1b[?1000l");
+        print!("\x1b[?2004l\x1b[?1006l\x1b[?1000l");
         io::stdout().flush().map_err(|e| e.to_string())?;
         disable_raw_mode().map_err(|e| format!("could not leave raw mode: {}", e))?;
         self.active = false;
@@ -67,7 +67,7 @@ impl TerminalInput {
         enable_raw_mode().map_err(|e| format!("could not enter raw mode: {}", e))?;
         // 1000 reports button presses/releases; 1006 gives unbounded, precise
         // terminal-cell coordinates. Deliberately do not enable 1002/1003.
-        print!("\x1b[?1000h\x1b[?1006h");
+        print!("\x1b[?1000h\x1b[?1006h\x1b[?2004h");
         if let Err(error) = io::stdout().flush() {
             let _ = disable_raw_mode();
             return Err(error.to_string());
