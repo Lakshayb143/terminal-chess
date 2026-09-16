@@ -13,6 +13,7 @@ crossterm = "0.29.0"
 image = { version = "0.25.10", default-features = false }
 resvg = { version = "0.48.1", default-features = false }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "vorbis"] }
+tempfile = "3.23.0"
 viuer = "0.11.0"
 
 [profile.release]

@@ -2531,14 +2531,37 @@ fn set_sound(screen: &mut Screen, rest: &str) {
             sound::Mode::On => "on",
             sound::Mode::Off => "off",
         };
-        let state = if screen.sound.is_playing() {
-            "audio output is ready"
+        let state = if let Some(backend) = screen.sound.backend() {
+            format!("{} is ready", backend)
         } else if screen.sound.mode() == sound::Mode::Off {
-            "muted"
+            "muted".to_string()
+        } else if let Some(error) = screen.sound.last_error() {
+            format!("audio could not start: {}", error)
         } else {
-            "no local audio output was found"
+            "no local audio output was found".to_string()
         };
         screen.note(screen.theme.dim(&format!("Sound is `{}` - {}.", mode, state)));
+        return;
+    }
+
+    if rest.eq_ignore_ascii_case("test") {
+        let message = if let Some(backend) = screen.sound.backend() {
+            if screen.sound.play(sound::Cue::Move) {
+                screen
+                    .theme
+                    .good(&format!("Playing a test move through {}.", backend))
+            } else {
+                screen.theme.warn("The test sound could not be queued.")
+            }
+        } else if screen.sound.mode() == sound::Mode::Off {
+            screen.theme.dim("Sound is off. Use `sound on` first.")
+        } else {
+            screen.theme.warn(&format!(
+                "Audio is unavailable: {}.",
+                screen.sound.last_error().unwrap_or("no output device was found")
+            ))
+        };
+        screen.note(message);
         return;
     }
 
@@ -2553,10 +2576,20 @@ fn set_sound(screen: &mut Screen, rest: &str) {
     let active = screen.sound.set_mode(mode);
     let message = match (mode, active) {
         (sound::Mode::Off, _) => screen.theme.dim("Sound effects are off."),
-        (_, true) => screen.theme.good("Sound effects are on."),
+        (_, true) => {
+            let backend = screen.sound.backend().unwrap_or("the audio device");
+            let _ = screen.sound.play(sound::Cue::Move);
+            screen.theme.good(&format!(
+                "Sound effects are on through {}. Playing a test move.",
+                backend
+            ))
+        }
         _ => screen
             .theme
-            .warn("No local audio output is available; the game will stay silent."),
+            .warn(&format!(
+                "No local audio output is available: {}.",
+                screen.sound.last_error().unwrap_or("no output device was found")
+            )),
     };
     screen.note(message);
 }
@@ -2689,7 +2722,7 @@ const COMMANDS: [(&str, &str); 20] = [
     ("depth", "search depth instead"),
     ("theme", "board colours"),
     ("pieces", "drawn, or figurines"),
-    ("sound", "auto, on, or off"),
+    ("sound", "auto, on, off, or test"),
     ("size", "fill the window, or not"),
     ("new", "start again"),
     ("resign", "concede the game"),
