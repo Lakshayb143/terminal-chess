@@ -31,6 +31,16 @@ Click another friendly piece to change the selection; press Escape or click
 outside the board to cancel. Promotions open a four-piece chooser directly on
 the board.
 
+The game screen includes player cards, chess clocks, captured pieces, material
+advantage, last-move and check highlighting, and a move list. Use the mouse
+wheel or Page Up / Page Down to scroll longer games. In a wide terminal this
+information sits beside the board; in a narrow one it becomes a compact stack
+underneath it.
+
+Undo, draw, resign, and restart are clickable. Resign and restart require a
+second click so they cannot end a game by accident. When a game finishes, the
+final position stays visible with clear rematch and quit actions.
+
 Keyboard input remains available: enter SAN (`Nf3`, `exd5`, `O-O`) or
 coordinates (`e2e4`). Type `help` during a game to see every command.
 
@@ -86,6 +96,9 @@ SSH session is a good first step if it is absent.
 --two                play with two people at one keyboard
 --time <seconds>     engine time per move
 --depth <number>     maximum search depth
+--clock <minutes>    starting time for each player (default: 10)
+--increment <secs>   time added after each move
+--no-clock           play without chess clocks
 --theme <name>       slate, wood, forest, or mono
 --pieces <kind>      auto, art, or glyph
 --compact            keep the small board
