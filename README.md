@@ -19,6 +19,13 @@ Choose a side from the opening screen, or start directly in two-player mode:
 cargo run --release -- --two
 ```
 
+Install it as a normal command from GitHub:
+
+```sh
+cargo install --git https://github.com/Lakshayb143/terminal-chess --locked
+chess
+```
+
 Click a piece to highlight its legal moves, then click a destination to play.
 Click another friendly piece to change the selection; press Escape or click
 outside the board to cancel. Promotions open a four-piece chooser directly on
@@ -26,6 +33,16 @@ the board.
 
 Keyboard input remains available: enter SAN (`Nf3`, `exd5`, `O-O`) or
 coordinates (`e2e4`). Type `help` during a game to see every command.
+
+## Sound
+
+Short sounds distinguish ordinary moves, captures, checks, castling,
+promotions, and the end of a game. They are embedded in the executable, so an
+installed game does not need a separate asset directory. Sound is enabled
+automatically for local play and stays quiet when an SSH session is detected.
+
+Inside a game, use `sound on`, `sound off`, or `sound auto`. You can also start
+muted with `--mute` or choose a mode with `--sound on|off|auto`.
 
 Mouse input works locally and over SSH in terminals that support standard SGR
 mouse reporting, including iTerm2 and Kitty. The game captures clicks only, so
@@ -72,6 +89,8 @@ SSH session is a good first step if it is absent.
 --theme <name>       slate, wood, forest, or mono
 --pieces <kind>      auto, art, or glyph
 --compact            keep the small board
+--sound <mode>       auto, on, or off
+--mute               disable sound effects
 --fen <position>     start from a FEN position
 ```
 
@@ -81,3 +100,7 @@ Run `cargo run --release -- --help` for the complete list.
 
 The bundled RhosGFX SVG chess pieces are by RhosGFX and released under CC0.
 See [`assets/pieces/rhosgfx/LICENSE.txt`](assets/pieces/rhosgfx/LICENSE.txt).
+
+The bundled sound effects are selected from Kenney's Impact Sounds and
+Interface Sounds packs and released under CC0. See
+[`assets/sounds/kenney/LICENSE.txt`](assets/sounds/kenney/LICENSE.txt).
