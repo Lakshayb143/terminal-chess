@@ -51,8 +51,12 @@ promotions, and the end of a game. They are embedded in the executable, so an
 installed game does not need a separate asset directory. Sound is enabled
 automatically for local play and stays quiet when an SSH session is detected.
 
-Inside a game, use `sound on`, `sound off`, or `sound auto`. You can also start
+Inside a game, use `sound on`, `sound off`, or `sound auto`. `sound test` plays
+an effect immediately and reports the active audio backend. You can also start
 muted with `--mute` or choose a mode with `--sound on|off|auto`.
+
+On macOS, the game uses the built-in system audio player for reliable local
+playback. Other platforms use the embedded Rodio backend.
 
 Mouse input works locally and over SSH in terminals that support standard SGR
 mouse reporting, including iTerm2 and Kitty. The game captures clicks only, so
