@@ -1,0 +1,6 @@
+RhosGFX chess piece set
+
+Creator: RhosGFX
+Source: https://github.com/lichess-org/lila/tree/master/public/piece/rhosgfx
+License: CC0 1.0 Universal (public-domain dedication)
+License text: https://creativecommons.org/publicdomain/zero/1.0/legalcode
