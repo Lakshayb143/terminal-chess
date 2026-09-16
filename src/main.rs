@@ -355,6 +355,8 @@ struct Screen {
     /// The left edge of the last frame, so the prompt and the engine's
     /// thinking line start where the board starts.
     indent: String,
+    /// The playable 8x8 rectangle from the last frame, in terminal cells.
+    board_hitbox: Option<BoardHitbox>,
     /// What the engine last said, kept because the frame is redrawn often.
     analysis: Vec<String>,
     /// Feedback under the board: a complaint, a note, a list of moves.
@@ -371,6 +373,32 @@ struct Screen {
 struct Page {
     title: String,
     lines: Vec<String>,
+}
+
+/// Geometry needed to turn a terminal-cell click into a chess square.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoardHitbox {
+    left: usize,
+    top: usize,
+    cell_w: usize,
+    cell_h: usize,
+    flipped: bool,
+}
+
+impl BoardHitbox {
+    fn square_at(self, column: u16, row: u16) -> Option<board::Square> {
+        let x = usize::from(column).checked_sub(self.left)?;
+        let y = usize::from(row).checked_sub(self.top)?;
+        if x >= self.cell_w * 8 || y >= self.cell_h * 8 {
+            return None;
+        }
+
+        let display_file = (x / self.cell_w) as u8;
+        let display_rank = (y / self.cell_h) as u8;
+        let file = if self.flipped { 7 - display_file } else { display_file };
+        let rank = if self.flipped { display_rank } else { 7 - display_rank };
+        Some(board::sq(file, rank))
+    }
 }
 
 impl Screen {
@@ -471,6 +499,7 @@ impl Screen {
 
     fn draw(&mut self, game: &Game, mode: Mode, limits: &Limits) {
         self.measure();
+        self.board_hitbox = None;
         let inline_board = if self.inline_images
             && self.pieces == ui::Pieces::Auto
             && self.page.is_none()
@@ -512,6 +541,15 @@ impl Screen {
             frame.push(String::new());
         }
         let body_start = frame.len();
+        if self.page.is_none() {
+            self.board_hitbox = Some(BoardHitbox {
+                left: self.indent.len() + ui::GUTTER,
+                top: body_start + 1,
+                cell_w: self.metrics.cell_w,
+                cell_h: self.metrics.cell_h,
+                flipped: self.flipped,
+            });
+        }
         frame.extend(body);
         // Pad down the window so the prompt always sits on the bottom row.
         while frame.len() + 1 < self.rows {
@@ -560,6 +598,10 @@ impl Screen {
             },
             targets: &self.targets,
         }
+    }
+
+    fn square_at(&self, column: u16, row: u16) -> Option<board::Square> {
+        self.board_hitbox?.square_at(column, row)
     }
 
     /// The board, the panel beside it, and the few lines underneath.
@@ -895,6 +937,7 @@ fn play(options: Options) -> Result<(), String> {
         pieces: options.pieces,
         compact: options.compact,
         indent: "  ".to_string(),
+        board_hitbox: None,
         analysis: Vec::new(),
         message: Vec::new(),
         targets: Vec::new(),
@@ -977,8 +1020,11 @@ fn play(options: Options) -> Result<(), String> {
                 }
                 continue;
             }
-            // Board clicks gain meaning in the next implementation slice.
-            InputAction::Click { .. } => continue,
+            // Board clicks gain game meaning in the next implementation slice.
+            InputAction::Click { column, row } => {
+                let _ = screen.square_at(column, row);
+                continue;
+            }
             // End of input, Ctrl-C or Ctrl-D.
             InputAction::Quit => {
                 println!();
@@ -1861,5 +1907,47 @@ fn ask_mode(stdin: &mut io::StdinLock, screen: &mut Screen) -> Result<Option<Mod
             "q" | "quit" | "exit" => return Ok(None),
             _ => complaint = theme.warn("  Choose 1, 2 or 3."),
         }
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+
+    fn hitbox(flipped: bool) -> BoardHitbox {
+        BoardHitbox {
+            left: 10,
+            top: 4,
+            cell_w: 8,
+            cell_h: 4,
+            flipped,
+        }
+    }
+
+    #[test]
+    fn board_hitbox_maps_white_orientation() {
+        let board = hitbox(false);
+        assert_eq!(board.square_at(10, 4), Some(board::H8 - 7)); // a8
+        assert_eq!(board.square_at(73, 4), Some(board::H8));
+        assert_eq!(board.square_at(10, 35), Some(board::A1));
+        assert_eq!(board.square_at(73, 35), Some(board::H1));
+    }
+
+    #[test]
+    fn board_hitbox_maps_flipped_orientation() {
+        let board = hitbox(true);
+        assert_eq!(board.square_at(10, 4), Some(board::H1));
+        assert_eq!(board.square_at(73, 4), Some(board::A1));
+        assert_eq!(board.square_at(10, 35), Some(board::H8));
+        assert_eq!(board.square_at(73, 35), Some(board::H8 - 7)); // a8
+    }
+
+    #[test]
+    fn board_hitbox_rejects_labels_and_outside_cells() {
+        let board = hitbox(false);
+        assert_eq!(board.square_at(9, 4), None);
+        assert_eq!(board.square_at(10, 3), None);
+        assert_eq!(board.square_at(74, 4), None);
+        assert_eq!(board.square_at(10, 36), None);
     }
 }
