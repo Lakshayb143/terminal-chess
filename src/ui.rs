@@ -32,6 +32,9 @@ pub struct Palette {
     /// Squares a piece has been asked about, or a hinted move.
     light_target: u8,
     dark_target: u8,
+    /// The piece currently chosen with the mouse.
+    light_selected: u8,
+    dark_selected: u8,
     white_piece: u8,
     black_piece: u8,
     /// The bar across the top of the screen.
@@ -52,6 +55,7 @@ pub const THEMES: [(&str, Palette); 4] = [
             light_last: 180, dark_last: 137,
             light_check: 174, dark_check: 131,
             light_target: 151, dark_target: 108,
+            light_selected: 153, dark_selected: 110,
             white_piece: 255, black_piece: 233,
             bar: 60,
             label: 245, accent: 110, warn: 174, good: 108,
@@ -64,6 +68,7 @@ pub const THEMES: [(&str, Palette); 4] = [
             light_last: 186, dark_last: 143,
             light_check: 174, dark_check: 131,
             light_target: 151, dark_target: 108,
+            light_selected: 153, dark_selected: 110,
             white_piece: 255, black_piece: 233,
             bar: 95,
             label: 245, accent: 179, warn: 174, good: 108,
@@ -76,6 +81,7 @@ pub const THEMES: [(&str, Palette); 4] = [
             light_last: 186, dark_last: 143,
             light_check: 174, dark_check: 131,
             light_target: 152, dark_target: 109,
+            light_selected: 186, dark_selected: 143,
             white_piece: 255, black_piece: 233,
             bar: 59,
             label: 245, accent: 108, warn: 174, good: 114,
@@ -88,6 +94,7 @@ pub const THEMES: [(&str, Palette); 4] = [
             light_last: 187, dark_last: 144,
             light_check: 181, dark_check: 138,
             light_target: 152, dark_target: 109,
+            light_selected: 181, dark_selected: 181,
             white_piece: 255, black_piece: 233,
             bar: 238,
             label: 245, accent: 252, warn: 181, good: 252,
@@ -657,6 +664,7 @@ impl Theme {
         let light = (board::file_of(s) + board::rank_of(s)) % 2 == 1;
         let last = view.last.map_or(false, |mv| mv.from == s || mv.to == s);
         let check = view.check == Some(s);
+        let selected = view.selected == Some(s);
         let target = view.targets.contains(&s);
 
         if !self.color {
@@ -669,6 +677,8 @@ impl Theme {
             // plain board can mark squares without any of it sliding sideways.
             let (open, close) = if check {
                 ('[', ']')
+            } else if selected {
+                ('<', '>')
             } else if target {
                 ('*', '*')
             } else if last {
@@ -680,15 +690,17 @@ impl Theme {
         }
 
         let p = &self.palette;
-        let bg = match (check, target, last, light) {
-            (true, _, _, true) => p.light_check,
-            (true, _, _, false) => p.dark_check,
-            (_, true, _, true) => p.light_target,
-            (_, true, _, false) => p.dark_target,
-            (_, _, true, true) => p.light_last,
-            (_, _, true, false) => p.dark_last,
-            (_, _, false, true) => p.light,
-            (_, _, false, false) => p.dark,
+        let bg = match (check, selected, target, last, light) {
+            (true, _, _, _, true) => p.light_check,
+            (true, _, _, _, false) => p.dark_check,
+            (_, true, _, _, true) => p.light_selected,
+            (_, true, _, _, false) => p.dark_selected,
+            (_, _, true, _, true) => p.light_target,
+            (_, _, true, _, false) => p.dark_target,
+            (_, _, _, true, true) => p.light_last,
+            (_, _, _, true, false) => p.dark_last,
+            (_, _, _, false, true) => p.light,
+            (_, _, _, false, false) => p.dark,
         };
         let middle = m.cell_h / 2;
 
@@ -753,17 +765,20 @@ impl Theme {
                     .last
                     .map_or(false, |mv| mv.from == square || mv.to == square);
                 let check = view.check == Some(square);
+                let selected = view.selected == Some(square);
                 let target = view.targets.contains(&square);
                 let p = &self.palette;
-                let background = ansi256_rgb(match (check, target, last, light) {
-                    (true, _, _, true) => p.light_check,
-                    (true, _, _, false) => p.dark_check,
-                    (_, true, _, true) => p.light_target,
-                    (_, true, _, false) => p.dark_target,
-                    (_, _, true, true) => p.light_last,
-                    (_, _, true, false) => p.dark_last,
-                    (_, _, false, true) => p.light,
-                    (_, _, false, false) => p.dark,
+                let background = ansi256_rgb(match (check, selected, target, last, light) {
+                    (true, _, _, _, true) => p.light_check,
+                    (true, _, _, _, false) => p.dark_check,
+                    (_, true, _, _, true) => p.light_selected,
+                    (_, true, _, _, false) => p.dark_selected,
+                    (_, _, true, _, true) => p.light_target,
+                    (_, _, true, _, false) => p.dark_target,
+                    (_, _, _, true, true) => p.light_last,
+                    (_, _, _, true, false) => p.dark_last,
+                    (_, _, _, false, true) => p.light,
+                    (_, _, _, false, false) => p.dark,
                 });
                 let origin_x = display_file * TILE;
                 let origin_y = display_rank * TILE;
@@ -864,6 +879,8 @@ pub struct BoardView<'a> {
     pub last: Option<Move>,
     /// The square of a king currently in check.
     pub check: Option<Square>,
+    /// The piece chosen for a click-to-move interaction.
+    pub selected: Option<Square>,
     /// Squares to point at: where a piece can go, or a suggested move.
     pub targets: &'a [Square],
 }
@@ -1003,6 +1020,7 @@ mod tests {
             flipped: false,
             last: None,
             check: None,
+            selected: None,
             targets: &[],
         };
 

@@ -361,6 +361,8 @@ struct Screen {
     analysis: Vec<String>,
     /// Feedback under the board: a complaint, a note, a list of moves.
     message: Vec<String>,
+    /// The piece currently chosen for click-to-move.
+    selected: Option<board::Square>,
     /// Squares the board should point at until the next move.
     targets: Vec<board::Square>,
     /// A page of text - the help, the move list, the score - shown in place of
@@ -493,6 +495,7 @@ impl Screen {
     /// engine last said about the position are all stale.
     fn clear_marks(&mut self) {
         self.message.clear();
+        self.selected = None;
         self.targets.clear();
         self.analysis.clear();
     }
@@ -525,8 +528,10 @@ impl Screen {
 
         let hint = if self.page.is_some() {
             "return goes back"
+        } else if self.selected.is_some() {
+            "click a highlighted square  \u{b7}  esc cancels"
         } else {
-            "help  \u{b7}  flip  \u{b7}  undo  \u{b7}  quit"
+            "click a piece  \u{b7}  help  \u{b7}  undo  \u{b7}  quit"
         };
         let mut frame = vec![self.theme.bar("C H E S S", hint, self.cols)];
         if !ui::tight(self.rows) {
@@ -596,6 +601,7 @@ impl Screen {
             } else {
                 None
             },
+            selected: self.selected,
             targets: &self.targets,
         }
     }
@@ -940,6 +946,7 @@ fn play(options: Options) -> Result<(), String> {
         board_hitbox: None,
         analysis: Vec::new(),
         message: Vec::new(),
+        selected: None,
         targets: Vec::new(),
         page: None,
         redraw: true,
@@ -1015,14 +1022,21 @@ fn play(options: Options) -> Result<(), String> {
             InputAction::Cancel => {
                 if screen.page.take().is_some() {
                     screen.redraw = true;
+                } else if screen.selected.take().is_some() || !screen.targets.is_empty() {
+                    screen.targets.clear();
+                    screen.redraw = true;
                 } else {
                     screen.draw_prompt(&game, terminal_input.buffer());
                 }
                 continue;
             }
-            // Board clicks gain game meaning in the next implementation slice.
             InputAction::Click { column, row } => {
-                let _ = screen.square_at(column, row);
+                if screen.page.take().is_some() {
+                    screen.redraw = true;
+                    continue;
+                }
+                let square = screen.square_at(column, row);
+                handle_board_click(&mut game, &mut screen, square, finished);
                 continue;
             }
             // End of input, Ctrl-C or Ctrl-D.
@@ -1133,7 +1147,7 @@ fn play(options: Options) -> Result<(), String> {
             "new" | "restart" => {
                 if confirm_new(&mut terminal_input, &game, &screen)? {
                     game.restart();
-                    screen.analysis.clear();
+                    screen.clear_marks();
                     screen.note(screen.theme.good("New game."));
                     screen.redraw = true;
                 }
@@ -1243,6 +1257,76 @@ fn make_move(game: &mut Game, input: &str, screen: &mut Screen) {
                 screen.theme.bold(&candidates.join(" or "))
             ));
         }
+    }
+}
+
+/// Chess.com-style two-click movement: choose a friendly piece, then one of
+/// its legal destinations. Clicking another friendly piece simply reselects.
+fn handle_board_click(
+    game: &mut Game,
+    screen: &mut Screen,
+    square: Option<board::Square>,
+    finished: bool,
+) {
+    let square = match square {
+        Some(square) => square,
+        None => {
+            if screen.selected.take().is_some() {
+                screen.targets.clear();
+                screen.redraw = true;
+            }
+            return;
+        }
+    };
+
+    if finished {
+        screen.note(screen.theme.dim("The game is over. Try `new` or `undo`."));
+        return;
+    }
+
+    let legal = generate_legal(&game.pos);
+    if let Some(from) = screen.selected {
+        if square == from {
+            screen.selected = None;
+            screen.targets.clear();
+            screen.redraw = true;
+            return;
+        }
+
+        let mut choices = legal.iter().copied().filter(|mv| mv.from == from && mv.to == square);
+        if let Some(first) = choices.next() {
+            // Four promotion moves share a destination. The visual chooser is
+            // added separately; until then a click follows the familiar queen
+            // default used by coordinate input.
+            let mv = std::iter::once(first)
+                .chain(choices)
+                .find(|mv| mv.promo == Some(PieceKind::Queen))
+                .unwrap_or(first);
+            game.play(mv);
+            screen.clear_marks();
+            screen.redraw = true;
+            return;
+        }
+    }
+
+    match game.pos.at(square) {
+        Some(piece) if piece.color == game.pos.side => {
+            screen.selected = Some(square);
+            screen.targets = legal
+                .iter()
+                .filter(|mv| mv.from == square)
+                .map(|mv| mv.to)
+                .collect();
+            screen.message.clear();
+            screen.redraw = true;
+        }
+        _ if screen.selected.is_none() => {
+            if !screen.targets.is_empty() {
+                screen.targets.clear();
+                screen.redraw = true;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1378,7 +1462,7 @@ fn undo(game: &mut Game, mode: Mode, screen: &mut Screen) {
         return;
     }
     taken.reverse();
-    screen.analysis.clear();
+    screen.clear_marks();
     screen.note(format!(
         "{} {}",
         screen.theme.dim("Took back"),
@@ -1773,6 +1857,7 @@ fn show_piece_moves(screen: &mut Screen, pos: &Position, filter: &str) {
             .map(|line| screen.theme.accent(line)),
     );
     screen.targets = moves.iter().map(|mv| mv.to).collect();
+    screen.selected = Some(from);
     screen.show(message);
 }
 
@@ -1924,6 +2009,27 @@ mod interaction_tests {
         }
     }
 
+    fn screen() -> Screen {
+        Screen {
+            theme: Theme::new(true, false, false, ui::THEMES[0].1),
+            inline_images: false,
+            flipped: false,
+            cols: 100,
+            rows: 40,
+            metrics: ui::Metrics::COMPACT,
+            pieces: ui::Pieces::Glyph,
+            compact: false,
+            indent: String::new(),
+            board_hitbox: None,
+            analysis: Vec::new(),
+            message: Vec::new(),
+            selected: None,
+            targets: Vec::new(),
+            page: None,
+            redraw: false,
+        }
+    }
+
     #[test]
     fn board_hitbox_maps_white_orientation() {
         let board = hitbox(false);
@@ -1949,5 +2055,42 @@ mod interaction_tests {
         assert_eq!(board.square_at(10, 3), None);
         assert_eq!(board.square_at(74, 4), None);
         assert_eq!(board.square_at(10, 36), None);
+    }
+
+    #[test]
+    fn clicking_a_piece_then_a_target_plays_the_move() {
+        let mut game = Game::new(Position::startpos());
+        let mut screen = screen();
+        let e2 = board::parse_square("e2").unwrap();
+        let e3 = board::parse_square("e3").unwrap();
+        let e4 = board::parse_square("e4").unwrap();
+
+        handle_board_click(&mut game, &mut screen, Some(e2), false);
+        assert_eq!(screen.selected, Some(e2));
+        assert!(screen.targets.contains(&e3));
+        assert!(screen.targets.contains(&e4));
+
+        handle_board_click(&mut game, &mut screen, Some(e4), false);
+        assert_eq!(game.pos.at(e2), None);
+        assert_eq!(game.pos.at(e4), Some(Piece::new(Color::White, PieceKind::Pawn)));
+        assert_eq!(game.pos.side, Color::Black);
+        assert_eq!(screen.selected, None);
+        assert!(screen.targets.is_empty());
+    }
+
+    #[test]
+    fn clicking_another_friendly_piece_reselects() {
+        let mut game = Game::new(Position::startpos());
+        let mut screen = screen();
+        let e2 = board::parse_square("e2").unwrap();
+        let g1 = board::parse_square("g1").unwrap();
+        let f3 = board::parse_square("f3").unwrap();
+
+        handle_board_click(&mut game, &mut screen, Some(e2), false);
+        handle_board_click(&mut game, &mut screen, Some(g1), false);
+        assert_eq!(screen.selected, Some(g1));
+        assert_eq!(screen.targets.len(), 2);
+        assert!(screen.targets.contains(&f3));
+        assert!(screen.targets.contains(&board::parse_square("h3").unwrap()));
     }
 }
