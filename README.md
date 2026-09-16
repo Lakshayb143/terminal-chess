@@ -1,98 +1,98 @@
 # Terminal Chess
 
-Play chess without leaving the terminal. The board adapts to the window, supports
-multiple colour themes, and can use a terminal image protocol for smooth pieces.
+Play a complete game of chess without leaving the terminal.
 
-## Run it
+Terminal Chess is a mouse-friendly Rust application that brings the familiar
+feel of a graphical chess site to a native command-line program. It combines a
+responsive board, scalable vector pieces, clocks, move history, sound effects,
+and an embedded engine in a single executable.
 
-Install a recent Rust toolchain, then:
+The long-term goal is a terminal-first place where people can play locally,
+against an engine, or eventually against another person over the network.
+
+## Highlights
+
+- Click a piece, inspect its legal moves, and click a destination to move.
+- Play against the built-in engine or another person at the same terminal.
+- Use SAN (`Nf3`, `exd5`, `O-O`) or coordinate notation (`e2e4`) at any time.
+- Get a responsive layout with player panels, clocks, captured pieces, material
+  advantage, move history, and clear game-over states.
+- Render crisp vector-derived pieces through iTerm2 and Kitty image protocols,
+  with true-colour and Unicode fallbacks for other terminals.
+- Hear distinct sounds for moves, captures, checks, castling, promotions, and
+  game endings.
+- Choose between four board themes and several piece-rendering modes.
+
+## Quick start
+
+You need a recent [Rust toolchain](https://www.rust-lang.org/tools/install).
 
 ```sh
-git clone git@github.com:Lakshayb143/terminal-chess.git
+git clone https://github.com/Lakshayb143/terminal-chess.git
 cd terminal-chess
 cargo run --release
 ```
 
-Choose a side from the opening screen, or start directly in two-player mode:
+To start a local two-player game immediately:
 
 ```sh
 cargo run --release -- --two
 ```
 
-Install it as a normal command from GitHub:
+To install Terminal Chess as a normal command:
 
 ```sh
 cargo install --git https://github.com/Lakshayb143/terminal-chess --locked
 chess
 ```
 
-Click a piece to highlight its legal moves, then click a destination to play.
-Click another friendly piece to change the selection; press Escape or click
-outside the board to cancel. Promotions open a four-piece chooser directly on
-the board.
+## Playing
 
-The game screen includes player cards, chess clocks, captured pieces, material
-advantage, last-move and check highlighting, and a move list. Use the mouse
-wheel or Page Up / Page Down to scroll longer games. In a wide terminal this
-information sits beside the board; in a narrow one it becomes a compact stack
-underneath it.
+Click a piece to select it. Legal destinations appear on the board; click one
+to complete the move. Click another friendly piece to change the selection, or
+press `Esc` to cancel. Promotions open a four-piece chooser on the board.
 
-Undo, draw, resign, and restart are clickable. Resign and restart require a
-second click so they cannot end a game by accident. When a game finishes, the
-final position stays visible with clear rematch and quit actions.
+The mouse-accessible actions let you undo, offer or accept a draw, resign, and
+restart. Potentially destructive actions require confirmation. The move list
+can be scrolled with the mouse wheel or `Page Up` and `Page Down`.
 
-Keyboard input remains available: enter SAN (`Nf3`, `exd5`, `O-O`) or
-coordinates (`e2e4`). Type `help` during a game to see every command.
+Keyboard input remains fully supported. Type a move in SAN or coordinate
+notation, or type `help` during a game to see every available command.
 
-## Sound
+## Board rendering
 
-Short sounds distinguish ordinary moves, captures, checks, castling,
-promotions, and the end of a game. They are embedded in the executable, so an
-installed game does not need a separate asset directory. Sound is enabled
-automatically for local play and stays quiet when an SSH session is detected.
+The board grows with the terminal window. Wide terminals place game information
+beside it; narrow terminals arrange a compact information panel underneath.
 
-Inside a game, use `sound on`, `sound off`, or `sound auto`. `sound test` plays
-an effect immediately and reports the active audio backend. You can also start
-muted with `--mute` or choose a mode with `--sound on|off|auto`.
+The default `auto` mode selects the best renderer available:
 
-On macOS, the game uses the built-in system audio player for reliable local
-playback. Other platforms use the embedded Rodio backend.
+| Command | Rendering mode |
+| --- | --- |
+| `pieces auto` | High-resolution inline images when supported, with a safe fallback |
+| `pieces art` | Portable true-colour artwork made from Unicode block elements |
+| `pieces glyph` | Chess characters supplied by the terminal font |
 
-Mouse input works locally and over SSH in terminals that support standard SGR
-mouse reporting, including iTerm2 and Kitty. The game captures clicks only, so
-ordinary mouse movement does not create extra SSH traffic.
-
-## Best-looking board on macOS
-
-Run the game from a current version of iTerm2. This also works when iTerm2 is
-connected to a Linux server over SSH: the program runs on the server, while
-iTerm2 renders the board on the Mac.
-
-The default `auto` mode prefers smooth inline images when the terminal supports
-them and falls back safely elsewhere. Inside the game, use:
+For the sharpest large board on macOS, use a current version of iTerm2 and run:
 
 ```text
 size big
 pieces auto
 ```
 
-The rendering choices are:
+Image rendering also works when iTerm2 is connected to a Linux machine over
+SSH. If detection fails, confirm that `LC_TERMINAL=iTerm2` reaches the server.
 
-- `pieces auto` — use high-resolution terminal images when available.
-- `pieces art` — force the portable true-colour Unicode renderer.
-- `pieces glyph` — use the terminal font's chess characters.
+## Sound
 
-If `auto` still looks like block art in iTerm2 over SSH, check that the terminal
-identity reaches the server:
+Sound effects are embedded in the executable, so no separate asset directory
+is required. Sound is enabled for local games and automatically stays quiet in
+an SSH session.
 
-```sh
-printf 'TERM=%s\nLC_TERMINAL=%s\n' "$TERM" "$LC_TERMINAL"
-```
+Use `sound on`, `sound off`, or `sound auto` during a game. Run `sound test` to
+play an effect immediately and report the selected audio backend. On macOS,
+Terminal Chess uses the system audio player; other platforms use Rodio.
 
-`LC_TERMINAL=iTerm2` is the useful signal. Updating iTerm2 and reconnecting the
-SSH session is a good first step if it is absent.
-
-## Options
+## Command-line options
 
 ```text
 --white              play White against the engine
@@ -111,13 +111,38 @@ SSH session is a good first step if it is absent.
 --fen <position>     start from a FEN position
 ```
 
-Run `cargo run --release -- --help` for the complete list.
+Run `chess --help` for the complete reference.
 
-## Piece artwork
+## Engineering notes
 
-The bundled RhosGFX SVG chess pieces are by RhosGFX and released under CC0.
-See [`assets/pieces/rhosgfx/LICENSE.txt`](assets/pieces/rhosgfx/LICENSE.txt).
+The project is intentionally built as a terminal application rather than a web
+view wrapped in a desktop shell. A few implementation details:
 
-The bundled sound effects are selected from Kenney's Impact Sounds and
-Interface Sounds packs and released under CC0. See
-[`assets/sounds/kenney/LICENSE.txt`](assets/sounds/kenney/LICENSE.txt).
+- The UI negotiates terminal capabilities and keeps a portable ANSI fallback.
+- SVG piece assets are rasterized in-process and embedded in the release binary.
+- The chess engine uses iterative deepening, alpha-beta search, and a tapered
+  positional evaluation.
+- The board uses a compact 0x88 representation with incremental Zobrist hashing.
+- Mouse events, keyboard commands, clocks, audio, and responsive rendering share
+  one interactive game loop.
+
+The current product priorities are tracked in [ROADMAP.md](ROADMAP.md).
+
+## Development
+
+```sh
+cargo test
+cargo clippy --all-targets
+cargo fmt --check
+cargo build --release
+```
+
+Contributions and issue reports are welcome. UI reports are most useful when
+they include the terminal application, operating system, window dimensions,
+and selected piece mode.
+
+## Credits
+
+The bundled [RhosGFX chess pieces](assets/pieces/rhosgfx/LICENSE.txt) and the
+selected [Kenney sound effects](assets/sounds/kenney/LICENSE.txt) are released
+under CC0.
