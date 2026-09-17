@@ -131,12 +131,24 @@ fn table_index(s: Square, color: Color) -> usize {
 #[inline]
 fn table_for(kind: PieceKind, endgame: bool) -> &'static [i32; 64] {
     match kind {
-        PieceKind::Pawn => if endgame { &PAWN_EG } else { &PAWN_MG },
+        PieceKind::Pawn => {
+            if endgame {
+                &PAWN_EG
+            } else {
+                &PAWN_MG
+            }
+        }
         PieceKind::Knight => &KNIGHT,
         PieceKind::Bishop => &BISHOP,
         PieceKind::Rook => &ROOK,
         PieceKind::Queen => &QUEEN,
-        PieceKind::King => if endgame { &KING_EG } else { &KING_MG },
+        PieceKind::King => {
+            if endgame {
+                &KING_EG
+            } else {
+                &KING_MG
+            }
+        }
     }
 }
 
@@ -219,10 +231,18 @@ pub fn evaluate(pos: &Position) -> i32 {
                 let ef = file_of(es) as i32;
                 let er = rank_of(es) as i32;
                 (ef - file).abs() <= 1
-                    && if color == Color::White { er > rank } else { er < rank }
+                    && if color == Color::White {
+                        er > rank
+                    } else {
+                        er < rank
+                    }
             });
             if !blocked {
-                let advance = if color == Color::White { rank } else { 7 - rank } as usize;
+                let advance = if color == Color::White {
+                    rank
+                } else {
+                    7 - rank
+                } as usize;
                 score_mg += PASSED_PAWN[advance] / 2;
                 score_eg += PASSED_PAWN[advance];
             }
@@ -254,7 +274,9 @@ pub fn evaluate(pos: &Position) -> i32 {
         let forward: i16 = if color == Color::White { 16 } else { -16 };
         for side_step in [-1i16, 0, 1] {
             let front = ksq as i16 + forward + side_step;
-            if on_board(front) && pos.squares[front as usize] == Some(Piece::new(color, PieceKind::Pawn)) {
+            if on_board(front)
+                && pos.squares[front as usize] == Some(Piece::new(color, PieceKind::Pawn))
+            {
                 score_mg += KING_SHIELD;
             }
         }
@@ -265,6 +287,10 @@ pub fn evaluate(pos: &Position) -> i32 {
 
     let blended = (mg * phase + eg * (24 - phase)) / 24;
     let white_pov = blended;
-    let score = if pos.side == Color::White { white_pov } else { -white_pov };
+    let score = if pos.side == Color::White {
+        white_pov
+    } else {
+        -white_pov
+    };
     score + TEMPO
 }

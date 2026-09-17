@@ -84,9 +84,7 @@ impl TerminalInput {
     /// timeout lets clocks advance even while nobody is pressing a key.
     pub fn read_for(&mut self, timeout: Duration) -> Result<Action, String> {
         loop {
-            if !event::poll(timeout)
-                .map_err(|e| format!("could not poll terminal input: {}", e))?
-            {
+            if !event::poll(timeout).map_err(|e| format!("could not poll terminal input: {}", e))? {
                 return Ok(Action::Tick);
             }
             let event =

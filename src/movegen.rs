@@ -78,10 +78,20 @@ fn push_pawn_move(out: &mut Vec<Move>, from: Square, to: Square, kind: MoveKind)
             PieceKind::Bishop,
             PieceKind::Knight,
         ] {
-            out.push(Move { from, to, promo: Some(promo), kind });
+            out.push(Move {
+                from,
+                to,
+                promo: Some(promo),
+                kind,
+            });
         }
     } else {
-        out.push(Move { from, to, promo: None, kind });
+        out.push(Move {
+            from,
+            to,
+            promo: None,
+            kind,
+        });
     }
 }
 

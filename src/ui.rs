@@ -57,61 +57,105 @@ pub const THEMES: [(&str, Palette); 4] = [
     (
         "slate",
         Palette {
-            light: 109, dark: 66,
-            light_last: 180, dark_last: 137,
-            light_check: 174, dark_check: 131,
-            light_target: 151, dark_target: 108,
-            light_capture: 186, dark_capture: 143,
-            light_invalid: 174, dark_invalid: 131,
-            light_selected: 153, dark_selected: 110,
-            white_piece: 255, black_piece: 233,
+            light: 109,
+            dark: 66,
+            light_last: 180,
+            dark_last: 137,
+            light_check: 174,
+            dark_check: 131,
+            light_target: 151,
+            dark_target: 108,
+            light_capture: 186,
+            dark_capture: 143,
+            light_invalid: 174,
+            dark_invalid: 131,
+            light_selected: 153,
+            dark_selected: 110,
+            white_piece: 255,
+            black_piece: 233,
             bar: 60,
-            label: 245, accent: 110, warn: 174, good: 108,
+            label: 245,
+            accent: 110,
+            warn: 174,
+            good: 108,
         },
     ),
     (
         "wood",
         Palette {
-            light: 180, dark: 137,
-            light_last: 186, dark_last: 143,
-            light_check: 174, dark_check: 131,
-            light_target: 151, dark_target: 108,
-            light_capture: 153, dark_capture: 110,
-            light_invalid: 174, dark_invalid: 131,
-            light_selected: 153, dark_selected: 110,
-            white_piece: 255, black_piece: 233,
+            light: 180,
+            dark: 137,
+            light_last: 186,
+            dark_last: 143,
+            light_check: 174,
+            dark_check: 131,
+            light_target: 151,
+            dark_target: 108,
+            light_capture: 153,
+            dark_capture: 110,
+            light_invalid: 174,
+            dark_invalid: 131,
+            light_selected: 153,
+            dark_selected: 110,
+            white_piece: 255,
+            black_piece: 233,
             bar: 95,
-            label: 245, accent: 179, warn: 174, good: 108,
+            label: 245,
+            accent: 179,
+            warn: 174,
+            good: 108,
         },
     ),
     (
         "forest",
         Palette {
-            light: 108, dark: 65,
-            light_last: 186, dark_last: 143,
-            light_check: 174, dark_check: 131,
-            light_target: 152, dark_target: 109,
-            light_capture: 186, dark_capture: 143,
-            light_invalid: 174, dark_invalid: 131,
-            light_selected: 186, dark_selected: 143,
-            white_piece: 255, black_piece: 233,
+            light: 108,
+            dark: 65,
+            light_last: 186,
+            dark_last: 143,
+            light_check: 174,
+            dark_check: 131,
+            light_target: 152,
+            dark_target: 109,
+            light_capture: 186,
+            dark_capture: 143,
+            light_invalid: 174,
+            dark_invalid: 131,
+            light_selected: 186,
+            dark_selected: 143,
+            white_piece: 255,
+            black_piece: 233,
             bar: 59,
-            label: 245, accent: 108, warn: 174, good: 114,
+            label: 245,
+            accent: 108,
+            warn: 174,
+            good: 114,
         },
     ),
     (
         "mono",
         Palette {
-            light: 145, dark: 102,
-            light_last: 187, dark_last: 144,
-            light_check: 181, dark_check: 138,
-            light_target: 152, dark_target: 109,
-            light_capture: 195, dark_capture: 152,
-            light_invalid: 181, dark_invalid: 138,
-            light_selected: 181, dark_selected: 181,
-            white_piece: 255, black_piece: 233,
+            light: 145,
+            dark: 102,
+            light_last: 187,
+            dark_last: 144,
+            light_check: 181,
+            dark_check: 138,
+            light_target: 152,
+            dark_target: 109,
+            light_capture: 195,
+            dark_capture: 152,
+            light_invalid: 181,
+            dark_invalid: 138,
+            light_selected: 181,
+            dark_selected: 181,
+            white_piece: 255,
+            black_piece: 233,
             bar: 238,
-            label: 245, accent: 252, warn: 181, good: 252,
+            label: 245,
+            accent: 252,
+            warn: 181,
+            good: 252,
         },
     ),
 ];
@@ -162,12 +206,7 @@ pub fn inline_images_replace_in_place() -> bool {
 
 /// Paint an already composed board into its reserved terminal rectangle. If a
 /// protocol fails, the caller's Unicode board remains visible underneath.
-pub fn draw_inline_image(
-    image: &image::DynamicImage,
-    metrics: Metrics,
-    column: usize,
-    row: usize,
-) {
+pub fn draw_inline_image(image: &image::DynamicImage, metrics: Metrics, column: usize, row: usize) {
     // iTerm receives a compressed PNG, so give it the full-resolution board.
     // viuer's remote Kitty path sends raw RGBA bytes; cap that copy so an SSH
     // redraw remains responsive without lowering iTerm's image quality.
@@ -282,7 +321,11 @@ pub struct Metrics {
 impl Metrics {
     /// The old small board: one row per rank, three columns per square. Still
     /// what a pipe, a dumb terminal and `--compact` get.
-    pub const COMPACT: Metrics = Metrics { cell_w: 3, cell_h: 1, art: false };
+    pub const COMPACT: Metrics = Metrics {
+        cell_w: 3,
+        cell_h: 1,
+        art: false,
+    };
 
     /// The biggest board that leaves room for the frame around it: the bar,
     /// the status line, the notes and the prompt, plus the blank lines
@@ -311,7 +354,11 @@ impl Metrics {
             Pieces::Glyph => false,
             Pieces::Art | Pieces::Auto => cell_h >= 3 && cell_w >= 6,
         };
-        Metrics { cell_w, cell_h, art }
+        Metrics {
+            cell_w,
+            cell_h,
+            art,
+        }
     }
 
     pub fn board_width(&self) -> usize {
@@ -527,11 +574,7 @@ fn art_row(piece: Piece, row: usize, metrics: Metrics, background: u8) -> String
             composite(&sprite, (y * pixel_width + x) * 4, background),
             composite(&sprite, (y * pixel_width + x + 1) * 4, background),
             composite(&sprite, ((y + 1) * pixel_width + x) * 4, background),
-            composite(
-                &sprite,
-                ((y + 1) * pixel_width + x + 1) * 4,
-                background,
-            ),
+            composite(&sprite, ((y + 1) * pixel_width + x + 1) * 4, background),
         ];
         let (foreground, background, glyph) = quadrant(pixels);
         if glyph == ' ' {
@@ -573,7 +616,12 @@ pub struct Theme {
 
 impl Theme {
     pub fn new(color: bool, ascii: bool, live: bool, palette: Palette) -> Theme {
-        Theme { color, ascii, live, palette }
+        Theme {
+            color,
+            ascii,
+            live,
+            palette,
+        }
     }
 
     /// Colour unless the user, the terminal or the pipe says otherwise.
@@ -694,8 +742,12 @@ impl Theme {
         // The outline set for White, the solid set for Black. Fonts differ on
         // how hollow the outline pieces look, so colour carries the meaning
         // and the shape only reinforces it.
-        const WHITE: [char; 6] = ['\u{2659}', '\u{2658}', '\u{2657}', '\u{2656}', '\u{2655}', '\u{2654}'];
-        const BLACK: [char; 6] = ['\u{265F}', '\u{265E}', '\u{265D}', '\u{265C}', '\u{265B}', '\u{265A}'];
+        const WHITE: [char; 6] = [
+            '\u{2659}', '\u{2658}', '\u{2657}', '\u{2656}', '\u{2655}', '\u{2654}',
+        ];
+        const BLACK: [char; 6] = [
+            '\u{265F}', '\u{265E}', '\u{265D}', '\u{265C}', '\u{265B}', '\u{265A}',
+        ];
         let table = match piece.color {
             Color::White => &WHITE,
             Color::Black => &BLACK,
@@ -718,7 +770,9 @@ impl Theme {
     /// part of the piece belongs on this row sitting in the middle of it.
     fn cell(&self, view: &BoardView, s: Square, m: Metrics, row: usize) -> String {
         let promotion = view.promotions.iter().find(|choice| choice.square == s);
-        let piece = promotion.map(|choice| choice.piece).or_else(|| view.pos.at(s));
+        let piece = promotion
+            .map(|choice| choice.piece)
+            .or_else(|| view.pos.at(s));
         let light = (board::file_of(s) + board::rank_of(s)) % 2 == 1;
         let last = view.last.map_or(false, |mv| mv.from == s || mv.to == s);
         let check = view.check == Some(s);
@@ -842,22 +896,24 @@ impl Theme {
                 let target = promotion.is_some() || view.targets.contains(&square);
                 let capture = promotion.is_none() && view.captures.contains(&square);
                 let p = &self.palette;
-                let background = ansi256_rgb(match (check, invalid, selected, capture, target, last, light) {
-                    (true, _, _, _, _, _, true) => p.light_check,
-                    (true, _, _, _, _, _, false) => p.dark_check,
-                    (_, true, _, _, _, _, true) => p.light_invalid,
-                    (_, true, _, _, _, _, false) => p.dark_invalid,
-                    (_, _, true, _, _, _, true) => p.light_selected,
-                    (_, _, true, _, _, _, false) => p.dark_selected,
-                    (_, _, _, true, _, _, true) => p.light_capture,
-                    (_, _, _, true, _, _, false) => p.dark_capture,
-                    (_, _, _, _, true, _, true) => p.light_target,
-                    (_, _, _, _, true, _, false) => p.dark_target,
-                    (_, _, _, _, _, true, true) => p.light_last,
-                    (_, _, _, _, _, true, false) => p.dark_last,
-                    (_, _, _, _, _, false, true) => p.light,
-                    (_, _, _, _, _, false, false) => p.dark,
-                });
+                let background = ansi256_rgb(
+                    match (check, invalid, selected, capture, target, last, light) {
+                        (true, _, _, _, _, _, true) => p.light_check,
+                        (true, _, _, _, _, _, false) => p.dark_check,
+                        (_, true, _, _, _, _, true) => p.light_invalid,
+                        (_, true, _, _, _, _, false) => p.dark_invalid,
+                        (_, _, true, _, _, _, true) => p.light_selected,
+                        (_, _, true, _, _, _, false) => p.dark_selected,
+                        (_, _, _, true, _, _, true) => p.light_capture,
+                        (_, _, _, true, _, _, false) => p.dark_capture,
+                        (_, _, _, _, true, _, true) => p.light_target,
+                        (_, _, _, _, true, _, false) => p.dark_target,
+                        (_, _, _, _, _, true, true) => p.light_last,
+                        (_, _, _, _, _, true, false) => p.dark_last,
+                        (_, _, _, _, _, false, true) => p.light,
+                        (_, _, _, _, _, false, false) => p.dark,
+                    },
+                );
                 let origin_x = display_file * TILE;
                 let origin_y = display_rank * TILE;
 
@@ -907,8 +963,10 @@ impl Theme {
                     let thickness = (TILE / 32).max(2);
                     for y in inset..TILE - inset {
                         for x in inset..TILE - inset {
-                            let on_vertical = x < inset + thickness || x >= TILE - inset - thickness;
-                            let on_horizontal = y < inset + thickness || y >= TILE - inset - thickness;
+                            let on_vertical =
+                                x < inset + thickness || x >= TILE - inset - thickness;
+                            let on_horizontal =
+                                y < inset + thickness || y >= TILE - inset - thickness;
                             if on_vertical || on_horizontal {
                                 let destination = ((origin_y + y) * BOARD + origin_x + x) * 4;
                                 pixels[destination..destination + 3].copy_from_slice(&marker);

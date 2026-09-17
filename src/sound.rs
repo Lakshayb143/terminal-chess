@@ -164,7 +164,8 @@ struct RodioOutput {
 
 impl RodioOutput {
     fn open() -> Result<RodioOutput, String> {
-        let mut device = DeviceSinkBuilder::open_default_sink().map_err(|error| error.to_string())?;
+        let mut device =
+            DeviceSinkBuilder::open_default_sink().map_err(|error| error.to_string())?;
         // Dropping the stream is an ordinary result of `sound off` or quitting;
         // Rodio's diagnostic would otherwise be printed through the TUI.
         device.log_on_drop(false);

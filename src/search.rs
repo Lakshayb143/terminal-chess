@@ -37,7 +37,10 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { depth: MAX_DEPTH, movetime: Some(Duration::from_secs(3)) }
+        Limits {
+            depth: MAX_DEPTH,
+            movetime: Some(Duration::from_secs(3)),
+        }
     }
 }
 
@@ -79,8 +82,14 @@ struct TtEntry {
 }
 
 /// `depth < 0` marks a slot that has never been written.
-const TT_EMPTY: TtEntry =
-    TtEntry { key: 0, mv: None, score: 0, depth: -1, bound: Bound::Exact, age: 0 };
+const TT_EMPTY: TtEntry = TtEntry {
+    key: 0,
+    mv: None,
+    score: 0,
+    depth: -1,
+    bound: Bound::Exact,
+    age: 0,
+};
 
 /// Mate scores are stored relative to the node, not the root, so that an entry
 /// stays true when the same position turns up at a different distance.
@@ -147,9 +156,7 @@ pub fn is_insufficient_material(pos: &Position) -> bool {
 
 fn has_non_pawn_material(pos: &Position, color: Color) -> bool {
     all_squares().any(|s| match pos.at(s) {
-        Some(p) => {
-            p.color == color && !matches!(p.kind, PieceKind::Pawn | PieceKind::King)
-        }
+        Some(p) => p.color == color && !matches!(p.kind, PieceKind::Pawn | PieceKind::King),
         None => false,
     })
 }
@@ -594,10 +601,8 @@ impl Search {
         let slot = &mut self.tt[(key as usize) & (TT_SIZE - 1)];
         // Prefer deeper entries, but never let an old search hold a slot
         // hostage for the rest of the game.
-        let replace = slot.depth < 0
-            || slot.key != key
-            || slot.age != self.age
-            || depth as i16 >= slot.depth;
+        let replace =
+            slot.depth < 0 || slot.key != key || slot.age != self.age || depth as i16 >= slot.depth;
         if !replace {
             return;
         }

@@ -19,8 +19,7 @@ pub fn to_san_with(pos: &Position, mv: Move, legal: &[Move]) -> String {
                 Some(p) => p,
                 None => return mv.to_uci(),
             };
-            let is_capture =
-                pos.at(mv.to).is_some() || mv.kind == MoveKind::EnPassant;
+            let is_capture = pos.at(mv.to).is_some() || mv.kind == MoveKind::EnPassant;
             let mut s = String::new();
 
             if piece.kind == PieceKind::Pawn {
@@ -48,7 +47,11 @@ pub fn to_san_with(pos: &Position, mv: Move, legal: &[Move]) -> String {
     let mut after = pos.clone();
     let undo = after.make_move(mv);
     if in_check(&after, after.side) {
-        s.push(if generate_legal(&after).is_empty() { '#' } else { '+' });
+        s.push(if generate_legal(&after).is_empty() {
+            '#'
+        } else {
+            '+'
+        });
     }
     after.unmake_move(undo);
     s
@@ -155,7 +158,11 @@ pub fn parse_move(pos: &Position, input: &str) -> Result<Move, ParseError> {
             .filter(|(san, _)| {
                 let a = loose(san);
                 let b = loose(&want);
-                if case_sensitive { a == b } else { a.eq_ignore_ascii_case(&b) }
+                if case_sensitive {
+                    a == b
+                } else {
+                    a.eq_ignore_ascii_case(&b)
+                }
             })
             .map(|(_, mv)| *mv)
             .collect();
@@ -209,7 +216,11 @@ fn parse_coordinate(text: &str, legal: &[Move]) -> Option<Move> {
         None => candidates
             .iter()
             .find(|mv| mv.promo.is_none())
-            .or_else(|| candidates.iter().find(|mv| mv.promo == Some(PieceKind::Queen)))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|mv| mv.promo == Some(PieceKind::Queen))
+            })
             .copied(),
         Some(kind) => candidates.iter().find(|mv| mv.promo == Some(kind)).copied(),
     }

@@ -212,7 +212,12 @@ pub struct Move {
 
 impl Move {
     pub fn normal(from: Square, to: Square) -> Move {
-        Move { from, to, promo: None, kind: MoveKind::Normal }
+        Move {
+            from,
+            to,
+            promo: None,
+            kind: MoveKind::Normal,
+        }
     }
 
     /// Long algebraic / UCI form, e.g. `e2e4`, `e7e8q`.
@@ -446,7 +451,11 @@ impl Position {
                 .filter(|&s| pos.at(s) == Some(Piece::new(color, PieceKind::King)))
                 .count();
             if kings != 1 {
-                return Err(format!("{} must have exactly one king, found {}", color.name(), kings));
+                return Err(format!(
+                    "{} must have exactly one king, found {}",
+                    color.name(),
+                    kings
+                ));
             }
         }
 
@@ -551,7 +560,8 @@ impl Position {
             hash: undo_hash,
         };
 
-        let piece = self.squares[mv.from as usize].expect("move originates from an occupied square");
+        let piece =
+            self.squares[mv.from as usize].expect("move originates from an occupied square");
 
         // Locate the captured piece (en passant sits behind the target square).
         let captured_sq = if mv.kind == MoveKind::EnPassant {
@@ -574,13 +584,17 @@ impl Position {
             MoveKind::CastleKing => {
                 let rook_from = sq(7, rank_of(mv.from));
                 let rook_to = sq(5, rank_of(mv.from));
-                let rook = self.take(rook_from, &mut h).expect("king-side rook present");
+                let rook = self
+                    .take(rook_from, &mut h)
+                    .expect("king-side rook present");
                 self.put(rook_to, rook, &mut h);
             }
             MoveKind::CastleQueen => {
                 let rook_from = sq(0, rank_of(mv.from));
                 let rook_to = sq(3, rank_of(mv.from));
-                let rook = self.take(rook_from, &mut h).expect("queen-side rook present");
+                let rook = self
+                    .take(rook_from, &mut h)
+                    .expect("queen-side rook present");
                 self.put(rook_to, rook, &mut h);
             }
             _ => {}
@@ -620,7 +634,11 @@ impl Position {
         }
         self.hash = h;
 
-        Undo { captured, captured_sq, ..undo }
+        Undo {
+            captured,
+            captured_sq,
+            ..undo
+        }
     }
 
     pub fn unmake_move(&mut self, undo: Undo) {
