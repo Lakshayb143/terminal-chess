@@ -22,6 +22,8 @@ against an engine, or eventually against another person over the network.
 - Hear distinct sounds for moves, captures, checks, castling, promotions, and
   game endings.
 - Choose between four board themes and several piece-rendering modes.
+- Pause at any time, resume an autosaved game, and import or export PGN files.
+- Keep player names and display preferences in a readable local configuration.
 
 ## Quick start
 
@@ -61,6 +63,36 @@ move box. Use `Tab` or the arrow keys to move through every visible control,
 `Shift+Tab` to go backwards, and `Enter` to activate the focused button. The
 `Move` button returns the cursor to the move box, so draw, resign, restart, and
 all other game actions remain usable without a mouse.
+
+Quiet legal moves use center dots. Captures use a separate highlighted square
+and frame, while an invalid click briefly marks only the rejected square and
+explains how to recover. Promotion choices accept either a click or `Q`, `R`,
+`B`, or `N` from the keyboard.
+
+## Local games and files
+
+Terminal Chess automatically saves the current game after moves and game-state
+changes. The next startup offers **Resume saved game**, or you can use:
+
+```text
+pause                  stop the clocks and prevent moves
+resume                 continue a paused game
+save                    update the default autosave
+save game.json          save to a chosen file
+load                    restore the default autosave
+load game.json          restore a chosen file
+export game.pgn         write a standard PGN file
+import game.pgn         import and replay a PGN main line
+```
+
+PGN import supports standard headers, comments, and annotations. The main line
+becomes the playable game, while parenthesized side variations are ignored.
+
+Preferences are stored at `~/.config/terminal-chess/config.toml` by default.
+Set `TERMINAL_CHESS_CONFIG` to choose another location. Player names, theme,
+piece style, board size, sound mode, orientation, clock, and increment persist
+between launches. Run `setup` in the game to see the active config and autosave
+paths, or set names with `name white Lakshay` and `name black Guest`.
 
 ## Board rendering
 
@@ -118,6 +150,8 @@ Terminal Chess uses the system audio player; other platforms use Rodio.
 --sound <mode>       auto, on, or off
 --mute               disable sound effects
 --fen <position>     start from a FEN position
+--resume             continue the automatically saved game
+--load <file>        open a specific saved game
 ```
 
 Run `chess --help` for the complete reference.

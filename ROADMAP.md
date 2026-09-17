@@ -14,26 +14,26 @@ Keep the board and surrounding interface visually stationary during play.
 - [x] Preserve the existing low-cost clock refresh path.
 - [x] Verify resizing and every piece-rendering mode.
 
-## 2. Piece interaction polish — next
+## 2. Piece interaction polish — complete
 
 Make mouse and keyboard play feel deliberate, clear, and forgiving.
 
-- [ ] Refine selected-square and legal-move markers.
-- [ ] Distinguish quiet moves from captures at a glance.
-- [ ] Add restrained feedback for invalid clicks.
+- [x] Refine selected-square and legal-move markers.
+- [x] Distinguish quiet moves from captures at a glance.
+- [x] Add restrained feedback for invalid clicks.
 - [x] Improve keyboard navigation and focus states.
 - [x] Add in-game controls for board size and piece style.
-- [ ] Review promotion and confirmation interactions.
+- [x] Review promotion and confirmation interactions.
 
-## 3. Complete the local-game experience — later
+## 3. Complete the local-game experience — complete
 
 Turn the current game into a session players can leave, share, and customize.
 
-- [ ] Pause and resume a game.
-- [ ] Save and restore unfinished games.
-- [ ] Import and export PGN.
-- [ ] Persist player names, themes, clocks, sound, and board orientation.
-- [ ] Add a first-run setup and straightforward configuration file.
+- [x] Pause and resume a game.
+- [x] Save and restore unfinished games.
+- [x] Import and export PGN.
+- [x] Persist player names, themes, clocks, sound, and board orientation.
+- [x] Add a first-run setup and straightforward configuration file.
 
 Multiplayer, matchmaking, spectators, and SSH-hosted games will follow after
 these local foundations are solid.
