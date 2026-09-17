@@ -617,6 +617,9 @@ struct Screen {
     board_hitbox: Option<BoardHitbox>,
     body_top: usize,
     action_hitboxes: Vec<ActionHitbox>,
+    /// The control currently selected for keyboard activation. Typing always
+    /// returns this to the move prompt; Tab and arrows traverse the buttons.
+    focused: UiAction,
     history_offset: usize,
     history_capacity: usize,
     confirming: Option<UiAction>,
@@ -654,10 +657,13 @@ struct Page {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiAction {
+    MoveInput,
     Undo,
     Draw,
     Resign,
     Restart,
+    ToggleSize,
+    CyclePieces,
     Rematch,
     Quit,
 }
@@ -890,15 +896,27 @@ impl Screen {
         let hint = if self.page.is_some() {
             "return goes back"
         } else if outcome(game).is_some() {
-            if self.cols < 55 { "rematch or quit" } else { "choose Rematch or Quit" }
+            if self.cols < 55 {
+                "Tab controls  ·  Enter selects"
+            } else {
+                "Tab moves focus  ·  Enter selects  ·  type a command"
+            }
         } else if self.confirming.is_some() {
-            if self.cols < 55 { "confirm  ·  esc" } else { "click Confirm  ·  esc cancels" }
+            if self.cols < 55 {
+                "Enter confirms  ·  esc cancels"
+            } else {
+                "choose Confirm  ·  Escape cancels"
+            }
         } else if self.selected.is_some() {
-            if self.cols < 55 { "choose target  \u{b7}  esc" } else { "click a highlighted square  \u{b7}  esc cancels" }
+            if self.cols < 55 {
+                "choose target  ·  esc"
+            } else {
+                "choose a highlighted square  ·  Escape cancels"
+            }
         } else if self.cols < 55 {
-            "click  \u{b7}  help"
+            "type a move  ·  Tab controls"
         } else {
-            "click a piece  \u{b7}  help  \u{b7}  undo  \u{b7}  quit"
+            "type a move  ·  click a piece  ·  Tab moves focus"
         };
         let mut frame = vec![self.theme.bar("C H E S S", hint, self.cols)];
         if !ui::tight(self.rows) {
@@ -997,7 +1015,7 @@ impl Screen {
                 body_start + 1,
             );
         }
-        print!("\x1b[{};1H\x1b[?25h\x1b[?2026l", self.rows);
+        print!("\x1b[?25l\x1b[?2026l");
         let _ = io::stdout().flush();
 
         self.last_frame = next_frame;
@@ -1079,6 +1097,43 @@ impl Screen {
             .iter()
             .find(|target| target.contains(column, row))
             .map(|target| target.action)
+    }
+
+    fn focus(&mut self, action: UiAction) -> bool {
+        if self.focused == action {
+            return false;
+        }
+        self.focused = action;
+        self.redraw = true;
+        true
+    }
+
+    fn focus_move_input(&mut self) -> bool {
+        self.focus(UiAction::MoveInput)
+    }
+
+    /// Traverse only controls that are enabled in the current frame. The
+    /// hitboxes already follow visual reading order, so keyboard and mouse
+    /// share one source of truth.
+    fn move_focus(&mut self, reverse: bool) {
+        let controls: Vec<UiAction> = self
+            .action_hitboxes
+            .iter()
+            .map(|target| target.action)
+            .collect();
+        if controls.is_empty() {
+            return;
+        }
+        let current = controls
+            .iter()
+            .position(|&action| action == self.focused);
+        let next = match (current, reverse) {
+            (Some(0), true) | (None, true) => controls.len() - 1,
+            (Some(index), true) => index - 1,
+            (Some(index), false) => (index + 1) % controls.len(),
+            (None, false) => 0,
+        };
+        self.focus(controls[next]);
     }
 
     fn scroll_history(&mut self, game: &Game, older: bool) {
@@ -1297,15 +1352,17 @@ impl Screen {
 
         let first = 3;
         let history_capacity = button_start.saturating_sub(first + 1);
-        let played = history_lines(game);
-        rows[first] = self.history_heading(played.len(), history_capacity);
-        let (start, end) = self.history_bounds(played.len(), history_capacity);
-        for (i, line) in played[start..end].iter().enumerate() {
-            rows[first + 1 + i] = if self.history_offset == 0 && i + 1 == end - start {
-                self.theme.bold(line)
-            } else {
-                self.theme.dim(line)
-            };
+        if history_capacity > 0 {
+            let played = history_lines(game);
+            rows[first] = self.history_heading(played.len(), history_capacity);
+            let (start, end) = self.history_bounds(played.len(), history_capacity);
+            for (i, line) in played[start..end].iter().enumerate() {
+                rows[first + 1 + i] = if self.history_offset == 0 && i + 1 == end - start {
+                    self.theme.bold(line)
+                } else {
+                    self.theme.dim(line)
+                };
+            }
         }
 
         RenderedBody {
@@ -1490,6 +1547,11 @@ impl Screen {
         };
         vec![
             ButtonSpec {
+                action: UiAction::MoveInput,
+                label: "Move",
+                enabled: true,
+            },
+            ButtonSpec {
                 action: UiAction::Undo,
                 label: "Undo",
                 enabled: !game.sans.is_empty(),
@@ -1517,11 +1579,18 @@ impl Screen {
                 },
                 enabled: true,
             },
+            self.size_button(),
+            self.pieces_button(),
         ]
     }
 
     fn game_over_buttons(&self) -> Vec<ButtonSpec> {
         vec![
+            ButtonSpec {
+                action: UiAction::MoveInput,
+                label: "Move",
+                enabled: true,
+            },
             ButtonSpec {
                 action: UiAction::Rematch,
                 label: "Rematch",
@@ -1532,7 +1601,29 @@ impl Screen {
                 label: "Quit",
                 enabled: true,
             },
+            self.size_button(),
+            self.pieces_button(),
         ]
+    }
+
+    fn size_button(&self) -> ButtonSpec {
+        ButtonSpec {
+            action: UiAction::ToggleSize,
+            label: if self.compact { "Size:Small" } else { "Size:Big" },
+            enabled: true,
+        }
+    }
+
+    fn pieces_button(&self) -> ButtonSpec {
+        ButtonSpec {
+            action: UiAction::CyclePieces,
+            label: match self.pieces {
+                ui::Pieces::Auto => "Piece:Auto",
+                ui::Pieces::Art => "Piece:Art",
+                ui::Pieces::Glyph => "Piece:Glyph",
+            },
+            enabled: !self.theme.ascii,
+        }
     }
 
     fn render_buttons(&self, specs: &[ButtonSpec], width: usize) -> RenderedBody {
@@ -1552,11 +1643,18 @@ impl Screen {
             let gap = usize::from(column > 0) * 2;
             lines[row].push_str(&" ".repeat(gap));
             column += gap;
+            let danger = self.confirming == Some(spec.action)
+                || matches!(spec.action, UiAction::Resign | UiAction::Restart);
             let styled = if !spec.enabled {
                 self.theme.dim(&plain)
-            } else if self.confirming == Some(spec.action)
-                || matches!(spec.action, UiAction::Resign | UiAction::Restart)
-            {
+            } else if self.focused == spec.action {
+                let color = if danger {
+                    self.theme.palette.warn
+                } else {
+                    self.theme.palette.accent
+                };
+                self.theme.focused(color, &plain)
+            } else if danger {
                 self.theme.warn(&plain)
             } else {
                 self.theme.accent(&plain)
@@ -1627,9 +1725,14 @@ impl Screen {
         if self.last_prompt.as_ref() == Some(&line) {
             return;
         }
-        print!("\r\x1b[K{}", line);
+        self.last_prompt = Some(line.clone());
+        print!(
+            "\x1b[{};1H\x1b[K{}{}",
+            self.rows,
+            ui::clip(&line, self.cols),
+            self.prompt_cursor_escape()
+        );
         let _ = io::stdout().flush();
-        self.last_prompt = Some(line);
     }
 
     /// Return the cursor to the end of the command line after a partial
@@ -1637,6 +1740,9 @@ impl Screen {
     /// final cursor position at column one makes the caret appear to jump
     /// away from text that is still correctly cached on the bottom row.
     fn prompt_cursor_escape(&self) -> String {
+        if self.focused != UiAction::MoveInput {
+            return "\x1b[?25l".to_string();
+        }
         let column = self
             .last_prompt
             .as_deref()
@@ -1800,6 +1906,7 @@ fn play(options: Options) -> Result<(), String> {
         board_hitbox: None,
         body_top: 0,
         action_hitboxes: Vec::new(),
+        focused: UiAction::MoveInput,
         history_offset: 0,
         history_capacity: 0,
         confirming: None,
@@ -1819,7 +1926,10 @@ fn play(options: Options) -> Result<(), String> {
     // Held for as long as the game lasts. Whatever was on the terminal before
     // comes back when this is dropped, however the program ends.
     let _fullscreen = ui::Fullscreen::enter(&screen.theme);
-    if screen.theme.live && !screen.theme.ascii && screen.pieces == ui::Pieces::Auto {
+    // Probe once up front even when another piece style was requested. The
+    // in-game Piece control can switch to Auto later without querying the
+    // terminal in the middle of raw event input.
+    if screen.theme.live && !screen.theme.ascii {
         screen.inline_images = ui::detect_inline_images();
     }
 
@@ -1841,7 +1951,9 @@ fn play(options: Options) -> Result<(), String> {
     let mut engine = Search::new();
     let mut limits = options.limits;
     screen.flipped = mode == Mode::HumanBlack;
-    screen.message = vec![screen.theme.dim("Click a piece, then its target.")];
+    screen.message = vec![screen
+        .theme
+        .dim("Type a move, click a piece, or press Tab for controls.")];
 
     loop {
         let flag_before = game.clock.flagged;
@@ -1884,9 +1996,24 @@ fn play(options: Options) -> Result<(), String> {
         };
 
         let line = match action {
-            InputAction::Submit(line) => line,
+            InputAction::Submit(line) => {
+                if line.is_empty() && screen.focused != UiAction::MoveInput {
+                    if handle_ui_action(screen.focused, &mut game, mode, &mut screen) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                line
+            }
             InputAction::Prompt => {
+                if screen.focus_move_input() {
+                    continue;
+                }
                 screen.draw_prompt(&game, terminal_input.buffer());
+                continue;
+            }
+            InputAction::Focus { reverse } => {
+                screen.move_focus(reverse);
                 continue;
             }
             InputAction::Resize => {
@@ -1899,6 +2026,7 @@ fn play(options: Options) -> Result<(), String> {
                 continue;
             }
             InputAction::Cancel => {
+                let focus_changed = screen.focus_move_input();
                 if screen.page.take().is_some() {
                     screen.redraw = true;
                 } else {
@@ -1906,7 +2034,7 @@ fn play(options: Options) -> Result<(), String> {
                         || !screen.targets.is_empty()
                         || !screen.promotions.is_empty();
                     let confirmation = screen.confirming.take().is_some();
-                    if cancelled || confirmation {
+                    if cancelled || confirmation || focus_changed {
                         screen.targets.clear();
                         screen.promotions.clear();
                         screen.redraw = true;
@@ -1931,6 +2059,7 @@ fn play(options: Options) -> Result<(), String> {
                     continue;
                 }
                 if let Some(action) = screen.action_at(column, row) {
+                    screen.focus(action);
                     if handle_ui_action(action, &mut game, mode, &mut screen) {
                         return Ok(());
                     }
@@ -2133,6 +2262,9 @@ fn split_command(input: &str) -> (String, &str) {
 /// Returns true when the application should close.
 fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut Screen) -> bool {
     match action {
+        UiAction::MoveInput => {
+            screen.focus_move_input();
+        }
         UiAction::Undo => {
             screen.confirming = None;
             undo(game, mode, screen);
@@ -2167,7 +2299,7 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
                 screen.redraw = true;
             } else {
                 screen.confirming = Some(UiAction::Resign);
-                screen.note(screen.theme.warn("Click Confirm to resign, or press Escape."));
+                screen.note(screen.theme.warn("Choose Confirm to resign, or press Escape."));
             }
         }
         UiAction::Restart => {
@@ -2177,9 +2309,11 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
                 screen.note(screen.theme.good("New game."));
             } else {
                 screen.confirming = Some(UiAction::Restart);
-                screen.note(screen.theme.warn("Click Confirm to restart, or press Escape."));
+                screen.note(screen.theme.warn("Choose Confirm to restart, or press Escape."));
             }
         }
+        UiAction::ToggleSize => toggle_size(screen),
+        UiAction::CyclePieces => cycle_pieces(screen),
         UiAction::Rematch => {
             game.restart();
             screen.clear_marks();
@@ -2603,10 +2737,7 @@ fn set_pieces(screen: &mut Screen, rest: &str) {
         return;
     }
     match ui::pieces_named(rest) {
-        Some(pieces) => {
-            screen.pieces = pieces;
-            screen.redraw = true;
-        }
+        Some(pieces) => apply_pieces(screen, pieces),
         None => {
             let text = screen
                 .theme
@@ -2614,6 +2745,34 @@ fn set_pieces(screen: &mut Screen, rest: &str) {
             screen.note(text);
         }
     }
+}
+
+fn apply_pieces(screen: &mut Screen, pieces: ui::Pieces) {
+    screen.pieces = pieces;
+    screen.redraw = true;
+}
+
+/// The UI cycles from automatic images directly to font glyphs first. That
+/// gives terminals with soft image scaling a crisp escape hatch in one key or
+/// click, while portable block art remains the third choice.
+fn cycle_pieces(screen: &mut Screen) {
+    let pieces = match screen.pieces {
+        ui::Pieces::Auto => ui::Pieces::Glyph,
+        ui::Pieces::Glyph => ui::Pieces::Art,
+        ui::Pieces::Art => ui::Pieces::Auto,
+    };
+    apply_pieces(screen, pieces);
+    let detail = match pieces {
+        ui::Pieces::Auto if screen.inline_images => "terminal images",
+        ui::Pieces::Auto => "the best available fallback",
+        ui::Pieces::Glyph => "your terminal font for maximum sharpness",
+        ui::Pieces::Art => "portable block artwork",
+    };
+    screen.note(screen.theme.good(&format!(
+        "Piece style: {} — using {}.",
+        pieces.name(),
+        detail
+    )));
 }
 
 fn set_sound(screen: &mut Screen, rest: &str) {
@@ -2702,6 +2861,12 @@ fn set_size(screen: &mut Screen, rest: &str) {
     };
     screen.compact = compact;
     screen.redraw = true;
+}
+
+fn toggle_size(screen: &mut Screen) {
+    screen.compact = !screen.compact;
+    let size = if screen.compact { "small" } else { "big" };
+    screen.note(screen.theme.good(&format!("Board size: {}.", size)));
 }
 
 /// Throwing a game away is the one thing `undo` cannot rescue, so ask first.
@@ -2878,6 +3043,16 @@ fn help_lines(theme: &Theme) -> Vec<String> {
         format!(
             "  {}",
             theme.dim("Page Up / Page Down also scroll the move list.")
+        ),
+        String::new(),
+        theme.bold("KEYBOARD"),
+        format!(
+            "  {}",
+            theme.dim("Tab or arrows move focus; Shift+Tab goes back; Enter selects.")
+        ),
+        format!(
+            "  {}",
+            theme.dim("Start typing at any time to focus the move box.")
         ),
         String::new(),
         theme.bold("MOVES"),
@@ -3176,6 +3351,7 @@ mod interaction_tests {
             board_hitbox: None,
             body_top: 0,
             action_hitboxes: Vec::new(),
+            focused: UiAction::MoveInput,
             history_offset: 0,
             history_capacity: 0,
             confirming: None,
@@ -3398,11 +3574,70 @@ mod interaction_tests {
         let buttons = screen.render_buttons(&screen.game_buttons(&game, Mode::TwoPlayer), 24);
 
         assert!(buttons.lines.len() >= 2);
-        assert_eq!(buttons.actions.len(), 3); // Undo starts disabled.
+        assert_eq!(buttons.actions.len(), 6); // Undo starts disabled.
         assert!(buttons
             .actions
             .iter()
             .all(|target| target.left + target.width <= 24));
+    }
+
+    #[test]
+    fn short_side_panel_gives_controls_priority_over_history() {
+        let game = Game::new(Position::startpos());
+        let screen = screen();
+        let panel = screen.panel(&game, Mode::TwoPlayer, &Limits::default(), 10, 24);
+
+        assert_eq!(panel.lines.len(), 10);
+        assert_eq!(panel.history_capacity, 0);
+        assert!(panel.actions.iter().all(|target| target.row < 8));
+    }
+
+    #[test]
+    fn keyboard_focus_follows_the_visible_control_order() {
+        let mut screen = screen();
+        screen.action_hitboxes = vec![
+            ActionHitbox {
+                left: 0,
+                top: 0,
+                width: 8,
+                action: UiAction::MoveInput,
+            },
+            ActionHitbox {
+                left: 10,
+                top: 0,
+                width: 8,
+                action: UiAction::Draw,
+            },
+            ActionHitbox {
+                left: 20,
+                top: 0,
+                width: 12,
+                action: UiAction::ToggleSize,
+            },
+        ];
+
+        screen.move_focus(false);
+        assert_eq!(screen.focused, UiAction::Draw);
+        screen.move_focus(false);
+        assert_eq!(screen.focused, UiAction::ToggleSize);
+        screen.move_focus(false);
+        assert_eq!(screen.focused, UiAction::MoveInput);
+        screen.move_focus(true);
+        assert_eq!(screen.focused, UiAction::ToggleSize);
+    }
+
+    #[test]
+    fn view_controls_cycle_without_a_typed_command() {
+        let mut screen = screen();
+        assert!(!screen.compact);
+        assert_eq!(screen.pieces, ui::Pieces::Glyph);
+
+        toggle_size(&mut screen);
+        cycle_pieces(&mut screen);
+
+        assert!(screen.compact);
+        assert_eq!(screen.pieces, ui::Pieces::Art);
+        assert!(screen.redraw);
     }
 
     #[test]
@@ -3446,5 +3681,8 @@ mod interaction_tests {
         screen.last_prompt = Some("    White › e4".to_string());
 
         assert_eq!(screen.prompt_cursor_escape(), "\x1b[32;15H\x1b[?25h");
+
+        screen.focused = UiAction::Draw;
+        assert_eq!(screen.prompt_cursor_escape(), "\x1b[?25l");
     }
 }

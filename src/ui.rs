@@ -210,13 +210,23 @@ fn stty_size() -> Option<(usize, usize)> {
 // ---------------------------------------------------------------------------
 
 /// Which set of pieces to put on the squares.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pieces {
     /// Drawn pieces when the squares are big enough for them, figurines when
     /// they are not.
     Auto,
     Art,
     Glyph,
+}
+
+impl Pieces {
+    pub fn name(self) -> &'static str {
+        match self {
+            Pieces::Auto => "auto",
+            Pieces::Art => "art",
+            Pieces::Glyph => "glyph",
+        }
+    }
 }
 
 pub fn pieces_named(name: &str) -> Option<Pieces> {
@@ -603,6 +613,12 @@ impl Theme {
 
     pub fn label(&self, text: &str) -> String {
         self.fg(self.palette.label, text)
+    }
+
+    /// Keyboard focus is deliberately stronger than an ordinary accent: it
+    /// must remain unmistakable across every board palette.
+    pub fn focused(&self, color: u8, text: &str) -> String {
+        self.sgr(&format!("1;7;38;5;{}", color), text)
     }
 
     // -- screen -------------------------------------------------------------

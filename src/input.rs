@@ -13,6 +13,7 @@ pub enum Action {
     Submit(String),
     Click { column: u16, row: u16 },
     Cancel,
+    Focus { reverse: bool },
     Prompt,
     Resize,
     Tick,
@@ -147,6 +148,16 @@ impl TerminalInput {
             }
             KeyCode::PageUp if self.buffer.is_empty() => Some(Action::History { older: true }),
             KeyCode::PageDown if self.buffer.is_empty() => Some(Action::History { older: false }),
+            KeyCode::BackTab if self.buffer.is_empty() => Some(Action::Focus { reverse: true }),
+            KeyCode::Tab if self.buffer.is_empty() => Some(Action::Focus {
+                reverse: key.modifiers.contains(KeyModifiers::SHIFT),
+            }),
+            KeyCode::Left | KeyCode::Up if self.buffer.is_empty() => {
+                Some(Action::Focus { reverse: true })
+            }
+            KeyCode::Right | KeyCode::Down if self.buffer.is_empty() => {
+                Some(Action::Focus { reverse: false })
+            }
             KeyCode::Char(c) if !c.is_control() => {
                 self.buffer.push(c);
                 Some(Action::Prompt)
@@ -159,5 +170,39 @@ impl TerminalInput {
 impl Drop for TerminalInput {
     fn drop(&mut self) {
         let _ = self.suspend();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input() -> TerminalInput {
+        TerminalInput {
+            active: false,
+            buffer: String::new(),
+        }
+    }
+
+    #[test]
+    fn tab_and_arrows_navigate_controls_when_the_prompt_is_empty() {
+        let mut input = input();
+        assert!(matches!(
+            input.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::Focus { reverse: false })
+        ));
+        assert!(matches!(
+            input.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Action::Focus { reverse: true })
+        ));
+        assert!(matches!(
+            input.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(Action::Focus { reverse: true })
+        ));
+
+        input.buffer.push('e');
+        assert!(input
+            .key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .is_none());
     }
 }
