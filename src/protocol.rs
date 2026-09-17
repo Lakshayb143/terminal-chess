@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Increment this only for a breaking wire-format or behavior change.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientEnvelope {
@@ -132,6 +132,7 @@ pub struct GameSnapshot {
     pub moves: Vec<String>,
     pub last_move: Option<String>,
     pub side_to_move: Side,
+    pub time_control: TimeControl,
     pub white: PlayerSnapshot,
     pub black: PlayerSnapshot,
     pub clock: ClockSnapshot,
@@ -250,6 +251,10 @@ mod tests {
             moves: vec!["e2e4".to_string()],
             last_move: Some("e2e4".to_string()),
             side_to_move: Side::Black,
+            time_control: TimeControl {
+                initial_ms: 300_000,
+                increment_ms: 2_000,
+            },
             white: PlayerSnapshot {
                 name: "White".to_string(),
                 connected: true,

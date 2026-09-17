@@ -2,17 +2,22 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use std::time::Instant;
 
 use chess::board::{self, Color, Move, MoveKind, Piece, PieceKind, Position};
-use chess::game::{describe, outcome, outcome_detail, score_tag, Game, Outcome};
+use chess::client::{OnlineClient, TransportEvent};
 #[cfg(test)]
 use chess::game::GameClock;
+use chess::game::{describe, outcome, outcome_detail, score_tag, Game, Outcome};
 use chess::input::{Action as InputAction, TerminalInput};
 use chess::movegen::{generate_legal, in_check};
+use chess::protocol::{
+    ClientCommand, ErrorCode, FinishReason, GameResult, GameSnapshot, GameStatus, MoveRejection,
+    ServerEvent, Side, TimeControl,
+};
 use chess::san::{parse_move, to_san, to_san_with, ParseError};
 use chess::search::{self, Limits, Search, SearchResult};
 use chess::ui::{self, BoardView, Theme};
@@ -72,6 +77,13 @@ enum StartChoice {
     Resume,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OnlineIntent {
+    Create,
+    Join(String),
+    Resume,
+}
+
 struct Options {
     /// `None` until the opening menu asks which side to take.
     mode: Option<Mode>,
@@ -94,6 +106,9 @@ struct Options {
     /// Restore the default autosave, or a specifically named saved game.
     resume: bool,
     load: Option<PathBuf>,
+    online: Option<OnlineIntent>,
+    server_url: String,
+    online_name: String,
 }
 
 const HELP: &str = "\
@@ -101,6 +116,9 @@ chess - play chess in your terminal
 
 USAGE:
     chess [OPTIONS]
+    chess online create [OPTIONS]
+    chess online join <CODE> [OPTIONS]
+    chess online resume [OPTIONS]
 
 GAME:
     -w, --white          play White against the engine (asked for if omitted)
@@ -116,6 +134,13 @@ GAME:
                          (quote it: it contains spaces)
         --resume         continue the automatically saved local game
         --load <FILE>    open a saved Terminal Chess game
+
+ONLINE:
+        online create    create a private game and show its invite code
+        online join CODE join a private game as Black
+        online resume    reconnect to the last active online game
+        --server <URL>   WebSocket endpoint (or CHESS_SERVER_URL)
+        --name <NAME>    name shown to the other player
 
 LOOK:
         --theme <NAME>   board colours: slate, wood, forest, mono
@@ -164,6 +189,10 @@ impl Options {
             increment: Duration::from_secs_f64(preferences.increment_seconds),
             resume: false,
             load: None,
+            online: None,
+            server_url: std::env::var("CHESS_SERVER_URL")
+                .unwrap_or_else(|_| "ws://127.0.0.1:3000/ws".to_string()),
+            online_name: preferences.white_name.clone(),
         };
         // Tracked so that `--depth` alone means "this depth, no clock", while
         // `--depth` with `--time` means "this depth, but stop when time runs out".
@@ -253,12 +282,46 @@ impl Options {
                 "--fen" => options.fen = Some(value("--fen")?),
                 "--resume" => options.resume = true,
                 "--load" => options.load = Some(PathBuf::from(value("--load")?)),
+                "--server" => options.server_url = value("--server")?,
+                "--name" => options.online_name = value("--name")?,
+                "online" => {
+                    if options.online.is_some() {
+                        return Err("online mode was specified more than once".to_string());
+                    }
+                    let action = value("online")?;
+                    options.online = Some(match action.as_str() {
+                        "create" => OnlineIntent::Create,
+                        "join" => OnlineIntent::Join(value("online join")?.to_ascii_uppercase()),
+                        "resume" => OnlineIntent::Resume,
+                        _ => {
+                            return Err(format!(
+                                "online wants create, join <CODE>, or resume, not '{action}'"
+                            ))
+                        }
+                    });
+                }
                 other => return Err(format!("unknown option '{}'", other)),
             }
         }
         // `--time` after `--depth` has to put the clock back.
         if timed && options.limits.movetime.is_none() {
             options.limits.movetime = Some(Limits::default().movetime.unwrap());
+        }
+        if options.online.is_some()
+            && !(options.server_url.starts_with("ws://")
+                || options.server_url.starts_with("wss://"))
+        {
+            return Err("--server must begin with ws:// or wss://".to_string());
+        }
+        options.online_name = options
+            .online_name
+            .trim()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(32)
+            .collect();
+        if options.online.is_some() && options.online_name.is_empty() {
+            return Err("--name cannot be empty".to_string());
         }
         Ok(Some(options))
     }
@@ -275,11 +338,7 @@ fn saved_game(game: &mut Game, mode: Mode) -> storage::SavedGame {
         .clock
         .initial
         .map(|time| time.as_millis().min(u64::MAX as u128) as u64);
-    saved.increment_ms = game
-        .clock
-        .increment
-        .as_millis()
-        .min(u64::MAX as u128) as u64;
+    saved.increment_ms = game.clock.increment.as_millis().min(u64::MAX as u128) as u64;
     saved.remaining_ms = game.clock.snapshot();
     saved.paused = game.paused;
     saved.resigned = game.resigned.map(|color| color.name().to_ascii_lowercase());
@@ -474,6 +533,43 @@ struct Screen {
     /// not keep sending the same cursor movement and text.
     last_prompt: Option<String>,
     redraw: bool,
+    online: Option<OnlineDisplay>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionDisplay {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Stopped,
+}
+
+struct OnlineDisplay {
+    connection: ConnectionDisplay,
+    invite_code: Option<String>,
+    your_side: Option<Color>,
+    white_connected: bool,
+    black_connected: bool,
+    reconnect_deadline_ms: Option<u64>,
+    move_pending: bool,
+}
+
+impl OnlineDisplay {
+    fn connected(&self, color: Color) -> bool {
+        match color {
+            Color::White => self.white_connected,
+            Color::Black => self.black_connected,
+        }
+    }
+
+    fn can_move(&self, game: &Game) -> bool {
+        self.connection == ConnectionDisplay::Connected
+            && self.your_side == Some(game.pos.side)
+            && self.white_connected
+            && self.black_connected
+            && !self.move_pending
+            && outcome(game).is_none()
+    }
 }
 
 /// A page shown instead of the board, with a heading over it.
@@ -568,8 +664,16 @@ impl BoardHitbox {
 
         let display_file = (x / self.cell_w) as u8;
         let display_rank = (y / self.cell_h) as u8;
-        let file = if self.flipped { 7 - display_file } else { display_file };
-        let rank = if self.flipped { display_rank } else { 7 - display_rank };
+        let file = if self.flipped {
+            7 - display_file
+        } else {
+            display_file
+        };
+        let rank = if self.flipped {
+            display_rank
+        } else {
+            7 - display_rank
+        };
         Some(board::sq(file, rank))
     }
 }
@@ -588,7 +692,11 @@ impl Screen {
         let preferred = if live && !self.compact {
             // Drawn pieces are made of Unicode block elements, exactly the kind
             // of character `--ascii` is there to say the terminal has not got.
-            let pieces = if self.theme.ascii { ui::Pieces::Glyph } else { self.pieces };
+            let pieces = if self.theme.ascii {
+                ui::Pieces::Glyph
+            } else {
+                self.pieces
+            };
             ui::Metrics::fit(self.cols, self.rows, pieces)
         } else {
             ui::Metrics::COMPACT
@@ -598,7 +706,11 @@ impl Screen {
             .saturating_sub(preferred.board_width() + self.gap_for(preferred) + 2)
             >= 24;
         self.metrics = if live && !self.compact && !self.wide_panel {
-            let pieces = if self.theme.ascii { ui::Pieces::Glyph } else { self.pieces };
+            let pieces = if self.theme.ascii {
+                ui::Pieces::Glyph
+            } else {
+                self.pieces
+            };
             ui::Metrics::fit_with_reserve(self.cols, self.rows, pieces, 5)
         } else {
             preferred
@@ -668,7 +780,10 @@ impl Screen {
     /// over, and is simply printed when the session is a transcript.
     fn open(&mut self, title: &str, lines: Vec<String>) {
         if self.theme.live {
-            self.page = Some(Page { title: title.to_string(), lines });
+            self.page = Some(Page {
+                title: title.to_string(),
+                lines,
+            });
             self.redraw = true;
         } else {
             println!();
@@ -760,7 +875,11 @@ impl Screen {
         // board sits in the middle of the window rather than riding up it. A
         // page is read from the top, so it starts at the top.
         let spare = self.rows.saturating_sub(frame.len() + body.len() + 1);
-        let above = if self.page.is_some() { 1.min(spare) } else { spare / 2 };
+        let above = if self.page.is_some() {
+            1.min(spare)
+        } else {
+            spare / 2
+        };
         for _ in 0..above {
             frame.push(String::new());
         }
@@ -870,7 +989,11 @@ impl Screen {
         if self.wide_panel {
             let left = self.indent.len() + self.metrics.board_width() + self.gap();
             let width = self.panel_width();
-            let top = if self.flipped { Color::White } else { Color::Black };
+            let top = if self.flipped {
+                Color::White
+            } else {
+                Color::Black
+            };
             updates.push((left, self.body_top, width, top));
             updates.push((
                 left,
@@ -879,10 +1002,14 @@ impl Screen {
                 top.flip(),
             ));
         } else {
-            let first = self.body_top
-                + self.metrics.board_height()
-                + usize::from(!ui::tight(self.rows));
-            updates.push((self.indent.len(), first, self.metrics.board_width(), Color::White));
+            let first =
+                self.body_top + self.metrics.board_height() + usize::from(!ui::tight(self.rows));
+            updates.push((
+                self.indent.len(),
+                first,
+                self.metrics.board_width(),
+                Color::White,
+            ));
             updates.push((
                 self.indent.len(),
                 first + 1,
@@ -962,9 +1089,7 @@ impl Screen {
         if controls.is_empty() {
             return;
         }
-        let current = controls
-            .iter()
-            .position(|&action| action == self.focused);
+        let current = controls.iter().position(|&action| action == self.focused);
         let next = match (current, reverse) {
             (Some(0), true) | (None, true) => controls.len() - 1,
             (Some(index), true) => index - 1,
@@ -1120,7 +1245,11 @@ impl Screen {
                 history_capacity: 0,
             };
         }
-        let top = if self.flipped { Color::White } else { Color::Black };
+        let top = if self.flipped {
+            Color::White
+        } else {
+            Color::Black
+        };
         let bottom = top.flip();
         rows[0] = self.player_line(game, mode, limits, top, width, false);
         rows[1] = self.capture_line(game, top);
@@ -1132,6 +1261,7 @@ impl Screen {
                 Outcome::Checkmate(_) => "CHECKMATE",
                 Outcome::Resignation(_) => "RESIGNED",
                 Outcome::Timeout(_) => "TIME",
+                Outcome::Abandonment(_) => "ABANDONED",
                 _ => "DRAW",
             };
             rows[3] = self.theme.strong(self.theme.palette.accent, "GAME OVER");
@@ -1237,7 +1367,11 @@ impl Screen {
                 .and_then(|slice| slice.first())
                 .map(String::as_str)
                 .unwrap_or("No moves yet");
-            let heading = if played.len() > 1 { "MOVES ↑↓" } else { "MOVES" };
+            let heading = if played.len() > 1 {
+                "MOVES ↑↓"
+            } else {
+                "MOVES"
+            };
             lines.push(format!(
                 "{}  {}",
                 self.theme.label(heading),
@@ -1263,7 +1397,10 @@ impl Screen {
             .collect();
 
         RenderedBody {
-            lines: lines.into_iter().map(|line| ui::clip(&line, width)).collect(),
+            lines: lines
+                .into_iter()
+                .map(|line| ui::clip(&line, width))
+                .collect(),
             actions,
             history_capacity,
         }
@@ -1287,6 +1424,7 @@ impl Screen {
         };
         let player = match (mode, color) {
             (Mode::HumanWhite, Color::Black) | (Mode::HumanBlack, Color::White) => "Engine",
+            _ if self.player_names[color.index()].is_empty() => "Waiting…",
             _ => &self.player_names[color.index()],
         };
         let name = if to_move {
@@ -1294,14 +1432,33 @@ impl Screen {
         } else {
             theme.label(player)
         };
-        let role = match player {
+        let mut role = match player {
             _ if width < 30 => String::new(),
             "Engine" if width >= 34 => {
-                format!("{} · {}", color.name().to_ascii_uppercase(), budget_text(limits))
+                format!(
+                    "{} · {}",
+                    color.name().to_ascii_uppercase(),
+                    budget_text(limits)
+                )
             }
             _ => color.name().to_ascii_uppercase(),
         };
-        let marker = if to_move { theme.accent(marker) } else { marker.to_string() };
+        if self
+            .online
+            .as_ref()
+            .is_some_and(|online| !online.connected(color) && player != "Waiting…")
+        {
+            role = if role.is_empty() {
+                "OFFLINE".to_string()
+            } else {
+                format!("{role} · OFFLINE")
+            };
+        }
+        let marker = if to_move {
+            theme.accent(marker)
+        } else {
+            marker.to_string()
+        };
         let icon = theme.piece(Piece::new(color, PieceKind::King));
         let mut left = if role.is_empty() {
             format!("{} {} {}", marker, icon, name)
@@ -1323,10 +1480,7 @@ impl Screen {
         } else {
             theme.label(&clock)
         };
-        let left = ui::clip(
-            &left,
-            width.saturating_sub(ui::width(&clock) + 1),
-        );
+        let left = ui::clip(&left, width.saturating_sub(ui::width(&clock) + 1));
         let gap = width
             .saturating_sub(ui::width(&left) + ui::width(&clock))
             .max(1);
@@ -1357,7 +1511,9 @@ impl Screen {
     }
 
     fn history_bounds(&self, len: usize, capacity: usize) -> (usize, usize) {
-        let offset = self.history_offset.min(len.saturating_sub(capacity.min(len)));
+        let offset = self
+            .history_offset
+            .min(len.saturating_sub(capacity.min(len)));
         let end = len.saturating_sub(offset);
         (end.saturating_sub(capacity), end)
     }
@@ -1381,6 +1537,38 @@ impl Screen {
             Some(_) => "Offered",
             None => "Draw",
         };
+        if let Some(online) = &self.online {
+            return vec![
+                ButtonSpec {
+                    action: UiAction::MoveInput,
+                    label: "Move",
+                    enabled: online.can_move(game),
+                },
+                ButtonSpec {
+                    action: UiAction::Draw,
+                    label: draw_label,
+                    enabled: online.connection == ConnectionDisplay::Connected
+                        && online.white_connected
+                        && online.black_connected
+                        && game.draw_offer != online.your_side
+                        && outcome(game).is_none(),
+                },
+                ButtonSpec {
+                    action: UiAction::Resign,
+                    label: if self.confirming == Some(UiAction::Resign) {
+                        "Confirm resign"
+                    } else {
+                        "Resign"
+                    },
+                    enabled: online.connection == ConnectionDisplay::Connected
+                        && outcome(game).is_none()
+                        && online.white_connected
+                        && online.black_connected,
+                },
+                self.size_button(),
+                self.pieces_button(),
+            ];
+        }
         vec![
             ButtonSpec {
                 action: UiAction::MoveInput,
@@ -1426,6 +1614,17 @@ impl Screen {
     }
 
     fn game_over_buttons(&self) -> Vec<ButtonSpec> {
+        if self.online.is_some() {
+            return vec![
+                ButtonSpec {
+                    action: UiAction::Quit,
+                    label: "Quit",
+                    enabled: true,
+                },
+                self.size_button(),
+                self.pieces_button(),
+            ];
+        }
         vec![
             ButtonSpec {
                 action: UiAction::MoveInput,
@@ -1450,7 +1649,11 @@ impl Screen {
     fn size_button(&self) -> ButtonSpec {
         ButtonSpec {
             action: UiAction::ToggleSize,
-            label: if self.compact { "Size:Small" } else { "Size:Big" },
+            label: if self.compact {
+                "Size:Small"
+            } else {
+                "Size:Big"
+            },
             enabled: true,
         }
     }
@@ -1520,6 +1723,48 @@ impl Screen {
 
     fn state_line(&self, game: &Game) -> String {
         let theme = &self.theme;
+        if let Some(online) = &self.online {
+            match online.connection {
+                ConnectionDisplay::Connecting => {
+                    return format!(
+                        "{}  {}",
+                        theme.strong(theme.palette.accent, "CONNECTING"),
+                        theme.dim("opening a secure game connection")
+                    );
+                }
+                ConnectionDisplay::Reconnecting => {
+                    return format!(
+                        "{}  {}",
+                        theme.strong(theme.palette.warn, "RECONNECTING"),
+                        theme.dim("your seat is reserved; moves are paused here")
+                    );
+                }
+                ConnectionDisplay::Stopped => {
+                    return format!(
+                        "{}  {}",
+                        theme.strong(theme.palette.warn, "OFFLINE"),
+                        theme.dim("type quit, then run online resume to return")
+                    );
+                }
+                ConnectionDisplay::Connected => {}
+            }
+            if online.reconnect_deadline_ms.is_some() {
+                return format!(
+                    "{}  {}",
+                    theme.strong(theme.palette.warn, "OPPONENT OFFLINE"),
+                    theme.dim("their seat is held for 60 seconds")
+                );
+            }
+            if let Some(code) = &online.invite_code {
+                if !online.black_connected {
+                    return format!(
+                        "{}  {}",
+                        theme.strong(theme.palette.accent, &format!("INVITE {code}")),
+                        theme.dim("share this code; waiting for your opponent")
+                    );
+                }
+            }
+        }
         if let Some(result) = outcome(game) {
             return format!(
                 "{}  {}",
@@ -1536,9 +1781,14 @@ impl Screen {
         }
         let separator = theme.dim("  \u{b7}  ");
         let mut parts = vec![
+            self.online
+                .as_ref()
+                .map(|_| theme.accent("online"))
+                .unwrap_or_default(),
             theme.dim(&format!("move {}", game.pos.fullmove)),
             format!("{} to move", theme.bold(game.pos.side.name())),
         ];
+        parts.retain(|part| !part.is_empty());
         if in_check(&game.pos, game.pos.side) {
             parts.push(theme.warn("check!"));
         }
@@ -1556,6 +1806,12 @@ impl Screen {
         let arrow = if self.theme.ascii { ">" } else { "\u{203a}" };
         let label = if outcome(game).is_some() {
             "Game over"
+        } else if self
+            .online
+            .as_ref()
+            .is_some_and(|online| !online.can_move(game))
+        {
+            "Online"
         } else {
             game.pos.side.name()
         };
@@ -1732,7 +1988,973 @@ fn wrap(words: &[String], width: usize, indent: &str) -> Vec<String> {
 // The game loop
 // ---------------------------------------------------------------------------
 
+struct OnlineSession {
+    client: OnlineClient,
+    intent: OnlineIntent,
+    server_url: String,
+    seat_path: PathBuf,
+    game_id: Option<String>,
+    reconnect_token: Option<String>,
+    side: Option<Color>,
+    player_name: String,
+    has_snapshot: bool,
+}
+
+impl OnlineSession {
+    fn send(&self, command: ClientCommand, screen: &mut Screen) -> bool {
+        match self.client.send(command) {
+            Ok(()) => true,
+            Err(error) => {
+                if let Some(online) = &mut screen.online {
+                    online.connection = ConnectionDisplay::Stopped;
+                    online.move_pending = false;
+                }
+                screen.note(screen.theme.warn(&error));
+                false
+            }
+        }
+    }
+
+    fn reconnect_command(&self) -> Option<ClientCommand> {
+        Some(ClientCommand::Reconnect {
+            game_id: self.game_id.clone()?,
+            reconnect_token: self.reconnect_token.clone()?,
+        })
+    }
+
+    fn save_seat(&self) -> Result<(), String> {
+        let side = self
+            .side
+            .ok_or_else(|| "online seat has no assigned side".to_string())?;
+        let game_id = self
+            .game_id
+            .clone()
+            .ok_or_else(|| "online seat has no game id".to_string())?;
+        let token = self
+            .reconnect_token
+            .clone()
+            .ok_or_else(|| "online seat has no reconnect token".to_string())?;
+        storage::save_online_seat(
+            &self.seat_path,
+            &storage::SavedOnlineSeat::new(
+                self.server_url.clone(),
+                game_id,
+                token,
+                side.name().to_ascii_lowercase(),
+            ),
+        )
+    }
+}
+
+fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Result<(), String> {
+    let config_path = loaded.path;
+    let seat_path = storage::default_online_session_path(&config_path);
+    let intent = options
+        .online
+        .take()
+        .expect("online mode checked by caller");
+    let restored_seat = if intent == OnlineIntent::Resume {
+        Some(
+            storage::load_online_seat(&seat_path)
+                .map_err(|error| format!("could not resume the last online game: {error}"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(seat) = &restored_seat {
+        options.server_url = seat.server_url.clone();
+    }
+
+    let initial_side = restored_seat
+        .as_ref()
+        .and_then(|seat| color_named(&seat.side))
+        .or(match intent {
+            OnlineIntent::Create => Some(Color::White),
+            OnlineIntent::Join(_) => Some(Color::Black),
+            OnlineIntent::Resume => None,
+        });
+    let color = options.color.unwrap_or_else(Theme::detect_color);
+    let mut player_names = [String::new(), String::new()];
+    if let Some(side) = initial_side {
+        player_names[side.index()] = options.online_name.clone();
+    }
+    let mut screen = Screen {
+        theme: Theme::new(
+            color,
+            options.ascii,
+            color && Theme::detect_live(),
+            options.palette,
+        ),
+        sound: sound::Player::new(options.sound),
+        inline_images: false,
+        flipped: options.flipped || initial_side == Some(Color::Black),
+        cols: 80,
+        rows: 24,
+        metrics: ui::Metrics::COMPACT,
+        wide_panel: false,
+        pieces: options.pieces,
+        player_names,
+        compact: options.compact,
+        indent: "  ".to_string(),
+        board_hitbox: None,
+        body_top: 0,
+        action_hitboxes: Vec::new(),
+        focused: UiAction::MoveInput,
+        history_offset: 0,
+        history_capacity: 0,
+        confirming: None,
+        analysis: Vec::new(),
+        message: vec![Theme::new(color, options.ascii, color, options.palette)
+            .dim("Connecting to the game server…")],
+        selected: None,
+        targets: Vec::new(),
+        captures: Vec::new(),
+        invalid: None,
+        promotions: Vec::new(),
+        page: None,
+        last_frame: Vec::new(),
+        last_size: None,
+        inline_drawn: false,
+        last_inline_board: None,
+        last_prompt: None,
+        redraw: true,
+        online: Some(OnlineDisplay {
+            connection: ConnectionDisplay::Connecting,
+            invite_code: None,
+            your_side: initial_side,
+            white_connected: false,
+            black_connected: false,
+            reconnect_deadline_ms: None,
+            move_pending: true,
+        }),
+    };
+    let _fullscreen = ui::Fullscreen::enter(&screen.theme);
+    if screen.theme.live && !screen.theme.ascii {
+        screen.inline_images = ui::detect_inline_images();
+    }
+
+    let mut game = Game::with_clock(Position::startpos(), options.clock, options.increment);
+    game.clock.pause();
+    let client = OnlineClient::connect(options.server_url.clone());
+    let mut session = OnlineSession {
+        client,
+        intent,
+        server_url: options.server_url,
+        seat_path,
+        game_id: restored_seat.as_ref().map(|seat| seat.game_id.clone()),
+        reconnect_token: restored_seat
+            .as_ref()
+            .map(|seat| seat.reconnect_token.clone()),
+        side: initial_side,
+        player_name: options.online_name,
+        has_snapshot: false,
+    };
+    let mut terminal_input = TerminalInput::enter(screen.theme.live && screen.theme.color)?;
+    let limits = Limits::default();
+    let mut last_preferences = loaded.preferences;
+    let mut persistence_error_reported = false;
+
+    loop {
+        while let Some(event) = session.client.try_recv() {
+            handle_transport_event(event, &mut session, &mut game, &mut screen)?;
+        }
+
+        let preferences = online_preferences(&last_preferences, &screen, &session, &game);
+        if preferences != last_preferences {
+            if let Err(error) = storage::save_preferences(&config_path, &preferences) {
+                if !persistence_error_reported {
+                    screen.note(
+                        screen
+                            .theme
+                            .warn(&format!("Preferences were not saved: {error}")),
+                    );
+                    persistence_error_reported = true;
+                }
+            } else {
+                last_preferences = preferences;
+            }
+        }
+
+        if game.clock.tick() {
+            screen.draw_clock_tick(&game, Mode::TwoPlayer, &limits);
+        }
+        if screen.redraw {
+            screen.redraw = false;
+            screen.draw(&game, Mode::TwoPlayer, &limits);
+        }
+
+        let action = if terminal_input.is_active() {
+            screen.draw_prompt(&game, terminal_input.buffer());
+            terminal_input.read_for(Duration::from_millis(100))?
+        } else {
+            let mut stdin = io::stdin().lock();
+            match read_line(&mut stdin, &screen.prompt(&game))? {
+                Some(line) => InputAction::Submit(line),
+                None => InputAction::Quit,
+            }
+        };
+
+        let line = match action {
+            InputAction::Submit(line) => {
+                if line.is_empty() && screen.focused != UiAction::MoveInput {
+                    if handle_online_action(screen.focused, &game, &session, &mut screen) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                line
+            }
+            InputAction::Prompt => {
+                let cleared_invalid = screen.invalid.take().is_some();
+                if screen.focus_move_input() || cleared_invalid {
+                    screen.redraw = true;
+                } else {
+                    screen.draw_prompt(&game, terminal_input.buffer());
+                }
+                continue;
+            }
+            InputAction::Focus { reverse } => {
+                screen.move_focus(reverse);
+                continue;
+            }
+            InputAction::Resize => {
+                screen.redraw = true;
+                continue;
+            }
+            InputAction::Tick => continue,
+            InputAction::History { older } => {
+                screen.scroll_history(&game, older);
+                continue;
+            }
+            InputAction::Cancel => {
+                let changed = screen.focus_move_input()
+                    || screen.page.take().is_some()
+                    || screen.selected.take().is_some()
+                    || screen.confirming.take().is_some()
+                    || !screen.promotions.is_empty();
+                screen.targets.clear();
+                screen.captures.clear();
+                screen.promotions.clear();
+                if changed {
+                    screen.redraw = true;
+                }
+                continue;
+            }
+            InputAction::Click { column, row } => {
+                if screen.page.take().is_some() {
+                    screen.redraw = true;
+                    continue;
+                }
+                if let Some(action) = screen.action_at(column, row) {
+                    screen.focus(action);
+                    if handle_online_action(action, &game, &session, &mut screen) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                screen.confirming = None;
+                let square = screen.square_at(column, row);
+                if online_can_move(&screen, &game) {
+                    if let Some(movement) = online_board_click(&game, &mut screen, square) {
+                        send_online_move(&session, &game, movement, &mut screen);
+                    }
+                } else {
+                    explain_online_wait(&game, &mut screen);
+                }
+                continue;
+            }
+            InputAction::Quit => return Ok(()),
+        };
+
+        let input = line.trim();
+        if screen.page.take().is_some() {
+            screen.redraw = true;
+        }
+        if input.is_empty() {
+            screen.redraw = screen.theme.live;
+            continue;
+        }
+        if !screen.promotions.is_empty() && input.len() == 1 {
+            let kind = input.chars().next().and_then(PieceKind::from_char);
+            if let Some(
+                kind @ (PieceKind::Queen | PieceKind::Rook | PieceKind::Bishop | PieceKind::Knight),
+            ) = kind
+            {
+                if let Some(movement) = screen
+                    .promotions
+                    .iter()
+                    .find(|choice| choice.piece.kind == kind)
+                    .map(|choice| choice.movement)
+                {
+                    screen.clear_marks();
+                    send_online_move(&session, &game, movement, &mut screen);
+                }
+                continue;
+            }
+        }
+
+        let (word, rest) = split_command(input);
+        match word.as_str() {
+            "quit" | "exit" | "q" => return Ok(()),
+            "help" | "h" | "?" => {
+                screen.open("ONLINE GAME", online_help_lines(&screen.theme));
+                continue;
+            }
+            "history" | "moveslist" => {
+                screen.open("THE GAME SO FAR", history_page(&screen.theme, &game));
+                continue;
+            }
+            "pgn" => {
+                screen.open("PGN", pgn_lines(&game, &screen.player_names));
+                continue;
+            }
+            "export" => {
+                let path = if rest.is_empty() {
+                    PathBuf::from("game.pgn")
+                } else {
+                    PathBuf::from(rest)
+                };
+                match export_pgn(&path, &game, &screen.player_names) {
+                    Ok(()) => screen.note(
+                        screen
+                            .theme
+                            .good(&format!("Exported PGN to {}.", path.display())),
+                    ),
+                    Err(error) => screen.note(screen.theme.warn(&error)),
+                }
+                continue;
+            }
+            "fen" => {
+                screen.note(screen.theme.accent(&game.pos.to_fen()));
+                continue;
+            }
+            "flip" => {
+                screen.flipped = !screen.flipped;
+                screen.redraw = true;
+                continue;
+            }
+            "theme" => {
+                set_theme(&mut screen, rest);
+                continue;
+            }
+            "pieces" => {
+                set_pieces(&mut screen, rest);
+                continue;
+            }
+            "sound" | "sounds" => {
+                set_sound(&mut screen, rest);
+                continue;
+            }
+            "size" => {
+                set_size(&mut screen, rest);
+                continue;
+            }
+            "draw" => {
+                if rest.eq_ignore_ascii_case("decline") {
+                    respond_to_draw(&session, &game, false, &mut screen);
+                } else {
+                    offer_or_accept_draw(&session, &game, &mut screen);
+                }
+                continue;
+            }
+            "resign" => {
+                send_resignation(&session, &game, &mut screen);
+                continue;
+            }
+            _ => {}
+        }
+
+        if !online_can_move(&screen, &game) {
+            explain_online_wait(&game, &mut screen);
+            continue;
+        }
+        request_online_move(&session, &game, input, &mut screen);
+    }
+}
+
+fn handle_transport_event(
+    event: TransportEvent,
+    session: &mut OnlineSession,
+    game: &mut Game,
+    screen: &mut Screen,
+) -> Result<(), String> {
+    match event {
+        TransportEvent::Connecting { attempt } => {
+            if let Some(online) = &mut screen.online {
+                online.connection = if attempt == 1 && !session.has_snapshot {
+                    ConnectionDisplay::Connecting
+                } else {
+                    ConnectionDisplay::Reconnecting
+                };
+                online.move_pending = true;
+            }
+            screen.redraw = true;
+        }
+        TransportEvent::Connected => {
+            if let Some(online) = &mut screen.online {
+                online.connection = ConnectionDisplay::Connected;
+                online.move_pending = true;
+            }
+            session.send(
+                ClientCommand::Hello {
+                    client_version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+                screen,
+            );
+            let command = session
+                .reconnect_command()
+                .unwrap_or_else(|| match &session.intent {
+                    OnlineIntent::Create => ClientCommand::CreateGame {
+                        player_name: session.player_name.clone(),
+                        time_control: TimeControl {
+                            initial_ms: game
+                                .clock
+                                .initial
+                                .map(|time| time.as_millis().min(u64::MAX as u128) as u64)
+                                .unwrap_or(0),
+                            increment_ms: game.clock.increment.as_millis().min(u64::MAX as u128)
+                                as u64,
+                        },
+                    },
+                    OnlineIntent::Join(code) => ClientCommand::JoinGame {
+                        invite_code: code.clone(),
+                        player_name: session.player_name.clone(),
+                    },
+                    OnlineIntent::Resume => unreachable!("resume has reconnect credentials"),
+                });
+            session.send(command, screen);
+            screen.redraw = true;
+        }
+        TransportEvent::Disconnected { reason, retry_in } => {
+            if let Some(online) = &mut screen.online {
+                online.connection = ConnectionDisplay::Reconnecting;
+                online.move_pending = true;
+            }
+            screen.show(vec![
+                screen
+                    .theme
+                    .warn("Connection lost — reconnecting automatically."),
+                screen.theme.dim(&format!(
+                    "Retrying in {:.1}s · {reason}",
+                    retry_in.as_secs_f32()
+                )),
+            ]);
+        }
+        TransportEvent::Stopped(reason) => {
+            if let Some(online) = &mut screen.online {
+                online.connection = ConnectionDisplay::Stopped;
+                online.move_pending = false;
+            }
+            screen.note(screen.theme.warn(&reason));
+        }
+        TransportEvent::Message(envelope) => match envelope.event {
+            ServerEvent::Welcome { .. } | ServerEvent::Pong => {}
+            ServerEvent::GameCreated {
+                invite_code,
+                reconnect_token,
+                game: snapshot,
+            } => {
+                session.game_id = Some(snapshot.game_id.clone());
+                session.reconnect_token = Some(reconnect_token);
+                session.side = Some(Color::White);
+                if let Some(online) = &mut screen.online {
+                    online.invite_code = Some(invite_code);
+                    online.your_side = session.side;
+                }
+                session.save_seat()?;
+                apply_online_snapshot(snapshot, session, game, screen)?;
+            }
+            ServerEvent::GameJoined {
+                reconnect_token,
+                game: snapshot,
+            } => {
+                session.game_id = Some(snapshot.game_id.clone());
+                session.reconnect_token = Some(reconnect_token);
+                if session.side.is_none() {
+                    session.side = Some(Color::Black);
+                }
+                if let Some(online) = &mut screen.online {
+                    online.your_side = session.side;
+                }
+                session.save_seat()?;
+                apply_online_snapshot(snapshot, session, game, screen)?;
+                screen.note(screen.theme.good("Connected to the game."));
+            }
+            ServerEvent::GameUpdated { game: snapshot } => {
+                apply_online_snapshot(snapshot, session, game, screen)?;
+            }
+            ServerEvent::MoveRejected {
+                reason,
+                game: snapshot,
+                ..
+            } => {
+                apply_online_snapshot(snapshot, session, game, screen)?;
+                let reason = match reason {
+                    MoveRejection::NotYourTurn => "It is not your turn.",
+                    MoveRejection::IllegalMove => "That move is not legal.",
+                    MoveRejection::StalePosition => {
+                        "The position changed before that move arrived. Try again."
+                    }
+                    MoveRejection::GameNotActive => "The game is not active.",
+                };
+                screen.note(screen.theme.warn(reason));
+            }
+            ServerEvent::OpponentDisconnected {
+                reconnect_deadline_ms,
+                ..
+            } => {
+                if let Some(online) = &mut screen.online {
+                    online.reconnect_deadline_ms = Some(reconnect_deadline_ms);
+                    let opponent = session.side.map(Color::flip);
+                    if opponent == Some(Color::White) {
+                        online.white_connected = false;
+                    } else if opponent == Some(Color::Black) {
+                        online.black_connected = false;
+                    }
+                }
+                screen.note(
+                    screen
+                        .theme
+                        .warn("Your opponent disconnected. Their seat is held for 60 seconds."),
+                );
+            }
+            ServerEvent::OpponentReconnected { .. } => {
+                if let Some(online) = &mut screen.online {
+                    online.reconnect_deadline_ms = None;
+                    if session.side == Some(Color::White) {
+                        online.black_connected = true;
+                    } else {
+                        online.white_connected = true;
+                    }
+                }
+                screen.note(screen.theme.good("Your opponent reconnected."));
+            }
+            ServerEvent::Error { code, message } => {
+                if matches!(
+                    code,
+                    ErrorCode::UnsupportedProtocol
+                        | ErrorCode::GameNotFound
+                        | ErrorCode::InvalidReconnectToken
+                ) && session.reconnect_token.is_some()
+                {
+                    if let Some(online) = &mut screen.online {
+                        online.connection = ConnectionDisplay::Stopped;
+                        online.move_pending = false;
+                    }
+                }
+                screen.note(screen.theme.warn(&message));
+            }
+        },
+    }
+    Ok(())
+}
+
+fn apply_online_snapshot(
+    snapshot: GameSnapshot,
+    session: &mut OnlineSession,
+    game: &mut Game,
+    screen: &mut Screen,
+) -> Result<(), String> {
+    let previous_ply = game.sans.len();
+    let previous_finished = outcome(game).is_some();
+    let mut updated = Game::with_clock(
+        Position::startpos(),
+        (snapshot.time_control.initial_ms > 0)
+            .then(|| Duration::from_millis(snapshot.time_control.initial_ms)),
+        Duration::from_millis(snapshot.time_control.increment_ms),
+    );
+    for (index, notation) in snapshot.moves.iter().enumerate() {
+        let movement = parse_move(&updated.pos, notation).map_err(|_| {
+            format!(
+                "server snapshot contains an illegal move {} (`{notation}`)",
+                index + 1
+            )
+        })?;
+        updated.play(movement);
+    }
+    if updated.pos.to_fen() != snapshot.fen {
+        return Err("server snapshot position does not match its move history".to_string());
+    }
+    let mut remaining = [snapshot.clock.white_ms, snapshot.clock.black_ms];
+    if let Some(running) = snapshot.clock.running {
+        let elapsed = unix_time_ms().saturating_sub(snapshot.clock.server_time_ms);
+        let index = side_color(running).index();
+        remaining[index] = remaining[index].saturating_sub(elapsed);
+    }
+    let active = matches!(snapshot.status, GameStatus::Active);
+    let clock_side = snapshot
+        .clock
+        .running
+        .map(side_color)
+        .unwrap_or(updated.pos.side);
+    updated.clock.restore(
+        remaining,
+        clock_side,
+        active && snapshot.clock.running.is_some(),
+    );
+    updated.draw_offer = snapshot.draw_offer.map(side_color);
+    apply_finished_status(&snapshot.status, &mut updated);
+    updated.revision = snapshot.revision;
+
+    screen.player_names = [snapshot.white.name.clone(), snapshot.black.name.clone()];
+    if let Some(online) = &mut screen.online {
+        online.connection = ConnectionDisplay::Connected;
+        online.your_side = session.side;
+        online.white_connected = snapshot.white.connected;
+        online.black_connected = snapshot.black.connected;
+        online.reconnect_deadline_ms = None;
+        online.move_pending = false;
+    }
+    let play_move_sound = session.has_snapshot && updated.sans.len() > previous_ply;
+    let play_end_sound = session.has_snapshot
+        && !previous_finished
+        && outcome(&updated).is_some()
+        && !play_move_sound;
+    *game = updated;
+    session.has_snapshot = true;
+    screen.clear_marks();
+    if play_move_sound {
+        screen.sound.play(sound_after_move(game));
+    } else if play_end_sound {
+        screen.sound.play(sound::Cue::GameEnd);
+    }
+    screen.redraw = true;
+    Ok(())
+}
+
+fn apply_finished_status(status: &GameStatus, game: &mut Game) {
+    let GameStatus::Finished { result, reason } = status else {
+        return;
+    };
+    let loser = match result {
+        GameResult::WhiteWins => Some(Color::Black),
+        GameResult::BlackWins => Some(Color::White),
+        GameResult::Draw => None,
+    };
+    match reason {
+        FinishReason::Resignation => game.resigned = loser,
+        FinishReason::Timeout => game.clock.flagged = loser,
+        FinishReason::Abandonment => game.abandoned = loser,
+        FinishReason::DrawAgreement => game.agreed_draw = true,
+        FinishReason::Checkmate
+        | FinishReason::Stalemate
+        | FinishReason::FiftyMove
+        | FinishReason::Threefold
+        | FinishReason::InsufficientMaterial => {}
+    }
+    game.clock.pause();
+}
+
+fn handle_online_action(
+    action: UiAction,
+    game: &Game,
+    session: &OnlineSession,
+    screen: &mut Screen,
+) -> bool {
+    match action {
+        UiAction::MoveInput => {
+            screen.focus_move_input();
+        }
+        UiAction::Draw => offer_or_accept_draw(session, game, screen),
+        UiAction::Resign => {
+            if screen.confirming == Some(UiAction::Resign) {
+                send_resignation(session, game, screen);
+            } else {
+                screen.confirming = Some(UiAction::Resign);
+                screen.note(
+                    screen
+                        .theme
+                        .warn("Choose Confirm to resign, or press Escape."),
+                );
+            }
+        }
+        UiAction::ToggleSize => toggle_size(screen),
+        UiAction::CyclePieces => cycle_pieces(screen),
+        UiAction::Quit => return true,
+        UiAction::Pause | UiAction::Undo | UiAction::Restart | UiAction::Rematch => {}
+    }
+    false
+}
+
+fn offer_or_accept_draw(session: &OnlineSession, game: &Game, screen: &mut Screen) {
+    let Some(game_id) = session.game_id.clone() else {
+        explain_online_wait(game, screen);
+        return;
+    };
+    let Some(side) = session.side else {
+        explain_online_wait(game, screen);
+        return;
+    };
+    let command = if game.draw_offer == Some(side.flip()) {
+        ClientCommand::RespondDraw {
+            game_id,
+            accept: true,
+        }
+    } else if game.draw_offer == Some(side) {
+        screen.note(
+            screen
+                .theme
+                .dim("Your draw offer is waiting for your opponent."),
+        );
+        return;
+    } else {
+        ClientCommand::OfferDraw { game_id }
+    };
+    session.send(command, screen);
+}
+
+fn respond_to_draw(session: &OnlineSession, game: &Game, accept: bool, screen: &mut Screen) {
+    let Some(side) = session.side else {
+        explain_online_wait(game, screen);
+        return;
+    };
+    if game.draw_offer != Some(side.flip()) {
+        screen.note(screen.theme.dim("There is no draw offer to answer."));
+        return;
+    }
+    if let Some(game_id) = session.game_id.clone() {
+        session.send(ClientCommand::RespondDraw { game_id, accept }, screen);
+    }
+}
+
+fn send_resignation(session: &OnlineSession, game: &Game, screen: &mut Screen) {
+    if outcome(game).is_some() {
+        screen.note(screen.theme.dim("The game is already over."));
+        return;
+    }
+    if let Some(game_id) = session.game_id.clone() {
+        screen.confirming = None;
+        session.send(ClientCommand::Resign { game_id }, screen);
+    } else {
+        explain_online_wait(game, screen);
+    }
+}
+
+fn online_can_move(screen: &Screen, game: &Game) -> bool {
+    screen
+        .online
+        .as_ref()
+        .is_some_and(|online| online.can_move(game))
+}
+
+fn explain_online_wait(game: &Game, screen: &mut Screen) {
+    let message = if outcome(game).is_some() {
+        "The game is over. Export the PGN or quit when you are ready."
+    } else if screen
+        .online
+        .as_ref()
+        .is_some_and(|online| online.connection != ConnectionDisplay::Connected)
+    {
+        "Reconnecting — your seat is reserved and moves will resume automatically."
+    } else if screen
+        .online
+        .as_ref()
+        .is_some_and(|online| !online.white_connected || !online.black_connected)
+    {
+        "Waiting for both players to be connected."
+    } else {
+        "It is your opponent's turn."
+    };
+    screen.note(screen.theme.dim(message));
+}
+
+fn request_online_move(session: &OnlineSession, game: &Game, input: &str, screen: &mut Screen) {
+    match parse_move(&game.pos, input) {
+        Ok(movement) => send_online_move(session, game, movement, screen),
+        Err(ParseError::Illegal(text)) => {
+            if let Some(movement) = promotion_default(&game.pos, input) {
+                send_online_move(session, game, movement, screen);
+                return;
+            }
+            let near = nearby_moves(&game.pos, input);
+            let hint = if near.is_empty() {
+                "type `moves` to list legal moves".to_string()
+            } else {
+                format!("did you mean {}?", near.join(" or "))
+            };
+            screen.note(format!(
+                "{} {}",
+                screen.theme.warn(&format!("`{text}` is not a legal move")),
+                screen.theme.dim(&format!("— {hint}"))
+            ));
+        }
+        Err(ParseError::Ambiguous(text, candidates)) => screen.note(format!(
+            "{} {}",
+            screen.theme.warn(&format!("`{text}` could mean")),
+            screen.theme.bold(&candidates.join(" or "))
+        )),
+    }
+}
+
+fn send_online_move(session: &OnlineSession, game: &Game, movement: Move, screen: &mut Screen) {
+    let Some(game_id) = session.game_id.clone() else {
+        explain_online_wait(game, screen);
+        return;
+    };
+    if let Some(online) = &mut screen.online {
+        online.move_pending = true;
+    }
+    screen.clear_marks();
+    screen.redraw = true;
+    session.send(
+        ClientCommand::PlayMove {
+            game_id,
+            expected_ply: game.sans.len() as u32,
+            uci: movement.to_uci(),
+        },
+        screen,
+    );
+}
+
+fn online_board_click(
+    game: &Game,
+    screen: &mut Screen,
+    square: Option<board::Square>,
+) -> Option<Move> {
+    let square = match square {
+        Some(square) => square,
+        None => {
+            if screen.selected.take().is_some() {
+                screen.targets.clear();
+                screen.captures.clear();
+                screen.promotions.clear();
+                screen.invalid = None;
+                screen.redraw = true;
+            }
+            return None;
+        }
+    };
+    screen.invalid = None;
+    if let Some(choice) = screen
+        .promotions
+        .iter()
+        .find(|choice| choice.square == square)
+        .copied()
+    {
+        return Some(choice.movement);
+    }
+    screen.promotions.clear();
+
+    let legal = generate_legal(&game.pos);
+    if let Some(from) = screen.selected {
+        if square == from {
+            screen.selected = None;
+            screen.targets.clear();
+            screen.captures.clear();
+            screen.redraw = true;
+            return None;
+        }
+        let choices: Vec<Move> = legal
+            .iter()
+            .copied()
+            .filter(|movement| movement.from == from && movement.to == square)
+            .collect();
+        if let Some(&movement) = choices.first() {
+            if choices.iter().any(|movement| movement.promo.is_some()) {
+                open_promotion_menu(game, screen, &choices);
+                return None;
+            }
+            return Some(movement);
+        }
+    }
+
+    match game.pos.at(square) {
+        Some(piece) if piece.color == game.pos.side => {
+            screen.selected = Some(square);
+            let moves: Vec<Move> = legal
+                .iter()
+                .filter(|movement| movement.from == square)
+                .copied()
+                .collect();
+            screen.targets = moves.iter().map(|movement| movement.to).collect();
+            screen.captures = moves
+                .iter()
+                .filter(|movement| {
+                    movement.kind == MoveKind::EnPassant || game.pos.at(movement.to).is_some()
+                })
+                .map(|movement| movement.to)
+                .collect();
+            screen.message = if moves.is_empty() {
+                vec![screen.theme.dim(&format!(
+                    "The {} on {} has no legal moves.",
+                    kind_name(piece.kind),
+                    board::square_name(square)
+                ))]
+            } else {
+                Vec::new()
+            };
+            screen.redraw = true;
+        }
+        _ if screen.selected.is_none() => {
+            screen.invalid = Some(square);
+            screen.message = vec![screen
+                .theme
+                .dim(&format!("Choose a {} piece.", game.pos.side.name()))];
+            screen.redraw = true;
+        }
+        _ => {
+            screen.invalid = Some(square);
+            screen.message = vec![screen.theme.warn(&format!(
+                "{} is not a legal destination for the selected piece.",
+                board::square_name(square)
+            ))];
+            screen.redraw = true;
+        }
+    }
+    None
+}
+
+fn online_preferences(
+    previous: &storage::Preferences,
+    screen: &Screen,
+    session: &OnlineSession,
+    game: &Game,
+) -> storage::Preferences {
+    let mut preferences = runtime_preferences(screen, game);
+    preferences.white_name = session.player_name.clone();
+    preferences.black_name = previous.black_name.clone();
+    preferences
+}
+
+fn online_help_lines(theme: &Theme) -> Vec<String> {
+    vec![
+        theme.bold("PLAY"),
+        "  Click a piece and a highlighted square, or type e4 / Nf3 / e2e4.".to_string(),
+        "  The server validates every move and owns both clocks.".to_string(),
+        String::new(),
+        theme.bold("GAME"),
+        "  draw             offer or accept a draw".to_string(),
+        "  draw decline     decline the current draw offer".to_string(),
+        "  resign           resign the game".to_string(),
+        "  history · pgn · export [FILE] · fen".to_string(),
+        String::new(),
+        theme.bold("VIEW"),
+        "  flip · size [small|big] · pieces [auto|art|glyph]".to_string(),
+        "  theme [slate|wood|forest|mono] · sound [auto|on|off]".to_string(),
+        String::new(),
+        theme.dim("If the connection drops, this client reconnects and restores your seat."),
+    ]
+}
+
+fn side_color(side: Side) -> Color {
+    match side {
+        Side::White => Color::White,
+        Side::Black => Color::Black,
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), String> {
+    if options.online.is_some() {
+        return play_online(options, loaded);
+    }
     let config_path = loaded.path;
     let session_path = storage::default_session_path(&config_path);
     let mut last_preferences = loaded.preferences;
@@ -1758,7 +2980,12 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
 
     let color = options.color.unwrap_or_else(Theme::detect_color);
     let mut screen = Screen {
-        theme: Theme::new(color, options.ascii, color && Theme::detect_live(), options.palette),
+        theme: Theme::new(
+            color,
+            options.ascii,
+            color && Theme::detect_live(),
+            options.palette,
+        ),
         sound: sound::Player::new(options.sound),
         inline_images: false,
         flipped: false,
@@ -1791,6 +3018,7 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
         last_inline_board: None,
         last_prompt: None,
         redraw: true,
+        online: None,
     };
     // Held for as long as the game lasts. Whatever was on the terminal before
     // comes back when this is dropped, however the program ends.
@@ -1839,10 +3067,9 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
     let mut limits = options.limits;
     screen.flipped = options.flipped || mode == Mode::HumanBlack;
     screen.message = if let Some(warning) = config_warning {
-        vec![screen.theme.warn(&format!(
-            "{} — using safe defaults.",
-            warning
-        ))]
+        vec![screen
+            .theme
+            .warn(&format!("{} — using safe defaults.", warning))]
     } else if resuming {
         vec![screen.theme.good("Saved game restored.")]
     } else if first_run {
@@ -1868,13 +3095,14 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
             if backup.is_ok() {
                 backup_config_before_save = false;
             }
-            let saved = backup
-                .and_then(|_| storage::save_preferences(&config_path, &preferences));
+            let saved = backup.and_then(|_| storage::save_preferences(&config_path, &preferences));
             if let Err(error) = saved {
                 if !persistence_error_reported {
-                    screen.note(screen.theme.warn(&format!(
-                        "Preferences were not saved: {error}"
-                    )));
+                    screen.note(
+                        screen
+                            .theme
+                            .warn(&format!("Preferences were not saved: {error}")),
+                    );
                     persistence_error_reported = true;
                 }
             }
@@ -2042,10 +3270,7 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
         if !screen.promotions.is_empty() && input.len() == 1 {
             let kind = input.chars().next().and_then(PieceKind::from_char);
             if let Some(
-                kind @ (PieceKind::Queen
-                | PieceKind::Rook
-                | PieceKind::Bishop
-                | PieceKind::Knight),
+                kind @ (PieceKind::Queen | PieceKind::Rook | PieceKind::Bishop | PieceKind::Knight),
             ) = kind
             {
                 play_promotion(&mut game, &mut screen, kind);
@@ -2099,10 +3324,11 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
                     PathBuf::from(rest)
                 };
                 match export_pgn(&path, &game, &screen.player_names) {
-                    Ok(()) => screen.note(screen.theme.good(&format!(
-                        "Exported PGN to {}.",
-                        path.display()
-                    ))),
+                    Ok(()) => screen.note(
+                        screen
+                            .theme
+                            .good(&format!("Exported PGN to {}.", path.display())),
+                    ),
                     Err(error) => screen.note(screen.theme.warn(&error)),
                 }
                 continue;
@@ -2122,10 +3348,11 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
                     PathBuf::from(rest)
                 };
                 match save_current_game(&path, &mut game, mode) {
-                    Ok(()) => screen.note(screen.theme.good(&format!(
-                        "Saved game to {}.",
-                        path.display()
-                    ))),
+                    Ok(()) => screen.note(
+                        screen
+                            .theme
+                            .good(&format!("Saved game to {}.", path.display())),
+                    ),
                     Err(error) => screen.note(screen.theme.warn(&error)),
                 }
                 continue;
@@ -2207,7 +3434,11 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
             "pause" | "resume" => {
                 let wants_pause = word == "pause";
                 if game.paused == wants_pause {
-                    let state = if game.paused { "already paused" } else { "already running" };
+                    let state = if game.paused {
+                        "already paused"
+                    } else {
+                        "already running"
+                    };
                     screen.note(screen.theme.dim(&format!("The game is {}.", state)));
                 } else {
                     handle_ui_action(UiAction::Pause, &mut game, mode, &mut screen);
@@ -2244,11 +3475,19 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
         }
 
         if finished {
-            screen.note(screen.theme.dim("The game is over. Try `new`, `undo` or `quit`."));
+            screen.note(
+                screen
+                    .theme
+                    .dim("The game is over. Try `new`, `undo` or `quit`."),
+            );
             continue;
         }
         if game.paused {
-            screen.note(screen.theme.dim("The game is paused. Choose Resume before moving."));
+            screen.note(
+                screen
+                    .theme
+                    .dim("The game is paused. Choose Resume before moving."),
+            );
             continue;
         }
         if looks_like_command(&word) {
@@ -2287,7 +3526,9 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
                 game.toggle_pause();
                 screen.clear_marks();
                 let message = if game.paused {
-                    screen.theme.accent("Game paused. Choose Resume when you are ready.")
+                    screen
+                        .theme
+                        .accent("Game paused. Choose Resume when you are ready.")
                 } else {
                     screen.theme.good("Game resumed.")
                 };
@@ -2301,7 +3542,11 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
         UiAction::Draw => {
             screen.confirming = None;
             if mode != Mode::TwoPlayer {
-                screen.note(screen.theme.dim("Draw offers are available in two-player games."));
+                screen.note(
+                    screen
+                        .theme
+                        .dim("Draw offers are available in two-player games."),
+                );
             } else if game.draw_offer == Some(game.pos.side.flip()) {
                 game.agreed_draw = true;
                 game.draw_offer = None;
@@ -2311,7 +3556,11 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
                 screen.sound.play(sound::Cue::GameEnd);
                 screen.redraw = true;
             } else if game.draw_offer == Some(game.pos.side) {
-                screen.note(screen.theme.dim("Your draw offer is waiting for the next player."));
+                screen.note(
+                    screen
+                        .theme
+                        .dim("Your draw offer is waiting for the next player."),
+                );
             } else {
                 game.draw_offer = Some(game.pos.side);
                 game.changed();
@@ -2331,7 +3580,11 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
                 screen.redraw = true;
             } else {
                 screen.confirming = Some(UiAction::Resign);
-                screen.note(screen.theme.warn("Choose Confirm to resign, or press Escape."));
+                screen.note(
+                    screen
+                        .theme
+                        .warn("Choose Confirm to resign, or press Escape."),
+                );
             }
         }
         UiAction::Restart => {
@@ -2341,7 +3594,11 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
                 screen.note(screen.theme.good("New game."));
             } else {
                 screen.confirming = Some(UiAction::Restart);
-                screen.note(screen.theme.warn("Choose Confirm to restart, or press Escape."));
+                screen.note(
+                    screen
+                        .theme
+                        .warn("Choose Confirm to restart, or press Escape."),
+                );
             }
         }
         UiAction::ToggleSize => toggle_size(screen),
@@ -2403,11 +3660,15 @@ fn make_move(game: &mut Game, input: &str, screen: &mut Screen) {
             let hint = if near.is_empty() {
                 screen.theme.dim("- `moves` lists what is legal")
             } else {
-                screen.theme.dim(&format!("- did you mean {}?", near.join(" or ")))
+                screen
+                    .theme
+                    .dim(&format!("- did you mean {}?", near.join(" or ")))
             };
             screen.note(format!(
                 "{} {}",
-                screen.theme.warn(&format!("`{}` is not a legal move", text)),
+                screen
+                    .theme
+                    .warn(&format!("`{}` is not a legal move", text)),
                 hint
             ));
         }
@@ -2448,7 +3709,11 @@ fn handle_board_click(
         return;
     }
     if game.paused {
-        screen.note(screen.theme.dim("The game is paused. Choose Resume before moving."));
+        screen.note(
+            screen
+                .theme
+                .dim("The game is paused. Choose Resume before moving."),
+        );
         return;
     }
     screen.invalid = None;
@@ -2504,9 +3769,7 @@ fn handle_board_click(
             screen.targets = moves.iter().map(|mv| mv.to).collect();
             screen.captures = moves
                 .iter()
-                .filter(|mv| {
-                    mv.kind == MoveKind::EnPassant || game.pos.at(mv.to).is_some()
-                })
+                .filter(|mv| mv.kind == MoveKind::EnPassant || game.pos.at(mv.to).is_some())
                 .map(|mv| mv.to)
                 .collect();
             screen.message = if moves.is_empty() {
@@ -2529,7 +3792,10 @@ fn handle_board_click(
                     piece.color.name(),
                     game.pos.side.name()
                 ),
-                None => format!("Choose a {} piece before choosing a destination.", game.pos.side.name()),
+                None => format!(
+                    "Choose a {} piece before choosing a destination.",
+                    game.pos.side.name()
+                ),
             };
             screen.message = vec![screen.theme.dim(&guidance)];
             screen.redraw = true;
@@ -2646,7 +3912,11 @@ fn engine_move(game: &mut Game, engine: &mut Search, limits: &Limits, screen: &m
     // The rest of the line it expects, from the position it has just reached.
     let expected = pv_text(&game.pos, result.pv.get(1..).unwrap_or(&[]), 6);
     if !expected.is_empty() {
-        lines.push(format!("{} {}", theme.dim("expects"), theme.label(&expected)));
+        lines.push(format!(
+            "{} {}",
+            theme.dim("expects"),
+            theme.label(&expected)
+        ));
     }
     screen.analysis = lines;
 }
@@ -2751,13 +4021,21 @@ fn undo(game: &mut Game, mode: Mode, screen: &mut Screen) {
 
 fn set_time(limits: &mut Limits, screen: &mut Screen, rest: &str) {
     if rest.is_empty() {
-        screen.note(screen.theme.dim(&format!("The engine gets {}.", budget_text(limits))));
+        screen.note(
+            screen
+                .theme
+                .dim(&format!("The engine gets {}.", budget_text(limits))),
+        );
         return;
     }
     match rest.parse::<f64>() {
         Ok(secs) if secs.is_finite() && secs > 0.0 => {
             limits.movetime = Some(Duration::from_secs_f64(secs));
-            screen.note(screen.theme.good(&format!("The engine now gets {}.", budget_text(limits))));
+            screen.note(
+                screen
+                    .theme
+                    .good(&format!("The engine now gets {}.", budget_text(limits))),
+            );
         }
         _ => screen.note(
             screen
@@ -2769,7 +4047,11 @@ fn set_time(limits: &mut Limits, screen: &mut Screen, rest: &str) {
 
 fn set_depth(limits: &mut Limits, screen: &mut Screen, rest: &str) {
     if rest.is_empty() {
-        screen.note(screen.theme.dim(&format!("Depth is capped at {}.", limits.depth)));
+        screen.note(
+            screen
+                .theme
+                .dim(&format!("Depth is capped at {}.", limits.depth)),
+        );
         return;
     }
     match rest.parse::<u32>() {
@@ -2777,13 +4059,16 @@ fn set_depth(limits: &mut Limits, screen: &mut Screen, rest: &str) {
             limits.depth = depth;
             // A depth asked for by name is a depth to reach, not to give up on.
             limits.movetime = None;
-            screen.note(screen.theme.good(&format!("The engine now searches to depth {}.", depth)));
+            screen.note(
+                screen
+                    .theme
+                    .good(&format!("The engine now searches to depth {}.", depth)),
+            );
         }
-        _ => screen.note(
-            screen
-                .theme
-                .warn(&format!("Depth must be a number from 1 to {}.", search::MAX_DEPTH)),
-        ),
+        _ => screen.note(screen.theme.warn(&format!(
+            "Depth must be a number from 1 to {}.",
+            search::MAX_DEPTH
+        ))),
     }
 }
 
@@ -2797,11 +4082,11 @@ fn set_theme(screen: &mut Screen, rest: &str) {
             screen.theme.palette = palette;
             screen.redraw = true;
         }
-        None => screen.note(
-            screen
-                .theme
-                .warn(&format!("No theme called `{}`. Try {}.", rest, ui::theme_names())),
-        ),
+        None => screen.note(screen.theme.warn(&format!(
+            "No theme called `{}`. Try {}.",
+            rest,
+            ui::theme_names()
+        ))),
     }
 }
 
@@ -2809,9 +4094,7 @@ fn set_theme(screen: &mut Screen, rest: &str) {
 /// tall, so on a small window this is a preference rather than an order.
 fn set_pieces(screen: &mut Screen, rest: &str) {
     if rest.is_empty() {
-        let text = screen
-            .theme
-            .dim("Pieces are `art`, `glyph` or `auto`.");
+        let text = screen.theme.dim("Pieces are `art`, `glyph` or `auto`.");
         screen.note(text);
         return;
     }
@@ -2870,7 +4153,11 @@ fn set_sound(screen: &mut Screen, rest: &str) {
         } else {
             "no local audio output was found".to_string()
         };
-        screen.note(screen.theme.dim(&format!("Sound is `{}` - {}.", mode, state)));
+        screen.note(
+            screen
+                .theme
+                .dim(&format!("Sound is `{}` - {}.", mode, state)),
+        );
         return;
     }
 
@@ -2888,7 +4175,10 @@ fn set_sound(screen: &mut Screen, rest: &str) {
         } else {
             screen.theme.warn(&format!(
                 "Audio is unavailable: {}.",
-                screen.sound.last_error().unwrap_or("no output device was found")
+                screen
+                    .sound
+                    .last_error()
+                    .unwrap_or("no output device was found")
             ))
         };
         screen.note(message);
@@ -2914,12 +4204,13 @@ fn set_sound(screen: &mut Screen, rest: &str) {
                 backend
             ))
         }
-        _ => screen
-            .theme
-            .warn(&format!(
-                "No local audio output is available: {}.",
-                screen.sound.last_error().unwrap_or("no output device was found")
-            )),
+        _ => screen.theme.warn(&format!(
+            "No local audio output is available: {}.",
+            screen
+                .sound
+                .last_error()
+                .unwrap_or("no output device was found")
+        )),
     };
     screen.note(message);
 }
@@ -2968,7 +4259,10 @@ fn confirm_new(input: &mut TerminalInput, game: &Game, screen: &Screen) -> Resul
     let line = answer?;
     resumed?;
     match line {
-        Some(line) => Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")),
+        Some(line) => Ok(matches!(
+            line.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        )),
         None => Ok(false),
     }
 }
@@ -3161,7 +4455,11 @@ fn help_lines(theme: &Theme) -> Vec<String> {
         let mut line = String::new();
         for column in [row, row + half] {
             if let Some((name, what)) = COMMANDS.get(column) {
-                let cell = format!("{}  {}", theme.accent(&format!("{:<8}", name)), theme.dim(what));
+                let cell = format!(
+                    "{}  {}",
+                    theme.accent(&format!("{:<8}", name)),
+                    theme.dim(what)
+                );
                 line.push_str(&ui::pad(&cell, 36));
             }
         }
@@ -3169,12 +4467,14 @@ fn help_lines(theme: &Theme) -> Vec<String> {
     }
     lines.push(String::new());
     lines.push(theme.dim("  `moves e2` points at one piece on the board"));
-    lines.push(theme.dim(
-        "  `time 5`, `depth 8`, `theme wood`, `pieces art`, `size small` all take a value",
-    ));
-    lines.push(theme.dim(
-        "  `save`, `load`, `import game.pgn` and `export game.pgn` keep games local",
-    ));
+    lines.push(
+        theme.dim(
+            "  `time 5`, `depth 8`, `theme wood`, `pieces art`, `size small` all take a value",
+        ),
+    );
+    lines.push(
+        theme.dim("  `save`, `load`, `import game.pgn` and `export game.pgn` keep games local"),
+    );
     lines.push(theme.dim("  Scores are in pawns, always from White's point of view."));
     lines
 }
@@ -3222,9 +4522,7 @@ fn show_piece_moves(screen: &mut Screen, pos: &Position, filter: &str) {
     let from = match board::parse_square(&filter.to_ascii_lowercase()) {
         Some(from) => from,
         None => {
-            let text = screen
-                .theme
-                .warn(&format!("`{}` is not a square.", filter));
+            let text = screen.theme.warn(&format!("`{}` is not a square.", filter));
             screen.note(text);
             return;
         }
@@ -3353,10 +4651,7 @@ fn load_saved_game(
     *mode = loaded_mode;
     screen.clear_marks();
     screen.page = None;
-    screen.note(screen.theme.good(&format!(
-        "Restored {}.",
-        path.display()
-    )));
+    screen.note(screen.theme.good(&format!("Restored {}.", path.display())));
     Ok(())
 }
 
@@ -3398,13 +4693,19 @@ fn export_pgn(path: &Path, game: &Game, names: &[String; 2]) -> Result<(), Strin
 
 fn set_player_name(screen: &mut Screen, rest: &str) {
     let Some((side, name)) = rest.split_once(char::is_whitespace) else {
-        screen.note(screen.theme.dim(
-            "Use `name white Lakshay` or `name black Guest`.",
-        ));
+        screen.note(
+            screen
+                .theme
+                .dim("Use `name white Lakshay` or `name black Guest`."),
+        );
         return;
     };
     let Some(color) = color_named(side) else {
-        screen.note(screen.theme.warn("Choose `white` or `black` before the name."));
+        screen.note(
+            screen
+                .theme
+                .warn("Choose `white` or `black` before the name."),
+        );
         return;
     };
     let name: String = name
@@ -3418,11 +4719,11 @@ fn set_player_name(screen: &mut Screen, rest: &str) {
         return;
     }
     screen.player_names[color.index()] = name.clone();
-    screen.note(screen.theme.good(&format!(
-        "{} is now {}.",
-        color.name(),
-        name
-    )));
+    screen.note(
+        screen
+            .theme
+            .good(&format!("{} is now {}.", color.name(), name)),
+    );
 }
 
 fn setup_lines(theme: &Theme, config: &Path, session: &Path) -> Vec<String> {
@@ -3435,7 +4736,10 @@ fn setup_lines(theme: &Theme, config: &Path, session: &Path) -> Vec<String> {
         String::new(),
         theme.bold("QUICK SETUP"),
         format!("  {}", theme.accent("name white Lakshay")),
-        format!("  {}", theme.accent("theme forest  ·  pieces glyph  ·  sound on")),
+        format!(
+            "  {}",
+            theme.accent("theme forest  ·  pieces glyph  ·  sound on")
+        ),
         format!("  {}", theme.accent("pause  ·  save  ·  load")),
         String::new(),
         theme.dim("Preferences are saved automatically. Edit config.toml when the game is closed."),
@@ -3520,9 +4824,7 @@ fn ask_mode(
             }
         };
         match line.trim().to_ascii_lowercase().as_str() {
-            "" | "1" | "w" | "white" => {
-                return Ok(Some(StartChoice::Mode(Mode::HumanWhite)))
-            }
+            "" | "1" | "w" | "white" => return Ok(Some(StartChoice::Mode(Mode::HumanWhite))),
             "2" | "b" | "black" => return Ok(Some(StartChoice::Mode(Mode::HumanBlack))),
             "3" | "t" | "two" => return Ok(Some(StartChoice::Mode(Mode::TwoPlayer))),
             "4" | "r" | "resume" if can_resume => return Ok(Some(StartChoice::Resume)),
@@ -3587,6 +4889,7 @@ mod interaction_tests {
             last_inline_board: None,
             last_prompt: None,
             redraw: false,
+            online: None,
         }
     }
 
@@ -3632,7 +4935,10 @@ mod interaction_tests {
 
         handle_board_click(&mut game, &mut screen, Some(e4), false);
         assert_eq!(game.pos.at(e2), None);
-        assert_eq!(game.pos.at(e4), Some(Piece::new(Color::White, PieceKind::Pawn)));
+        assert_eq!(
+            game.pos.at(e4),
+            Some(Piece::new(Color::White, PieceKind::Pawn))
+        );
         assert_eq!(game.pos.side, Color::Black);
         assert_eq!(screen.selected, None);
         assert!(screen.targets.is_empty());
@@ -3718,10 +5024,7 @@ mod interaction_tests {
 
     #[test]
     fn moves_choose_their_most_meaningful_sound() {
-        assert_eq!(
-            cue_after(board::START_FEN, "e4"),
-            sound::Cue::Move
-        );
+        assert_eq!(cue_after(board::START_FEN, "e4"), sound::Cue::Move);
         assert_eq!(
             cue_after("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1", "exd5"),
             sound::Cue::Capture
@@ -3742,11 +5045,7 @@ mod interaction_tests {
 
     #[test]
     fn clock_flags_the_side_that_runs_out_of_time() {
-        let mut clock = GameClock::new(
-            Some(Duration::from_secs(60)),
-            Duration::ZERO,
-            Color::White,
-        );
+        let mut clock = GameClock::new(Some(Duration::from_secs(60)), Duration::ZERO, Color::White);
         clock.remaining[Color::White.index()] = Duration::from_millis(10);
         clock.running = Some((Color::White, Instant::now() - Duration::from_millis(20)));
 
@@ -3782,7 +5081,10 @@ mod interaction_tests {
 
         game.toggle_pause();
         assert!(!game.paused);
-        assert_eq!(game.clock.running.map(|(color, _)| color), Some(Color::White));
+        assert_eq!(
+            game.clock.running.map(|(color, _)| color),
+            Some(Color::White)
+        );
     }
 
     #[test]
@@ -3843,12 +5145,7 @@ mod interaction_tests {
 
         let movement = parse_move(&game.pos, "e4").ok().unwrap();
         game.play(movement);
-        handle_ui_action(
-            UiAction::Draw,
-            &mut game,
-            Mode::TwoPlayer,
-            &mut screen,
-        );
+        handle_ui_action(UiAction::Draw, &mut game, Mode::TwoPlayer, &mut screen);
         assert!(game.agreed_draw);
         assert!(matches!(outcome(&game), Some(Outcome::DrawAgreement)));
     }
@@ -3859,21 +5156,11 @@ mod interaction_tests {
         let mut screen = screen();
         screen.theme.live = true;
 
-        handle_ui_action(
-            UiAction::Resign,
-            &mut game,
-            Mode::TwoPlayer,
-            &mut screen,
-        );
+        handle_ui_action(UiAction::Resign, &mut game, Mode::TwoPlayer, &mut screen);
         assert_eq!(screen.confirming, Some(UiAction::Resign));
         assert_eq!(game.resigned, None);
 
-        handle_ui_action(
-            UiAction::Resign,
-            &mut game,
-            Mode::TwoPlayer,
-            &mut screen,
-        );
+        handle_ui_action(UiAction::Resign, &mut game, Mode::TwoPlayer, &mut screen);
         assert_eq!(game.resigned, Some(Color::White));
     }
 
@@ -3994,5 +5281,54 @@ mod interaction_tests {
 
         screen.focused = UiAction::Draw;
         assert_eq!(screen.prompt_cursor_escape(), "\x1b[?25l");
+    }
+
+    #[test]
+    fn online_cli_parses_create_join_and_server_url() {
+        let preferences = storage::Preferences::default();
+        let create = Options::parse(
+            [
+                "online",
+                "create",
+                "--server",
+                "wss://play.example/ws",
+                "--name",
+                "Ada",
+            ]
+            .into_iter()
+            .map(str::to_string),
+            &preferences,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(create.online, Some(OnlineIntent::Create));
+        assert_eq!(create.server_url, "wss://play.example/ws");
+        assert_eq!(create.online_name, "Ada");
+
+        let join = Options::parse(
+            ["online", "join", "ab12cd"].into_iter().map(str::to_string),
+            &preferences,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(join.online, Some(OnlineIntent::Join("AB12CD".to_string())));
+    }
+
+    #[test]
+    fn online_click_builds_a_request_without_advancing_locally() {
+        let game = Game::new(Position::startpos());
+        let mut screen = screen();
+        let e2 = board::parse_square("e2").unwrap();
+        let e4 = board::parse_square("e4").unwrap();
+
+        assert!(online_board_click(&game, &mut screen, Some(e2)).is_none());
+        let movement = online_board_click(&game, &mut screen, Some(e4)).unwrap();
+
+        assert_eq!(movement.to_uci(), "e2e4");
+        assert_eq!(
+            game.pos.at(e2),
+            Some(Piece::new(Color::White, PieceKind::Pawn))
+        );
+        assert_eq!(game.pos.at(e4), None);
     }
 }

@@ -1,8 +1,12 @@
 //! Authoritative, transport-independent state for online guest matches.
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::board::{Color, Position};
@@ -20,6 +24,7 @@ const RECONNECT_GRACE: Duration = Duration::from_secs(60);
 const MAX_NAME_CHARS: usize = 32;
 const MAX_INITIAL_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_INCREMENT_MS: u64 = 60 * 60 * 1_000;
+const STATE_VERSION: u32 = 1;
 
 /// A message ready for the WebSocket layer to send to one connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +48,7 @@ struct PlayerSlot {
 
 struct Room {
     game_id: String,
+    invite_code: String,
     game: Game,
     white: PlayerSlot,
     black: Option<PlayerSlot>,
@@ -85,6 +91,7 @@ pub struct Hub {
     memberships: HashMap<ConnectionId, Membership>,
     next_connection_id: ConnectionId,
     next_event_id: u64,
+    dirty: bool,
 }
 
 impl Default for Hub {
@@ -101,7 +108,106 @@ impl Hub {
             memberships: HashMap::new(),
             next_connection_id: 1,
             next_event_id: 1,
+            dirty: false,
         }
+    }
+
+    /// Restore durable room state. Network connections are intentionally not
+    /// restored; clients prove possession of their reconnect token again.
+    pub fn load(path: &Path) -> Result<Hub, String> {
+        if !path.exists() {
+            return Ok(Hub::new());
+        }
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+        let stored: PersistedHub = serde_json::from_str(&text)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        if stored.version != STATE_VERSION {
+            return Err(format!(
+                "{} uses unsupported server state version {}",
+                path.display(),
+                stored.version
+            ));
+        }
+
+        let now = Instant::now();
+        let downtime_ms = unix_time_ms().saturating_sub(stored.saved_at_ms);
+        let mut hub = Hub::new();
+        for saved in stored.rooms {
+            let initial = (saved.time_control.initial_ms > 0)
+                .then(|| Duration::from_millis(saved.time_control.initial_ms));
+            let mut game = Game::with_clock(
+                Position::startpos(),
+                initial,
+                Duration::from_millis(saved.time_control.increment_ms),
+            );
+            for (index, notation) in saved.moves.iter().enumerate() {
+                let movement = parse_move(&game.pos, notation).map_err(|_| {
+                    format!(
+                        "saved online game {} has an illegal move {} (`{notation}`)",
+                        saved.game_id,
+                        index + 1
+                    )
+                })?;
+                game.play(movement);
+            }
+            let mut remaining = saved.remaining_ms;
+            if let Some(running) = saved.running {
+                let index = color(running).index();
+                remaining[index] = remaining[index].saturating_sub(downtime_ms);
+            }
+            let running = saved.running.is_some() && remaining.iter().all(|&time| time > 0);
+            game.clock.restore(remaining, game.pos.side, running);
+            if let Some(running_side) = saved.running {
+                let running_color = color(running_side);
+                if remaining[running_color.index()] == 0 && game.clock.initial.is_some() {
+                    game.clock.flagged = Some(running_color);
+                    game.clock.running = None;
+                }
+            }
+            game.resigned = saved.resigned.map(color);
+            game.draw_offer = saved.draw_offer.map(color);
+            game.agreed_draw = saved.agreed_draw;
+            game.abandoned = saved.abandoned.map(color);
+            game.revision = saved.revision;
+
+            let disconnected_at = Some(now);
+            let room = Room {
+                game_id: saved.game_id.clone(),
+                invite_code: saved.invite_code.clone(),
+                game,
+                white: saved.white.restore(disconnected_at),
+                black: saved.black.map(|player| player.restore(disconnected_at)),
+                abandoned: saved.abandoned.map(color),
+            };
+            hub.invites.insert(saved.invite_code, saved.game_id.clone());
+            hub.rooms.insert(saved.game_id, room);
+        }
+        Ok(hub)
+    }
+
+    /// Atomically save every room, including reconnect credentials. The file
+    /// is private on Unix because possession of a token grants a player's seat.
+    pub fn save(&mut self, path: &Path) -> Result<(), String> {
+        let saved_at_ms = unix_time_ms();
+        let rooms = self
+            .rooms
+            .values_mut()
+            .map(PersistedRoom::capture)
+            .collect();
+        let text = serde_json::to_vec_pretty(&PersistedHub {
+            version: STATE_VERSION,
+            saved_at_ms,
+            rooms,
+        })
+        .map_err(|error| format!("could not encode server state: {error}"))?;
+        atomic_write(path, &text)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     pub fn connect(&mut self) -> ConnectionId {
@@ -124,6 +230,12 @@ impl Hub {
         }
 
         let request_id = request.request_id;
+        if !matches!(
+            request.command,
+            ClientCommand::Hello { .. } | ClientCommand::Ping
+        ) {
+            self.dirty = true;
+        }
         match request.command {
             ClientCommand::Hello { .. } => vec![self.delivery(
                 connection,
@@ -170,10 +282,20 @@ impl Hub {
         self.direct_error(connection, None, ErrorCode::InvalidRequest, message.into())
     }
 
+    pub fn rate_limited(&mut self, connection: ConnectionId) -> Vec<Delivery> {
+        self.direct_error(
+            connection,
+            None,
+            ErrorCode::RateLimited,
+            "too many requests; wait a moment before trying again",
+        )
+    }
+
     pub fn disconnect(&mut self, connection: ConnectionId) -> Vec<Delivery> {
         let Some(membership) = self.memberships.remove(&connection) else {
             return Vec::new();
         };
+        self.dirty = true;
         let now = Instant::now();
         let deadline = unix_time_ms().saturating_add(RECONNECT_GRACE.as_millis() as u64);
         let (targets, game_id) = {
@@ -217,7 +339,10 @@ impl Hub {
                         .player(side)
                         .and_then(|player| player.disconnected_at)
                         .is_some_and(|since| now.duration_since(since) >= RECONNECT_GRACE);
-                    if expired {
+                    let opponent_online = room
+                        .player(side.flip())
+                        .is_some_and(|player| player.connection.is_some());
+                    if expired && opponent_online {
                         room.abandoned = Some(side);
                         room.game.clock.pause();
                         room.game.changed();
@@ -229,6 +354,10 @@ impl Hub {
             if changed {
                 updates.push((room.targets(), snapshot(room)));
             }
+        }
+
+        if !updates.is_empty() {
+            self.dirty = true;
         }
 
         let mut deliveries = Vec::new();
@@ -293,6 +422,7 @@ impl Hub {
         game.clock.pause();
         let room = Room {
             game_id: game_id.clone(),
+            invite_code: invite_code.clone(),
             game,
             white: PlayerSlot {
                 name: player_name,
@@ -750,6 +880,15 @@ fn snapshot(room: &mut Room) -> GameSnapshot {
             .collect(),
         last_move: room.game.last_move().map(|movement| movement.to_uci()),
         side_to_move: side(room.game.pos.side),
+        time_control: TimeControl {
+            initial_ms: room
+                .game
+                .clock
+                .initial
+                .map(|time| time.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0),
+            increment_ms: room.game.clock.increment.as_millis().min(u64::MAX as u128) as u64,
+        },
         white: player_snapshot(Some(&room.white)),
         black: player_snapshot(room.black.as_ref()),
         clock: ClockSnapshot {
@@ -781,6 +920,7 @@ fn room_status(room: &Room) -> GameStatus {
         Some(Outcome::Checkmate(winner)) => finished(winner, FinishReason::Checkmate),
         Some(Outcome::Resignation(loser)) => finished(loser.flip(), FinishReason::Resignation),
         Some(Outcome::Timeout(loser)) => finished(loser.flip(), FinishReason::Timeout),
+        Some(Outcome::Abandonment(loser)) => finished(loser.flip(), FinishReason::Abandonment),
         Some(Outcome::DrawAgreement) => drawn(FinishReason::DrawAgreement),
         Some(Outcome::Stalemate) => drawn(FinishReason::Stalemate),
         Some(Outcome::FiftyMove) => drawn(FinishReason::FiftyMove),
@@ -812,6 +952,128 @@ fn side(color: Color) -> Side {
         Color::White => Side::White,
         Color::Black => Side::Black,
     }
+}
+
+fn color(side: Side) -> Color {
+    match side {
+        Side::White => Color::White,
+        Side::Black => Color::Black,
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedHub {
+    version: u32,
+    saved_at_ms: u64,
+    rooms: Vec<PersistedRoom>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRoom {
+    game_id: String,
+    invite_code: String,
+    revision: u64,
+    moves: Vec<String>,
+    time_control: TimeControl,
+    remaining_ms: [u64; 2],
+    running: Option<Side>,
+    white: PersistedPlayer,
+    black: Option<PersistedPlayer>,
+    resigned: Option<Side>,
+    draw_offer: Option<Side>,
+    agreed_draw: bool,
+    abandoned: Option<Side>,
+}
+
+impl PersistedRoom {
+    fn capture(room: &mut Room) -> PersistedRoom {
+        let remaining_ms = room.game.clock.snapshot();
+        PersistedRoom {
+            game_id: room.game_id.clone(),
+            invite_code: room.invite_code.clone(),
+            revision: room.game.revision,
+            moves: room
+                .game
+                .undos
+                .iter()
+                .map(|undo| undo.mv.to_uci())
+                .collect(),
+            time_control: TimeControl {
+                initial_ms: room
+                    .game
+                    .clock
+                    .initial
+                    .map(|time| time.as_millis().min(u64::MAX as u128) as u64)
+                    .unwrap_or(0),
+                increment_ms: room.game.clock.increment.as_millis().min(u64::MAX as u128) as u64,
+            },
+            remaining_ms,
+            running: room.game.clock.running.map(|(color, _)| side(color)),
+            white: PersistedPlayer::capture(&room.white),
+            black: room.black.as_ref().map(PersistedPlayer::capture),
+            resigned: room.game.resigned.map(side),
+            draw_offer: room.game.draw_offer.map(side),
+            agreed_draw: room.game.agreed_draw,
+            abandoned: room.abandoned.map(side),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPlayer {
+    name: String,
+    reconnect_token: String,
+}
+
+impl PersistedPlayer {
+    fn capture(player: &PlayerSlot) -> PersistedPlayer {
+        PersistedPlayer {
+            name: player.name.clone(),
+            reconnect_token: player.reconnect_token.clone(),
+        }
+    }
+
+    fn restore(self, disconnected_at: Option<Instant>) -> PlayerSlot {
+        PlayerSlot {
+            name: self.name,
+            reconnect_token: self.reconnect_token,
+            connection: None,
+            disconnected_at,
+        }
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "could not create server state directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let temp = temporary_path(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp)
+        .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
+    fs::rename(&temp, path)
+        .map_err(|error| format!("could not replace {}: {error}", path.display()))
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(format!(".{}.tmp", std::process::id()));
+    PathBuf::from(temp)
 }
 
 fn unix_time_ms() -> u64 {
@@ -1009,5 +1271,120 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn active_rooms_survive_a_server_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rooms.json");
+        let mut hub = Hub::new();
+        let white = hub.connect();
+        let black = hub.connect();
+        let (code, white_token, game_id) = create(&mut hub, white);
+        let black_token = join(&mut hub, black, &code);
+        hub.handle(
+            white,
+            ClientEnvelope::new(
+                3,
+                ClientCommand::PlayMove {
+                    game_id: game_id.clone(),
+                    expected_ply: 0,
+                    uci: "e2e4".to_string(),
+                },
+            ),
+        );
+        hub.save(&path).unwrap();
+
+        let mut restored = Hub::load(&path).unwrap();
+        let new_white = restored.connect();
+        let white_events = restored.handle(
+            new_white,
+            ClientEnvelope::new(
+                4,
+                ClientCommand::Reconnect {
+                    game_id: game_id.clone(),
+                    reconnect_token: white_token,
+                },
+            ),
+        );
+        let new_black = restored.connect();
+        let black_events = restored.handle(
+            new_black,
+            ClientEnvelope::new(
+                5,
+                ClientCommand::Reconnect {
+                    game_id,
+                    reconnect_token: black_token,
+                },
+            ),
+        );
+
+        let snapshot = white_events
+            .iter()
+            .chain(&black_events)
+            .find_map(|delivery| match &delivery.message.event {
+                ServerEvent::GameJoined { game, .. } if game.moves.len() == 1 => Some(game),
+                _ => None,
+            })
+            .expect("reconnected client receives restored position");
+        assert_eq!(snapshot.moves, ["e2e4"]);
+        assert_eq!(snapshot.side_to_move, Side::Black);
+        assert!(snapshot.white.connected || snapshot.black.connected);
+    }
+
+    #[test]
+    fn two_delayed_clients_can_reconnect_and_finish_by_checkmate() {
+        let mut hub = Hub::new();
+        let white = hub.connect();
+        let black = hub.connect();
+        let (code, _, game_id) = create(&mut hub, white);
+        let black_token = join(&mut hub, black, &code);
+
+        let play = |hub: &mut Hub, connection, request_id, ply, uci: &str| {
+            std::thread::sleep(Duration::from_millis(10));
+            hub.handle(
+                connection,
+                ClientEnvelope::new(
+                    request_id,
+                    ClientCommand::PlayMove {
+                        game_id: game_id.clone(),
+                        expected_ply: ply,
+                        uci: uci.to_string(),
+                    },
+                ),
+            )
+        };
+
+        play(&mut hub, white, 3, 0, "f2f3");
+        play(&mut hub, black, 4, 1, "e7e5");
+        assert_eq!(hub.disconnect(black).len(), 1);
+        std::thread::sleep(Duration::from_millis(20));
+        let replacement = hub.connect();
+        hub.handle(
+            replacement,
+            ClientEnvelope::new(
+                5,
+                ClientCommand::Reconnect {
+                    game_id: game_id.clone(),
+                    reconnect_token: black_token,
+                },
+            ),
+        );
+        play(&mut hub, white, 6, 2, "g2g4");
+        let updates = play(&mut hub, replacement, 7, 3, "d8h4");
+
+        for update in updates {
+            let ServerEvent::GameUpdated { game } = update.message.event else {
+                panic!("expected final game update");
+            };
+            assert_eq!(game.moves.len(), 4);
+            assert!(matches!(
+                game.status,
+                GameStatus::Finished {
+                    result: GameResult::BlackWins,
+                    reason: FinishReason::Checkmate,
+                }
+            ));
+        }
     }
 }

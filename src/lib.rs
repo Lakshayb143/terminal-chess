@@ -4,6 +4,7 @@
 //! positions, clocks, outcomes, and wire messages have one implementation.
 
 pub mod board;
+pub mod client;
 pub mod eval;
 pub mod game;
 pub mod input;

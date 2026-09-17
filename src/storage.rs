@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 const CONFIG_VERSION: u32 = 1;
 const SESSION_VERSION: u32 = 1;
+const ONLINE_SESSION_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -143,6 +144,60 @@ pub fn default_session_path(config: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("session.json")
+}
+
+pub fn default_online_session_path(config: &Path) -> PathBuf {
+    config
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("online-session.json")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedOnlineSeat {
+    pub version: u32,
+    pub server_url: String,
+    pub game_id: String,
+    pub reconnect_token: String,
+    pub side: String,
+}
+
+impl SavedOnlineSeat {
+    pub fn new(
+        server_url: String,
+        game_id: String,
+        reconnect_token: String,
+        side: String,
+    ) -> SavedOnlineSeat {
+        SavedOnlineSeat {
+            version: ONLINE_SESSION_VERSION,
+            server_url,
+            game_id,
+            reconnect_token,
+            side,
+        }
+    }
+}
+
+pub fn save_online_seat(path: &Path, seat: &SavedOnlineSeat) -> Result<(), String> {
+    let text = serde_json::to_vec_pretty(seat)
+        .map_err(|error| format!("could not encode online session: {error}"))?;
+    atomic_write(path, &text)
+}
+
+pub fn load_online_seat(path: &Path) -> Result<SavedOnlineSeat, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let seat: SavedOnlineSeat = serde_json::from_str(&text)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if seat.version != ONLINE_SESSION_VERSION {
+        return Err(format!(
+            "{} uses unsupported online session version {}",
+            path.display(),
+            seat.version
+        ));
+    }
+    Ok(seat)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

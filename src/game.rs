@@ -167,6 +167,8 @@ pub struct Game {
     /// A draw offer remains live until the opponent accepts or plays a move.
     pub draw_offer: Option<Color>,
     pub agreed_draw: bool,
+    /// Side that lost because it did not return within the online reconnect window.
+    pub abandoned: Option<Color>,
     pub paused: bool,
     /// Monotonically changes whenever persistent or visible game state changes.
     pub revision: u64,
@@ -189,6 +191,7 @@ impl Game {
             resigned: None,
             draw_offer: None,
             agreed_draw: false,
+            abandoned: None,
             paused: false,
             revision: 0,
             clock: GameClock::new(initial, increment, side),
@@ -217,6 +220,7 @@ impl Game {
         self.resigned = None;
         self.draw_offer = None;
         self.agreed_draw = false;
+        self.abandoned = None;
         if !self.paused {
             self.clock.resume(self.pos.side);
         }
@@ -232,6 +236,7 @@ impl Game {
         self.resigned = None;
         self.draw_offer = None;
         self.agreed_draw = false;
+        self.abandoned = None;
         self.paused = false;
         self.clock.reset(self.pos.side);
         self.revision = self.revision.wrapping_add(1);
@@ -285,6 +290,8 @@ pub enum Outcome {
     Resignation(Color),
     /// Carries the side that ran out of time.
     Timeout(Color),
+    /// Carries the side that did not reconnect in time.
+    Abandonment(Color),
     DrawAgreement,
     Stalemate,
     FiftyMove,
@@ -301,6 +308,9 @@ pub fn outcome(game: &Game) -> Option<Outcome> {
     }
     if let Some(color) = game.clock.flagged {
         return Some(Outcome::Timeout(color));
+    }
+    if let Some(color) = game.abandoned {
+        return Some(Outcome::Abandonment(color));
     }
     let pos = &game.pos;
     if generate_legal(pos).is_empty() {
@@ -335,6 +345,11 @@ pub fn describe(result: &Outcome) -> String {
                 loser.flip().name()
             )
         }
+        Outcome::Abandonment(loser) => format!(
+            "{} did not reconnect - {} wins",
+            loser.name(),
+            loser.flip().name()
+        ),
         Outcome::DrawAgreement => "Draw by agreement".to_string(),
         Outcome::Stalemate => "Stalemate - the game is drawn".to_string(),
         Outcome::FiftyMove => "Drawn by the fifty-move rule".to_string(),
@@ -349,6 +364,7 @@ pub fn outcome_detail(result: &Outcome) -> String {
         Outcome::Checkmate(winner) => format!("{} wins", winner.name()),
         Outcome::Resignation(loser) => format!("{} resigned", loser.name()),
         Outcome::Timeout(loser) => format!("{} lost on time", loser.name()),
+        Outcome::Abandonment(loser) => format!("{} did not reconnect", loser.name()),
         Outcome::DrawAgreement => "By agreement".to_string(),
         Outcome::Stalemate => "Stalemate".to_string(),
         Outcome::FiftyMove => "Fifty-move rule".to_string(),
@@ -362,10 +378,12 @@ pub fn score_tag(game: &Game) -> &'static str {
     match outcome(game) {
         Some(Outcome::Checkmate(Color::White))
         | Some(Outcome::Resignation(Color::Black))
-        | Some(Outcome::Timeout(Color::Black)) => "1-0",
+        | Some(Outcome::Timeout(Color::Black))
+        | Some(Outcome::Abandonment(Color::Black)) => "1-0",
         Some(Outcome::Checkmate(Color::Black))
         | Some(Outcome::Resignation(Color::White))
-        | Some(Outcome::Timeout(Color::White)) => "0-1",
+        | Some(Outcome::Timeout(Color::White))
+        | Some(Outcome::Abandonment(Color::White)) => "0-1",
         Some(_) => "1/2-1/2",
         None => "*",
     }
