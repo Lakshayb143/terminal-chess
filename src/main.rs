@@ -7,9 +7,11 @@ mod movegen;
 mod san;
 mod search;
 mod sound;
+mod storage;
 mod ui;
 
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use board::{Color, Move, MoveKind, Piece, PieceKind, Position, Undo};
@@ -20,7 +22,8 @@ use search::{Limits, Search, SearchResult};
 use ui::{BoardView, Theme};
 
 fn main() {
-    let options = match Options::parse(std::env::args().skip(1)) {
+    let loaded = storage::load_preferences();
+    let options = match Options::parse(std::env::args().skip(1), &loaded.preferences) {
         Ok(Some(options)) => options,
         Ok(None) => return,
         Err(message) => {
@@ -29,7 +32,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(message) = play(options) {
+    if let Err(message) = play(options, loaded) {
         eprintln!("chess: {}", message);
         std::process::exit(1);
     }
@@ -39,13 +42,37 @@ fn main() {
 // Options
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// The human has White, the engine answers as Black.
     HumanWhite,
     HumanBlack,
     /// Two people sharing the keyboard; the engine only gives hints.
     TwoPlayer,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::HumanWhite => "white",
+            Mode::HumanBlack => "black",
+            Mode::TwoPlayer => "two",
+        }
+    }
+
+    fn named(name: &str) -> Option<Mode> {
+        match name {
+            "white" => Some(Mode::HumanWhite),
+            "black" => Some(Mode::HumanBlack),
+            "two" => Some(Mode::TwoPlayer),
+            _ => None,
+        }
+    }
+}
+
+enum StartChoice {
+    Mode(Mode),
+    Resume,
 }
 
 struct Options {
@@ -62,9 +89,14 @@ struct Options {
     /// Keep the old small board rather than filling the window.
     compact: bool,
     sound: sound::Mode,
+    player_names: [String; 2],
+    flipped: bool,
     /// Each player's starting time. `None` is an untimed game.
     clock: Option<Duration>,
     increment: Duration,
+    /// Restore the default autosave, or a specifically named saved game.
+    resume: bool,
+    load: Option<PathBuf>,
 }
 
 const HELP: &str = "\
@@ -85,6 +117,8 @@ GAME:
         --no-clock       play without chess clocks
         --fen <FEN>      start from a position rather than the initial one
                          (quote it: it contains spaces)
+        --resume         continue the automatically saved local game
+        --load <FILE>    open a saved Terminal Chess game
 
 LOOK:
         --theme <NAME>   board colours: slate, wood, forest, mono
@@ -107,19 +141,32 @@ IN THE GAME:
 
 impl Options {
     /// `Ok(None)` means help was printed and there is nothing left to do.
-    fn parse(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
+    fn parse(
+        args: impl Iterator<Item = String>,
+        preferences: &storage::Preferences,
+    ) -> Result<Option<Options>, String> {
+        let clock = preferences
+            .clock_enabled
+            .then(|| Duration::from_secs_f64(preferences.clock_minutes * 60.0));
         let mut options = Options {
             mode: None,
             fen: None,
             limits: Limits::default(),
             ascii: false,
             color: None,
-            palette: ui::THEMES[0].1,
-            pieces: ui::Pieces::Auto,
-            compact: false,
-            sound: sound::Mode::Auto,
-            clock: Some(Duration::from_secs(10 * 60)),
-            increment: Duration::ZERO,
+            palette: ui::palette(&preferences.theme).unwrap_or(ui::THEMES[0].1),
+            pieces: ui::pieces_named(&preferences.pieces).unwrap_or(ui::Pieces::Auto),
+            compact: preferences.compact,
+            sound: sound::Mode::named(&preferences.sound).unwrap_or(sound::Mode::Auto),
+            player_names: [
+                preferences.white_name.clone(),
+                preferences.black_name.clone(),
+            ],
+            flipped: preferences.flipped,
+            clock,
+            increment: Duration::from_secs_f64(preferences.increment_seconds),
+            resume: false,
+            load: None,
         };
         // Tracked so that `--depth` alone means "this depth, no clock", while
         // `--depth` with `--time` means "this depth, but stop when time runs out".
@@ -207,6 +254,8 @@ impl Options {
                 }
                 "--no-clock" => options.clock = None,
                 "--fen" => options.fen = Some(value("--fen")?),
+                "--resume" => options.resume = true,
+                "--load" => options.load = Some(PathBuf::from(value("--load")?)),
                 other => return Err(format!("unknown option '{}'", other)),
             }
         }
@@ -338,6 +387,25 @@ impl GameClock {
             shown_seconds(self.remaining[Color::Black.index()]),
         ];
     }
+
+    fn snapshot(&mut self) -> [u64; 2] {
+        self.sync();
+        [
+            self.remaining[Color::White.index()]
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            self.remaining[Color::Black.index()]
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        ]
+    }
+
+    fn restore(&mut self, remaining_ms: [u64; 2], side: Color, running: bool) {
+        self.remaining = remaining_ms.map(Duration::from_millis);
+        self.flagged = None;
+        self.running = (self.initial.is_some() && running).then_some((side, Instant::now()));
+        self.remember_shown();
+    }
 }
 
 fn shown_seconds(time: Duration) -> u64 {
@@ -359,6 +427,8 @@ struct Game {
     /// A draw offer remains live until the opponent accepts or plays a move.
     draw_offer: Option<Color>,
     agreed_draw: bool,
+    paused: bool,
+    revision: u64,
     clock: GameClock,
 }
 
@@ -379,6 +449,8 @@ impl Game {
             resigned: None,
             draw_offer: None,
             agreed_draw: false,
+            paused: false,
+            revision: 0,
             clock: GameClock::new(initial, increment, side),
         }
     }
@@ -394,6 +466,7 @@ impl Game {
         self.sans.push(text.clone());
         self.hashes.push(self.pos.hash);
         self.clock.complete_move(mover, self.pos.side);
+        self.revision = self.revision.wrapping_add(1);
         text
     }
 
@@ -404,7 +477,10 @@ impl Game {
         self.resigned = None;
         self.draw_offer = None;
         self.agreed_draw = false;
-        self.clock.resume(self.pos.side);
+        if !self.paused {
+            self.clock.resume(self.pos.side);
+        }
+        self.revision = self.revision.wrapping_add(1);
         self.sans.pop()
     }
 
@@ -416,7 +492,9 @@ impl Game {
         self.resigned = None;
         self.draw_offer = None;
         self.agreed_draw = false;
+        self.paused = false;
         self.clock.reset(self.pos.side);
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn last_move(&self) -> Option<Move> {
@@ -440,6 +518,106 @@ impl Game {
     fn prior_positions(&self) -> &[u64] {
         &self.hashes[..self.hashes.len() - 1]
     }
+
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        if self.paused {
+            self.clock.pause();
+        } else {
+            self.clock.resume(self.pos.side);
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+fn saved_game(game: &mut Game, mode: Mode) -> storage::SavedGame {
+    let mut saved = storage::SavedGame::new();
+    saved.start_fen = game.start.to_fen();
+    saved.moves = game.undos.iter().map(|undo| undo.mv.to_uci()).collect();
+    saved.mode = mode.name().to_string();
+    saved.initial_clock_ms = game
+        .clock
+        .initial
+        .map(|time| time.as_millis().min(u64::MAX as u128) as u64);
+    saved.increment_ms = game
+        .clock
+        .increment
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    saved.remaining_ms = game.clock.snapshot();
+    saved.paused = game.paused;
+    saved.resigned = game.resigned.map(|color| color.name().to_ascii_lowercase());
+    saved.draw_offer = game
+        .draw_offer
+        .map(|color| color.name().to_ascii_lowercase());
+    saved.agreed_draw = game.agreed_draw;
+    saved
+}
+
+fn restore_game(saved: storage::SavedGame) -> Result<(Game, Mode), String> {
+    let mode = Mode::named(&saved.mode)
+        .ok_or_else(|| format!("saved game has unknown mode `{}`", saved.mode))?;
+    let start = Position::from_fen(&saved.start_fen)
+        .map_err(|error| format!("saved starting position is invalid: {error}"))?;
+    let initial = saved.initial_clock_ms.map(Duration::from_millis);
+    let increment = Duration::from_millis(saved.increment_ms);
+    let mut game = Game::with_clock(start, initial, increment);
+    for (index, notation) in saved.moves.iter().enumerate() {
+        let movement = parse_move(&game.pos, notation).map_err(|_| {
+            format!(
+                "saved move {} (`{}`) is not legal in its position",
+                index + 1,
+                notation
+            )
+        })?;
+        game.play(movement);
+    }
+    game.resigned = saved.resigned.as_deref().and_then(color_named);
+    game.draw_offer = saved.draw_offer.as_deref().and_then(color_named);
+    game.agreed_draw = saved.agreed_draw;
+    game.paused = saved.paused;
+    let running = !game.paused && outcome(&game).is_none();
+    game.clock
+        .restore(saved.remaining_ms, game.pos.side, running);
+    game.revision = 0;
+    Ok((game, mode))
+}
+
+fn color_named(name: &str) -> Option<Color> {
+    match name.to_ascii_lowercase().as_str() {
+        "white" => Some(Color::White),
+        "black" => Some(Color::Black),
+        _ => None,
+    }
+}
+
+fn runtime_preferences(screen: &Screen, game: &Game) -> storage::Preferences {
+    storage::Preferences {
+        version: 1,
+        white_name: screen.player_names[Color::White.index()].clone(),
+        black_name: screen.player_names[Color::Black.index()].clone(),
+        theme: ui::palette_name(screen.theme.palette).to_string(),
+        pieces: screen.pieces.name().to_string(),
+        compact: screen.compact,
+        sound: screen.sound.mode().name().to_string(),
+        flipped: screen.flipped,
+        clock_enabled: game.clock.initial.is_some(),
+        clock_minutes: game
+            .clock
+            .initial
+            .map(|time| time.as_secs_f64() / 60.0)
+            .unwrap_or(10.0),
+        increment_seconds: game.clock.increment.as_secs_f64(),
+        onboarding_complete: true,
+    }
+}
+
+fn save_current_game(path: &Path, game: &mut Game, mode: Mode) -> Result<(), String> {
+    storage::save_game(path, &saved_game(game, mode))
 }
 
 fn kind_name(kind: PieceKind) -> &'static str {
@@ -608,6 +786,7 @@ struct Screen {
     /// keep the board large and stack compact information underneath.
     wide_panel: bool,
     pieces: ui::Pieces,
+    player_names: [String; 2],
     /// Hold the board at its old small size whatever the window could take.
     compact: bool,
     /// The left edge of the last frame, so the prompt and the engine's
@@ -662,6 +841,7 @@ struct Page {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiAction {
     MoveInput,
+    Pause,
     Undo,
     Draw,
     Resign,
@@ -909,6 +1089,8 @@ impl Screen {
             } else {
                 "Tab moves focus  ·  Enter selects  ·  type a command"
             }
+        } else if game.paused {
+            "game paused  ·  choose Resume or type a command"
         } else if self.confirming.is_some() {
             if self.cols < 55 {
                 "Enter confirms  ·  esc cancels"
@@ -1453,17 +1635,15 @@ impl Screen {
         compact: bool,
     ) -> String {
         let theme = &self.theme;
-        let to_move = game.pos.side == color && outcome(game).is_none();
+        let to_move = game.pos.side == color && outcome(game).is_none() && !game.paused;
         let marker = match (to_move, theme.ascii) {
             (false, _) => " ",
             (true, true) => ">",
             (true, false) => "\u{25B8}",
         };
         let player = match (mode, color) {
-            (Mode::TwoPlayer, Color::White) => "Player 1",
-            (Mode::TwoPlayer, Color::Black) => "Player 2",
-            (Mode::HumanWhite, Color::White) | (Mode::HumanBlack, Color::Black) => "You",
-            _ => "Engine",
+            (Mode::HumanWhite, Color::Black) | (Mode::HumanBlack, Color::White) => "Engine",
+            _ => &self.player_names[color.index()],
         };
         let name = if to_move {
             theme.bold(player)
@@ -1562,6 +1742,11 @@ impl Screen {
                 action: UiAction::MoveInput,
                 label: "Move",
                 enabled: true,
+            },
+            ButtonSpec {
+                action: UiAction::Pause,
+                label: if game.paused { "Resume" } else { "Pause" },
+                enabled: outcome(game).is_none(),
             },
             ButtonSpec {
                 action: UiAction::Undo,
@@ -1696,6 +1881,13 @@ impl Screen {
                 "{}  {}",
                 theme.strong(theme.palette.accent, &describe(&result)),
                 theme.dim("choose Rematch or Quit")
+            );
+        }
+        if game.paused {
+            return format!(
+                "{}  {}",
+                theme.strong(theme.palette.accent, "PAUSED"),
+                theme.dim("clocks and moves are stopped")
             );
         }
         let separator = theme.dim("  \u{b7}  ");
@@ -1896,10 +2088,28 @@ fn wrap(words: &[String], width: usize, indent: &str) -> Vec<String> {
 // The game loop
 // ---------------------------------------------------------------------------
 
-fn play(options: Options) -> Result<(), String> {
-    let start = match &options.fen {
-        Some(fen) => Position::from_fen(fen).map_err(|why| format!("bad --fen: {}", why))?,
-        None => Position::startpos(),
+fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), String> {
+    let config_path = loaded.path;
+    let session_path = storage::default_session_path(&config_path);
+    let mut last_preferences = loaded.preferences;
+    let mut backup_config_before_save = loaded.backup_before_save;
+    let first_run = loaded.first_run;
+    let config_warning = loaded.warning;
+    let requested_load = options
+        .load
+        .clone()
+        .or_else(|| options.resume.then(|| session_path.clone()));
+    let mut resuming = requested_load.is_some();
+    let mut restored = match requested_load {
+        Some(path) => Some(restore_game(storage::load_game(&path)?)?),
+        None => None,
+    };
+    let start = match (&restored, &options.fen) {
+        (Some(_), _) => None,
+        (None, Some(fen)) => {
+            Some(Position::from_fen(fen).map_err(|why| format!("bad --fen: {}", why))?)
+        }
+        (None, None) => Some(Position::startpos()),
     };
 
     let color = options.color.unwrap_or_else(Theme::detect_color);
@@ -1913,6 +2123,7 @@ fn play(options: Options) -> Result<(), String> {
         metrics: ui::Metrics::COMPACT,
         wide_panel: false,
         pieces: options.pieces,
+        player_names: options.player_names,
         compact: options.compact,
         indent: "  ".to_string(),
         board_hitbox: None,
@@ -1947,32 +2158,97 @@ fn play(options: Options) -> Result<(), String> {
         screen.inline_images = ui::detect_inline_images();
     }
 
-    let mut stdin = io::stdin().lock();
-    let mode = match options.mode {
-        Some(mode) => mode,
-        None => match ask_mode(&mut stdin, &mut screen)? {
-            Some(mode) => mode,
-            None => return Ok(()),
-        },
+    let (mut game, mut mode) = match restored.take() {
+        Some((game, mode)) => (game, mode),
+        None => {
+            let mut stdin = io::stdin().lock();
+            let choice = match options.mode {
+                Some(mode) => StartChoice::Mode(mode),
+                None => match ask_mode(&mut stdin, &mut screen, session_path.exists())? {
+                    Some(choice) => choice,
+                    None => return Ok(()),
+                },
+            };
+            drop(stdin);
+            match choice {
+                StartChoice::Mode(mode) => (
+                    Game::with_clock(
+                        start.expect("new games have a starting position"),
+                        options.clock,
+                        options.increment,
+                    ),
+                    mode,
+                ),
+                StartChoice::Resume => {
+                    resuming = true;
+                    restore_game(storage::load_game(&session_path)?)?
+                }
+            }
+        }
     };
-    drop(stdin);
 
     // Raw events are only appropriate while we own an interactive colour
     // terminal. Piped input retains the original line-oriented interface.
     let mut terminal_input = TerminalInput::enter(screen.theme.live && screen.theme.color)?;
 
-    let mut game = Game::with_clock(start, options.clock, options.increment);
     let mut engine = Search::new();
     let mut limits = options.limits;
-    screen.flipped = mode == Mode::HumanBlack;
-    screen.message = vec![screen
-        .theme
-        .dim("Type a move, click a piece, or press Tab for controls.")];
+    screen.flipped = options.flipped || mode == Mode::HumanBlack;
+    screen.message = if let Some(warning) = config_warning {
+        vec![screen.theme.warn(&format!(
+            "{} — using safe defaults.",
+            warning
+        ))]
+    } else if resuming {
+        vec![screen.theme.good("Saved game restored.")]
+    } else if first_run {
+        vec![screen.theme.accent(
+            "Welcome — type a move, click a piece, or press Tab. Preferences save automatically.",
+        )]
+    } else {
+        vec![screen
+            .theme
+            .dim("Type a move, click a piece, or press Tab for controls.")]
+    };
+    let mut saved_revision = game.revision;
+    let mut persistence_error_reported = false;
 
     loop {
+        let preferences = runtime_preferences(&screen, &game);
+        if preferences != last_preferences {
+            let backup = if backup_config_before_save {
+                storage::backup_invalid_preferences(&config_path).map(|_| ())
+            } else {
+                Ok(())
+            };
+            if backup.is_ok() {
+                backup_config_before_save = false;
+            }
+            let saved = backup
+                .and_then(|_| storage::save_preferences(&config_path, &preferences));
+            if let Err(error) = saved {
+                if !persistence_error_reported {
+                    screen.note(screen.theme.warn(&format!(
+                        "Preferences were not saved: {error}"
+                    )));
+                    persistence_error_reported = true;
+                }
+            }
+            last_preferences = preferences;
+        }
+        if game.revision != saved_revision {
+            if let Err(error) = save_current_game(&session_path, &mut game, mode) {
+                if !persistence_error_reported {
+                    screen.note(screen.theme.warn(&format!("Autosave failed: {error}")));
+                    persistence_error_reported = true;
+                }
+            }
+            saved_revision = game.revision;
+        }
         let flag_before = game.clock.flagged;
         if game.clock.tick() {
             if flag_before.is_none() && game.clock.flagged.is_some() {
+                game.changed();
                 screen.sound.play(sound::Cue::GameEnd);
                 screen.clear_marks();
                 screen.page = None;
@@ -1992,7 +2268,7 @@ fn play(options: Options) -> Result<(), String> {
             Mode::HumanBlack => game.pos.side == Color::White,
             Mode::TwoPlayer => false,
         };
-        if !finished && engine_to_move {
+        if !finished && !game.paused && engine_to_move {
             engine_move(&mut game, &mut engine, &limits, &mut screen);
             screen.redraw = true;
             continue;
@@ -2013,6 +2289,7 @@ fn play(options: Options) -> Result<(), String> {
             InputAction::Submit(line) => {
                 if line.is_empty() && screen.focused != UiAction::MoveInput {
                     if handle_ui_action(screen.focused, &mut game, mode, &mut screen) {
+                        let _ = save_current_game(&session_path, &mut game, mode);
                         return Ok(());
                     }
                     continue;
@@ -2020,7 +2297,9 @@ fn play(options: Options) -> Result<(), String> {
                 line
             }
             InputAction::Prompt => {
-                if screen.focus_move_input() {
+                let cleared_invalid = screen.invalid.take().is_some();
+                if screen.focus_move_input() || cleared_invalid {
+                    screen.redraw = true;
                     continue;
                 }
                 screen.draw_prompt(&game, terminal_input.buffer());
@@ -2062,6 +2341,7 @@ fn play(options: Options) -> Result<(), String> {
                 let flag_before = game.clock.flagged;
                 game.clock.tick();
                 if flag_before.is_none() && game.clock.flagged.is_some() {
+                    game.changed();
                     screen.sound.play(sound::Cue::GameEnd);
                     screen.clear_marks();
                     screen.page = None;
@@ -2075,6 +2355,7 @@ fn play(options: Options) -> Result<(), String> {
                 if let Some(action) = screen.action_at(column, row) {
                     screen.focus(action);
                     if handle_ui_action(action, &mut game, mode, &mut screen) {
+                        let _ = save_current_game(&session_path, &mut game, mode);
                         return Ok(());
                     }
                     continue;
@@ -2087,6 +2368,7 @@ fn play(options: Options) -> Result<(), String> {
             }
             // End of input, Ctrl-C or Ctrl-D.
             InputAction::Quit => {
+                let _ = save_current_game(&session_path, &mut game, mode);
                 println!();
                 return Ok(());
             }
@@ -2095,6 +2377,7 @@ fn play(options: Options) -> Result<(), String> {
         let flag_before = game.clock.flagged;
         game.clock.tick();
         if flag_before.is_none() && game.clock.flagged.is_some() {
+            game.changed();
             screen.sound.play(sound::Cue::GameEnd);
             screen.clear_marks();
             screen.page = None;
@@ -2134,6 +2417,7 @@ fn play(options: Options) -> Result<(), String> {
                 if !screen.theme.live {
                     println!("  {}", screen.theme.dim("Goodbye."));
                 }
+                let _ = save_current_game(&session_path, &mut game, mode);
                 return Ok(());
             }
             "help" | "h" | "?" => {
@@ -2160,8 +2444,68 @@ fn play(options: Options) -> Result<(), String> {
                 continue;
             }
             "pgn" => {
-                let lines = pgn_lines(&game);
+                let lines = pgn_lines(&game, &screen.player_names);
                 screen.open("PGN", lines);
+                continue;
+            }
+            "export" => {
+                let path = if rest.is_empty() {
+                    PathBuf::from("game.pgn")
+                } else {
+                    PathBuf::from(rest)
+                };
+                match export_pgn(&path, &game, &screen.player_names) {
+                    Ok(()) => screen.note(screen.theme.good(&format!(
+                        "Exported PGN to {}.",
+                        path.display()
+                    ))),
+                    Err(error) => screen.note(screen.theme.warn(&error)),
+                }
+                continue;
+            }
+            "import" => {
+                if rest.is_empty() {
+                    screen.note(screen.theme.dim("Use `import game.pgn`."));
+                } else if let Err(error) = import_pgn(Path::new(rest), &mut game, &mut screen) {
+                    screen.note(screen.theme.warn(&error));
+                }
+                continue;
+            }
+            "save" => {
+                let path = if rest.is_empty() {
+                    session_path.clone()
+                } else {
+                    PathBuf::from(rest)
+                };
+                match save_current_game(&path, &mut game, mode) {
+                    Ok(()) => screen.note(screen.theme.good(&format!(
+                        "Saved game to {}.",
+                        path.display()
+                    ))),
+                    Err(error) => screen.note(screen.theme.warn(&error)),
+                }
+                continue;
+            }
+            "load" => {
+                let path = if rest.is_empty() {
+                    session_path.clone()
+                } else {
+                    PathBuf::from(rest)
+                };
+                if let Err(error) = load_saved_game(&path, &mut game, &mut mode, &mut screen) {
+                    screen.note(screen.theme.warn(&error));
+                }
+                continue;
+            }
+            "setup" | "config" => {
+                screen.open(
+                    "LOCAL SETUP",
+                    setup_lines(&screen.theme, &config_path, &session_path),
+                );
+                continue;
+            }
+            "name" => {
+                set_player_name(&mut screen, rest);
                 continue;
             }
             "fen" => {
@@ -2216,6 +2560,16 @@ fn play(options: Options) -> Result<(), String> {
                 undo(&mut game, mode, &mut screen);
                 continue;
             }
+            "pause" | "resume" => {
+                let wants_pause = word == "pause";
+                if game.paused == wants_pause {
+                    let state = if game.paused { "already paused" } else { "already running" };
+                    screen.note(screen.theme.dim(&format!("The game is {}.", state)));
+                } else {
+                    handle_ui_action(UiAction::Pause, &mut game, mode, &mut screen);
+                }
+                continue;
+            }
             "draw" => {
                 handle_ui_action(UiAction::Draw, &mut game, mode, &mut screen);
                 continue;
@@ -2234,6 +2588,7 @@ fn play(options: Options) -> Result<(), String> {
                     screen.note(screen.theme.dim("The game is already over."));
                 } else {
                     game.resigned = Some(game.pos.side);
+                    game.changed();
                     game.clock.pause();
                     screen.analysis.clear();
                     screen.sound.play(sound::Cue::GameEnd);
@@ -2246,6 +2601,10 @@ fn play(options: Options) -> Result<(), String> {
 
         if finished {
             screen.note(screen.theme.dim("The game is over. Try `new`, `undo` or `quit`."));
+            continue;
+        }
+        if game.paused {
+            screen.note(screen.theme.dim("The game is paused. Choose Resume before moving."));
             continue;
         }
         if looks_like_command(&word) {
@@ -2279,6 +2638,18 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
         UiAction::MoveInput => {
             screen.focus_move_input();
         }
+        UiAction::Pause => {
+            if outcome(game).is_none() {
+                game.toggle_pause();
+                screen.clear_marks();
+                let message = if game.paused {
+                    screen.theme.accent("Game paused. Choose Resume when you are ready.")
+                } else {
+                    screen.theme.good("Game resumed.")
+                };
+                screen.note(message);
+            }
+        }
         UiAction::Undo => {
             screen.confirming = None;
             undo(game, mode, screen);
@@ -2290,6 +2661,7 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
             } else if game.draw_offer == Some(game.pos.side.flip()) {
                 game.agreed_draw = true;
                 game.draw_offer = None;
+                game.changed();
                 game.clock.pause();
                 screen.clear_marks();
                 screen.sound.play(sound::Cue::GameEnd);
@@ -2298,6 +2670,7 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
                 screen.note(screen.theme.dim("Your draw offer is waiting for the next player."));
             } else {
                 game.draw_offer = Some(game.pos.side);
+                game.changed();
                 screen.note(screen.theme.accent(&format!(
                     "{} offers a draw. Play your move; the opponent can then accept.",
                     game.pos.side.name()
@@ -2307,6 +2680,7 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
         UiAction::Resign => {
             if screen.confirming == Some(UiAction::Resign) {
                 game.resigned = Some(game.pos.side);
+                game.changed();
                 game.clock.pause();
                 screen.clear_marks();
                 screen.sound.play(sound::Cue::GameEnd);
@@ -2427,6 +2801,10 @@ fn handle_board_click(
 
     if finished {
         screen.note(screen.theme.dim("The game is over. Try `new` or `undo`."));
+        return;
+    }
+    if game.paused {
+        screen.note(screen.theme.dim("The game is paused. Choose Resume before moving."));
         return;
     }
     screen.invalid = None;
@@ -2589,6 +2967,7 @@ fn engine_move(game: &mut Game, engine: &mut Search, limits: &Limits, screen: &m
     let flag_before = game.clock.flagged;
     game.clock.tick();
     if flag_before.is_none() && game.clock.flagged.is_some() {
+        game.changed();
         screen.sound.play(sound::Cue::GameEnd);
         screen.clear_marks();
         screen.page = None;
@@ -3019,17 +3398,22 @@ fn bare_form(text: &str) -> String {
 }
 
 /// Every command and what it does, in the order the help lists them.
-const COMMANDS: [(&str, &str); 20] = [
+const COMMANDS: [(&str, &str); 27] = [
     ("help", "this list"),
     ("board", "redraw the board"),
     ("flip", "turn the board around"),
     ("moves", "list the legal moves"),
     ("history", "the moves so far"),
     ("pgn", "the game as PGN"),
+    ("export", "write a PGN file"),
+    ("import", "open a PGN file"),
+    ("save", "save this game"),
+    ("load", "restore a game"),
     ("fen", "the position as FEN"),
     ("eval", "the engine's opinion"),
     ("hint", "ask for a suggestion"),
     ("undo", "take back a move"),
+    ("pause", "pause or resume"),
     ("draw", "offer or accept a draw"),
     ("time", "seconds per move"),
     ("depth", "search depth instead"),
@@ -3037,6 +3421,8 @@ const COMMANDS: [(&str, &str); 20] = [
     ("pieces", "drawn, or figurines"),
     ("sound", "auto, on, off, or test"),
     ("size", "fill the window, or not"),
+    ("name", "set a player name"),
+    ("setup", "local files and setup"),
     ("new", "start again"),
     ("resign", "concede the game"),
     ("quit", "leave"),
@@ -3141,6 +3527,9 @@ fn help_lines(theme: &Theme) -> Vec<String> {
     lines.push(theme.dim("  `moves e2` points at one piece on the board"));
     lines.push(theme.dim(
         "  `time 5`, `depth 8`, `theme wood`, `pieces art`, `size small` all take a value",
+    ));
+    lines.push(theme.dim(
+        "  `save`, `load`, `import game.pgn` and `export game.pgn` keep games local",
     ));
     lines.push(theme.dim("  Scores are in pawns, always from White's point of view."));
     lines
@@ -3270,11 +3659,13 @@ fn history_page(theme: &Theme, game: &Game) -> Vec<String> {
 
 /// Left plain on purpose: PGN is for pasting somewhere else, and escape codes
 /// would go with it.
-fn pgn_lines(game: &Game) -> Vec<String> {
+fn pgn_lines(game: &Game, names: &[String; 2]) -> Vec<String> {
     let mut lines = vec![
         "[Event \"Casual game\"]".to_string(),
         "[Site \"Terminal\"]".to_string(),
         "[Date \"????.??.??\"]".to_string(),
+        format!("[White \"{}\"]", pgn_escape(&names[Color::White.index()])),
+        format!("[Black \"{}\"]", pgn_escape(&names[Color::Black.index()])),
         format!("[Result \"{}\"]", score_tag(game)),
     ];
     if game.start.to_fen() != board::START_FEN {
@@ -3303,6 +3694,111 @@ fn pgn_lines(game: &Game) -> Vec<String> {
     lines
 }
 
+fn pgn_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn load_saved_game(
+    path: &Path,
+    game: &mut Game,
+    mode: &mut Mode,
+    screen: &mut Screen,
+) -> Result<(), String> {
+    let (loaded, loaded_mode) = restore_game(storage::load_game(path)?)?;
+    *game = loaded;
+    *mode = loaded_mode;
+    screen.clear_marks();
+    screen.page = None;
+    screen.note(screen.theme.good(&format!(
+        "Restored {}.",
+        path.display()
+    )));
+    Ok(())
+}
+
+fn import_pgn(path: &Path, game: &mut Game, screen: &mut Screen) -> Result<(), String> {
+    let imported = storage::read_pgn(path)?;
+    let start = match imported.start_fen {
+        Some(fen) => Position::from_fen(&fen)
+            .map_err(|error| format!("PGN starting position is invalid: {error}"))?,
+        None => Position::startpos(),
+    };
+    let mut candidate = Game::with_clock(start, game.clock.initial, game.clock.increment);
+    for (index, notation) in imported.moves.iter().enumerate() {
+        let movement = parse_move(&candidate.pos, notation).map_err(|_| {
+            format!(
+                "PGN move {} (`{}`) is not legal in its position",
+                index + 1,
+                notation
+            )
+        })?;
+        candidate.play(movement);
+    }
+    candidate.revision = game.revision.wrapping_add(1);
+    *game = candidate;
+    screen.clear_marks();
+    screen.page = None;
+    screen.note(screen.theme.good(&format!(
+        "Imported {} moves from {}.",
+        game.sans.len(),
+        path.display()
+    )));
+    Ok(())
+}
+
+fn export_pgn(path: &Path, game: &Game, names: &[String; 2]) -> Result<(), String> {
+    let mut text = pgn_lines(game, names).join("\n");
+    text.push('\n');
+    storage::write_text(path, &text)
+}
+
+fn set_player_name(screen: &mut Screen, rest: &str) {
+    let Some((side, name)) = rest.split_once(char::is_whitespace) else {
+        screen.note(screen.theme.dim(
+            "Use `name white Lakshay` or `name black Guest`.",
+        ));
+        return;
+    };
+    let Some(color) = color_named(side) else {
+        screen.note(screen.theme.warn("Choose `white` or `black` before the name."));
+        return;
+    };
+    let name: String = name
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(32)
+        .collect();
+    if name.is_empty() {
+        screen.note(screen.theme.warn("A player name cannot be empty."));
+        return;
+    }
+    screen.player_names[color.index()] = name.clone();
+    screen.note(screen.theme.good(&format!(
+        "{} is now {}.",
+        color.name(),
+        name
+    )));
+}
+
+fn setup_lines(theme: &Theme, config: &Path, session: &Path) -> Vec<String> {
+    vec![
+        theme.bold("YOUR LOCAL GAME"),
+        theme.dim("Moves, clicks, clocks and sounds work without a browser."),
+        String::new(),
+        format!("{}  {}", theme.label("Preferences"), config.display()),
+        format!("{}  {}", theme.label("Autosave"), session.display()),
+        String::new(),
+        theme.bold("QUICK SETUP"),
+        format!("  {}", theme.accent("name white Lakshay")),
+        format!("  {}", theme.accent("theme forest  ·  pieces glyph  ·  sound on")),
+        format!("  {}", theme.accent("pause  ·  save  ·  load")),
+        String::new(),
+        theme.dim("Preferences are saved automatically. Edit config.toml when the game is closed."),
+        theme.dim("Press Escape or Return to go back to the board."),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
@@ -3319,7 +3815,11 @@ fn read_line(stdin: &mut io::StdinLock, prompt: &str) -> Result<Option<String>, 
     }
 }
 
-fn ask_mode(stdin: &mut io::StdinLock, screen: &mut Screen) -> Result<Option<Mode>, String> {
+fn ask_mode(
+    stdin: &mut io::StdinLock,
+    screen: &mut Screen,
+    can_resume: bool,
+) -> Result<Option<StartChoice>, String> {
     screen.measure();
     let mut complaint = String::new();
     loop {
@@ -3335,9 +3835,12 @@ fn ask_mode(stdin: &mut io::StdinLock, screen: &mut Screen) -> Result<Option<Mod
             ),
             format!("  {}   play as Black", theme.bold("2")),
             format!("  {}   two players at one keyboard", theme.bold("3")),
-            String::new(),
-            theme.dim("  q   leave"),
         ];
+        if can_resume {
+            block.push(format!("  {}   resume saved game", theme.bold("4")));
+        }
+        block.push(String::new());
+        block.push(theme.dim("  q   leave"));
         if !complaint.is_empty() {
             block.push(String::new());
             block.push(complaint.clone());
@@ -3373,11 +3876,20 @@ fn ask_mode(stdin: &mut io::StdinLock, screen: &mut Screen) -> Result<Option<Mod
             }
         };
         match line.trim().to_ascii_lowercase().as_str() {
-            "" | "1" | "w" | "white" => return Ok(Some(Mode::HumanWhite)),
-            "2" | "b" | "black" => return Ok(Some(Mode::HumanBlack)),
-            "3" | "t" | "two" => return Ok(Some(Mode::TwoPlayer)),
+            "" | "1" | "w" | "white" => {
+                return Ok(Some(StartChoice::Mode(Mode::HumanWhite)))
+            }
+            "2" | "b" | "black" => return Ok(Some(StartChoice::Mode(Mode::HumanBlack))),
+            "3" | "t" | "two" => return Ok(Some(StartChoice::Mode(Mode::TwoPlayer))),
+            "4" | "r" | "resume" if can_resume => return Ok(Some(StartChoice::Resume)),
             "q" | "quit" | "exit" => return Ok(None),
-            _ => complaint = theme.warn("  Choose 1, 2 or 3."),
+            _ => {
+                complaint = theme.warn(if can_resume {
+                    "  Choose 1, 2, 3 or 4."
+                } else {
+                    "  Choose 1, 2 or 3."
+                })
+            }
         }
     }
 }
@@ -3407,6 +3919,7 @@ mod interaction_tests {
             metrics: ui::Metrics::COMPACT,
             wide_panel: true,
             pieces: ui::Pieces::Glyph,
+            player_names: ["Player 1".to_string(), "Player 2".to_string()],
             compact: false,
             indent: String::new(),
             board_hitbox: None,
@@ -3612,6 +4125,65 @@ mod interaction_tests {
     }
 
     #[test]
+    fn pausing_stops_and_resumes_the_active_clock() {
+        let mut game = Game::with_clock(
+            Position::startpos(),
+            Some(Duration::from_secs(60)),
+            Duration::ZERO,
+        );
+
+        game.toggle_pause();
+        assert!(game.paused);
+        assert!(game.clock.running.is_none());
+
+        game.toggle_pause();
+        assert!(!game.paused);
+        assert_eq!(game.clock.running.map(|(color, _)| color), Some(Color::White));
+    }
+
+    #[test]
+    fn saved_game_round_trips_moves_clock_mode_and_pause() {
+        let mut game = Game::with_clock(
+            Position::startpos(),
+            Some(Duration::from_secs(300)),
+            Duration::from_secs(2),
+        );
+        for notation in ["e4", "e5", "Nf3"] {
+            let movement = parse_move(&game.pos, notation).ok().unwrap();
+            game.play(movement);
+        }
+        game.toggle_pause();
+
+        let saved = saved_game(&mut game, Mode::TwoPlayer);
+        let (restored, mode) = restore_game(saved).unwrap();
+
+        assert_eq!(mode, Mode::TwoPlayer);
+        assert_eq!(restored.pos.to_fen(), game.pos.to_fen());
+        assert_eq!(restored.sans, game.sans);
+        assert!(restored.paused);
+        assert_eq!(restored.clock.increment, Duration::from_secs(2));
+        assert!(restored.clock.running.is_none());
+    }
+
+    #[test]
+    fn pgn_import_replays_the_main_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.pgn");
+        std::fs::write(
+            &path,
+            "[Event \"Test\"]\n\n1. e4 e5 2. Nf3 (2. Bc4) Nc6 *\n",
+        )
+        .unwrap();
+        let mut game = Game::new(Position::startpos());
+        let mut screen = screen();
+
+        import_pgn(&path, &mut game, &mut screen).unwrap();
+
+        assert_eq!(game.sans, ["e4", "e5", "Nf3", "Nc6"]);
+        assert_eq!(game.pos.side, Color::White);
+    }
+
+    #[test]
     fn draw_offer_can_be_accepted_after_the_offering_move() {
         let mut game = Game::new(Position::startpos());
         let mut screen = screen();
@@ -3668,7 +4240,7 @@ mod interaction_tests {
         let buttons = screen.render_buttons(&screen.game_buttons(&game, Mode::TwoPlayer), 24);
 
         assert!(buttons.lines.len() >= 2);
-        assert_eq!(buttons.actions.len(), 6); // Undo starts disabled.
+        assert_eq!(buttons.actions.len(), 7); // Undo starts disabled.
         assert!(buttons
             .actions
             .iter()

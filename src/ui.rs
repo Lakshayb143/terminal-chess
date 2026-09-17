@@ -131,6 +131,14 @@ pub fn theme_names() -> String {
         .join(", ")
 }
 
+pub fn palette_name(palette: Palette) -> &'static str {
+    THEMES
+        .iter()
+        .find(|(_, candidate)| *candidate == palette)
+        .map(|(name, _)| *name)
+        .unwrap_or("slate")
+}
+
 /// Probe for a real inline-image protocol. The Kitty query also works through
 /// SSH because the bytes are answered by the terminal emulator on the user's
 /// machine, not by the remote shell. iTerm-family terminals are recognized by

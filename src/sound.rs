@@ -58,6 +58,14 @@ impl Mode {
             _ => None,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Auto => "auto",
+            Mode::On => "on",
+            Mode::Off => "off",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
