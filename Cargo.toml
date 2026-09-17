@@ -3,20 +3,25 @@ name = "chess"
 version = "0.1.0"
 edition = "2021"
 description = "Play chess in your terminal"
+default-run = "chess"
 
 [[bin]]
 name = "chess"
 path = "src/main.rs"
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
 crossterm = "0.29.0"
+futures-util = "0.3"
 image = { version = "0.25.10", default-features = false }
 resvg = { version = "0.48.1", default-features = false }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "vorbis"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.23.0"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
 viuer = "0.11.0"
 
 [profile.release]

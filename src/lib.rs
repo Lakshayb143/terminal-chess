@@ -8,6 +8,7 @@ pub mod eval;
 pub mod game;
 pub mod input;
 pub mod movegen;
+pub mod online;
 pub mod protocol;
 pub mod san;
 pub mod search;

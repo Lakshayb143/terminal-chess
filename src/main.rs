@@ -2,12 +2,15 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(test)]
+use std::time::Instant;
 
 use chess::board::{self, Color, Move, MoveKind, Piece, PieceKind, Position};
-use chess::game::{
-    describe, outcome, outcome_detail, score_tag, Game, GameClock, Outcome,
-};
+use chess::game::{describe, outcome, outcome_detail, score_tag, Game, Outcome};
+#[cfg(test)]
+use chess::game::GameClock;
 use chess::input::{Action as InputAction, TerminalInput};
 use chess::movegen::{generate_legal, in_check};
 use chess::san::{parse_move, to_san, to_san_with, ParseError};
