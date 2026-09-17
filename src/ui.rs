@@ -32,6 +32,12 @@ pub struct Palette {
     /// Squares a piece has been asked about, or a hinted move.
     light_target: u8,
     dark_target: u8,
+    /// Legal destinations that take an opposing piece.
+    light_capture: u8,
+    dark_capture: u8,
+    /// A square the player clicked but cannot legally use.
+    light_invalid: u8,
+    dark_invalid: u8,
     /// The piece currently chosen with the mouse.
     light_selected: u8,
     dark_selected: u8,
@@ -55,6 +61,8 @@ pub const THEMES: [(&str, Palette); 4] = [
             light_last: 180, dark_last: 137,
             light_check: 174, dark_check: 131,
             light_target: 151, dark_target: 108,
+            light_capture: 186, dark_capture: 143,
+            light_invalid: 174, dark_invalid: 131,
             light_selected: 153, dark_selected: 110,
             white_piece: 255, black_piece: 233,
             bar: 60,
@@ -68,6 +76,8 @@ pub const THEMES: [(&str, Palette); 4] = [
             light_last: 186, dark_last: 143,
             light_check: 174, dark_check: 131,
             light_target: 151, dark_target: 108,
+            light_capture: 153, dark_capture: 110,
+            light_invalid: 174, dark_invalid: 131,
             light_selected: 153, dark_selected: 110,
             white_piece: 255, black_piece: 233,
             bar: 95,
@@ -81,6 +91,8 @@ pub const THEMES: [(&str, Palette); 4] = [
             light_last: 186, dark_last: 143,
             light_check: 174, dark_check: 131,
             light_target: 152, dark_target: 109,
+            light_capture: 186, dark_capture: 143,
+            light_invalid: 174, dark_invalid: 131,
             light_selected: 186, dark_selected: 143,
             white_piece: 255, black_piece: 233,
             bar: 59,
@@ -94,6 +106,8 @@ pub const THEMES: [(&str, Palette); 4] = [
             light_last: 187, dark_last: 144,
             light_check: 181, dark_check: 138,
             light_target: 152, dark_target: 109,
+            light_capture: 195, dark_capture: 152,
+            light_invalid: 181, dark_invalid: 138,
             light_selected: 181, dark_selected: 181,
             white_piece: 255, black_piece: 233,
             bar: 238,
@@ -700,8 +714,10 @@ impl Theme {
         let light = (board::file_of(s) + board::rank_of(s)) % 2 == 1;
         let last = view.last.map_or(false, |mv| mv.from == s || mv.to == s);
         let check = view.check == Some(s);
+        let invalid = view.invalid == Some(s);
         let selected = promotion.is_none() && view.selected == Some(s);
         let target = promotion.is_some() || view.targets.contains(&s);
+        let capture = promotion.is_none() && view.captures.contains(&s);
 
         if !self.color {
             let glyph = match piece {
@@ -713,8 +729,12 @@ impl Theme {
             // plain board can mark squares without any of it sliding sideways.
             let (open, close) = if check {
                 ('[', ']')
+            } else if invalid {
+                ('!', '!')
             } else if selected {
                 ('<', '>')
+            } else if capture {
+                ('x', 'x')
             } else if target {
                 ('*', '*')
             } else if last {
@@ -726,17 +746,21 @@ impl Theme {
         }
 
         let p = &self.palette;
-        let bg = match (check, selected, target, last, light) {
-            (true, _, _, _, true) => p.light_check,
-            (true, _, _, _, false) => p.dark_check,
-            (_, true, _, _, true) => p.light_selected,
-            (_, true, _, _, false) => p.dark_selected,
-            (_, _, true, _, true) => p.light_target,
-            (_, _, true, _, false) => p.dark_target,
-            (_, _, _, true, true) => p.light_last,
-            (_, _, _, true, false) => p.dark_last,
-            (_, _, _, false, true) => p.light,
-            (_, _, _, false, false) => p.dark,
+        let bg = match (check, invalid, selected, capture, target, last, light) {
+            (true, _, _, _, _, _, true) => p.light_check,
+            (true, _, _, _, _, _, false) => p.dark_check,
+            (_, true, _, _, _, _, true) => p.light_invalid,
+            (_, true, _, _, _, _, false) => p.dark_invalid,
+            (_, _, true, _, _, _, true) => p.light_selected,
+            (_, _, true, _, _, _, false) => p.dark_selected,
+            (_, _, _, true, _, _, true) => p.light_capture,
+            (_, _, _, true, _, _, false) => p.dark_capture,
+            (_, _, _, _, true, _, true) => p.light_target,
+            (_, _, _, _, true, _, false) => p.dark_target,
+            (_, _, _, _, _, true, true) => p.light_last,
+            (_, _, _, _, _, true, false) => p.dark_last,
+            (_, _, _, _, _, false, true) => p.light,
+            (_, _, _, _, _, false, false) => p.dark,
         };
         let middle = m.cell_h / 2;
 
@@ -760,11 +784,11 @@ impl Theme {
                 }
             }
             // An empty square worth looking at gets a dot to look at.
-            None if target && row == middle => format!(
+            None if (target || invalid) && row == middle => format!(
                 "\x1b[48;5;{};38;5;{}m{}\x1b[0m",
                 bg,
                 p.label,
-                center("\u{2022}", m.cell_w)
+                center(if capture || invalid { "×" } else { "\u{2022}" }, m.cell_w)
             ),
             None => format!("\x1b[48;5;{}m{}\x1b[0m", bg, " ".repeat(m.cell_w)),
         }
@@ -805,20 +829,26 @@ impl Theme {
                     .last
                     .map_or(false, |mv| mv.from == square || mv.to == square);
                 let check = view.check == Some(square);
+                let invalid = view.invalid == Some(square);
                 let selected = promotion.is_none() && view.selected == Some(square);
                 let target = promotion.is_some() || view.targets.contains(&square);
+                let capture = promotion.is_none() && view.captures.contains(&square);
                 let p = &self.palette;
-                let background = ansi256_rgb(match (check, selected, target, last, light) {
-                    (true, _, _, _, true) => p.light_check,
-                    (true, _, _, _, false) => p.dark_check,
-                    (_, true, _, _, true) => p.light_selected,
-                    (_, true, _, _, false) => p.dark_selected,
-                    (_, _, true, _, true) => p.light_target,
-                    (_, _, true, _, false) => p.dark_target,
-                    (_, _, _, true, true) => p.light_last,
-                    (_, _, _, true, false) => p.dark_last,
-                    (_, _, _, false, true) => p.light,
-                    (_, _, _, false, false) => p.dark,
+                let background = ansi256_rgb(match (check, invalid, selected, capture, target, last, light) {
+                    (true, _, _, _, _, _, true) => p.light_check,
+                    (true, _, _, _, _, _, false) => p.dark_check,
+                    (_, true, _, _, _, _, true) => p.light_invalid,
+                    (_, true, _, _, _, _, false) => p.dark_invalid,
+                    (_, _, true, _, _, _, true) => p.light_selected,
+                    (_, _, true, _, _, _, false) => p.dark_selected,
+                    (_, _, _, true, _, _, true) => p.light_capture,
+                    (_, _, _, true, _, _, false) => p.dark_capture,
+                    (_, _, _, _, true, _, true) => p.light_target,
+                    (_, _, _, _, true, _, false) => p.dark_target,
+                    (_, _, _, _, _, true, true) => p.light_last,
+                    (_, _, _, _, _, true, false) => p.dark_last,
+                    (_, _, _, _, _, false, true) => p.light,
+                    (_, _, _, _, _, false, false) => p.dark,
                 });
                 let origin_x = display_file * TILE;
                 let origin_y = display_rank * TILE;
@@ -845,7 +875,7 @@ impl Theme {
                             pixels[destination..destination + 3].copy_from_slice(&color);
                         }
                     }
-                } else if target {
+                } else if target && !capture {
                     let marker = ansi256_rgb(p.label);
                     let radius = (TILE / 10) as isize;
                     let center = (TILE / 2) as isize;
@@ -863,7 +893,6 @@ impl Theme {
 
                 // An occupied legal destination gets a quiet inset frame;
                 // empty destinations keep the conventional center dot above.
-                let capture = promotion.is_none() && target && view.pos.at(square).is_some();
                 if capture {
                     let marker = ansi256_rgb(p.label);
                     let inset = TILE / 18;
@@ -945,6 +974,10 @@ pub struct BoardView<'a> {
     pub selected: Option<Square>,
     /// Squares to point at: where a piece can go, or a suggested move.
     pub targets: &'a [Square],
+    /// Legal targets that capture, including an empty en-passant destination.
+    pub captures: &'a [Square],
+    /// The most recently rejected click, highlighted until the next action.
+    pub invalid: Option<Square>,
     /// A temporary, chess-client-style promotion menu drawn over one file.
     pub promotions: &'a [PromotionOption],
 }
@@ -1094,6 +1127,8 @@ mod tests {
             check: None,
             selected: None,
             targets: &[],
+            captures: &[],
+            invalid: None,
             promotions: &[],
         };
 

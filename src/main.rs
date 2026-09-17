@@ -631,6 +631,10 @@ struct Screen {
     selected: Option<board::Square>,
     /// Squares the board should point at until the next move.
     targets: Vec<board::Square>,
+    /// Legal destinations that capture, styled separately from quiet moves.
+    captures: Vec<board::Square>,
+    /// A rejected click, shown briefly as local feedback on the board.
+    invalid: Option<board::Square>,
     /// Clickable pieces shown when a pawn reaches the back rank.
     promotions: Vec<ui::PromotionOption>,
     /// A page of text - the help, the move list, the score - shown in place of
@@ -705,6 +709,8 @@ struct InlineBoardKey {
     check: Option<board::Square>,
     selected: Option<board::Square>,
     targets: Vec<board::Square>,
+    captures: Vec<board::Square>,
+    invalid: Option<board::Square>,
     promotions: Vec<(board::Square, Piece)>,
     palette: ui::Palette,
     metrics: ui::Metrics,
@@ -855,6 +861,8 @@ impl Screen {
         self.message.clear();
         self.selected = None;
         self.targets.clear();
+        self.captures.clear();
+        self.invalid = None;
         self.promotions.clear();
         self.analysis.clear();
         self.history_offset = 0;
@@ -965,6 +973,8 @@ impl Screen {
                 .then_some(game.pos.king[game.pos.side.index()]),
             selected: self.selected,
             targets: self.targets.clone(),
+            captures: self.captures.clone(),
+            invalid: self.invalid,
             promotions: self
                 .promotions
                 .iter()
@@ -1084,6 +1094,8 @@ impl Screen {
             },
             selected: self.selected,
             targets: &self.targets,
+            captures: &self.captures,
+            invalid: self.invalid,
             promotions: &self.promotions,
         }
     }
@@ -1564,7 +1576,7 @@ impl Screen {
             ButtonSpec {
                 action: UiAction::Resign,
                 label: if self.confirming == Some(UiAction::Resign) {
-                    "Confirm"
+                    "Confirm resign"
                 } else {
                     "Resign"
                 },
@@ -1573,7 +1585,7 @@ impl Screen {
             ButtonSpec {
                 action: UiAction::Restart,
                 label: if self.confirming == Some(UiAction::Restart) {
-                    "Confirm"
+                    "Confirm restart"
                 } else {
                     "Restart"
                 },
@@ -1914,6 +1926,8 @@ fn play(options: Options) -> Result<(), String> {
         message: Vec::new(),
         selected: None,
         targets: Vec::new(),
+        captures: Vec::new(),
+        invalid: None,
         promotions: Vec::new(),
         page: None,
         last_frame: Vec::new(),
@@ -2402,7 +2416,9 @@ fn handle_board_click(
         None => {
             if screen.selected.take().is_some() {
                 screen.targets.clear();
+                screen.captures.clear();
                 screen.promotions.clear();
+                screen.invalid = None;
                 screen.redraw = true;
             }
             return;
@@ -2413,6 +2429,7 @@ fn handle_board_click(
         screen.note(screen.theme.dim("The game is over. Try `new` or `undo`."));
         return;
     }
+    screen.invalid = None;
 
     if let Some(choice) = screen
         .promotions
@@ -2432,6 +2449,7 @@ fn handle_board_click(
         if square == from {
             screen.selected = None;
             screen.targets.clear();
+            screen.captures.clear();
             screen.redraw = true;
             return;
         }
@@ -2456,21 +2474,52 @@ fn handle_board_click(
     match game.pos.at(square) {
         Some(piece) if piece.color == game.pos.side => {
             screen.selected = Some(square);
-            screen.targets = legal
+            let moves: Vec<Move> = legal
                 .iter()
                 .filter(|mv| mv.from == square)
+                .copied()
+                .collect();
+            screen.targets = moves.iter().map(|mv| mv.to).collect();
+            screen.captures = moves
+                .iter()
+                .filter(|mv| {
+                    mv.kind == MoveKind::EnPassant || game.pos.at(mv.to).is_some()
+                })
                 .map(|mv| mv.to)
                 .collect();
-            screen.message.clear();
+            screen.message = if moves.is_empty() {
+                vec![screen.theme.dim(&format!(
+                    "The {} on {} has no legal moves.",
+                    kind_name(piece.kind),
+                    board::square_name(square)
+                ))]
+            } else {
+                Vec::new()
+            };
             screen.redraw = true;
         }
         _ if screen.selected.is_none() => {
-            if !screen.targets.is_empty() {
-                screen.targets.clear();
-                screen.redraw = true;
-            }
+            screen.invalid = Some(square);
+            let guidance = match game.pos.at(square) {
+                Some(piece) => format!(
+                    "That {} belongs to {}. Choose a {} piece.",
+                    kind_name(piece.kind),
+                    piece.color.name(),
+                    game.pos.side.name()
+                ),
+                None => format!("Choose a {} piece before choosing a destination.", game.pos.side.name()),
+            };
+            screen.message = vec![screen.theme.dim(&guidance)];
+            screen.redraw = true;
         }
-        _ => {}
+        _ => {
+            screen.invalid = Some(square);
+            screen.message = vec![screen.theme.warn(&format!(
+                "{} is not a legal destination for the selected piece.",
+                board::square_name(square)
+            ))];
+            screen.redraw = true;
+        }
     }
 }
 
@@ -2500,9 +2549,11 @@ fn open_promotion_menu(game: &Game, screen: &mut Screen, moves: &[Move]) {
         })
         .collect();
     screen.analysis.clear();
-    screen.message = vec![screen
-        .theme
-        .dim("Choose promotion: click a piece, or type Q, R, B or N.")];
+    screen.message = vec![format!(
+        "{}  {}",
+        screen.theme.accent("Promotion"),
+        screen.theme.dim("choose a piece, or type Q, R, B or N")
+    )];
     screen.redraw = true;
 }
 
@@ -2636,6 +2687,11 @@ fn hint(game: &Game, engine: &mut Search, limits: &Limits, screen: &mut Screen) 
             }
             screen.analysis = lines;
             screen.targets = vec![mv.from, mv.to];
+            screen.captures = if mv.kind == MoveKind::EnPassant || game.pos.at(mv.to).is_some() {
+                vec![mv.to]
+            } else {
+                Vec::new()
+            };
             screen.redraw = true;
         }
         None => {
@@ -3183,6 +3239,11 @@ fn show_piece_moves(screen: &mut Screen, pos: &Position, filter: &str) {
             .map(|line| screen.theme.accent(line)),
     );
     screen.targets = moves.iter().map(|mv| mv.to).collect();
+    screen.captures = moves
+        .iter()
+        .filter(|mv| mv.kind == MoveKind::EnPassant || pos.at(mv.to).is_some())
+        .map(|mv| mv.to)
+        .collect();
     screen.selected = Some(from);
     screen.show(message);
 }
@@ -3359,6 +3420,8 @@ mod interaction_tests {
             message: Vec::new(),
             selected: None,
             targets: Vec::new(),
+            captures: Vec::new(),
+            invalid: None,
             promotions: Vec::new(),
             page: None,
             last_frame: Vec::new(),
@@ -3432,6 +3495,37 @@ mod interaction_tests {
         assert_eq!(screen.targets.len(), 2);
         assert!(screen.targets.contains(&f3));
         assert!(screen.targets.contains(&board::parse_square("h3").unwrap()));
+    }
+
+    #[test]
+    fn capture_targets_are_distinct_from_quiet_moves() {
+        let position = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let mut game = Game::new(position);
+        let mut screen = screen();
+        let e4 = board::parse_square("e4").unwrap();
+        let d5 = board::parse_square("d5").unwrap();
+        let e5 = board::parse_square("e5").unwrap();
+
+        handle_board_click(&mut game, &mut screen, Some(e4), false);
+
+        assert!(screen.targets.contains(&d5));
+        assert!(screen.targets.contains(&e5));
+        assert_eq!(screen.captures, vec![d5]);
+    }
+
+    #[test]
+    fn invalid_destination_gets_local_feedback() {
+        let mut game = Game::new(Position::startpos());
+        let mut screen = screen();
+        let e2 = board::parse_square("e2").unwrap();
+        let e5 = board::parse_square("e5").unwrap();
+
+        handle_board_click(&mut game, &mut screen, Some(e2), false);
+        handle_board_click(&mut game, &mut screen, Some(e5), false);
+
+        assert_eq!(screen.invalid, Some(e5));
+        assert_eq!(screen.selected, Some(e2));
+        assert!(!screen.message.is_empty());
     }
 
     #[test]
