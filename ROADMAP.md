@@ -21,7 +21,8 @@ Make mouse and keyboard play feel deliberate, clear, and forgiving.
 - [ ] Refine selected-square and legal-move markers.
 - [ ] Distinguish quiet moves from captures at a glance.
 - [ ] Add restrained feedback for invalid clicks.
-- [ ] Improve keyboard navigation and focus states.
+- [x] Improve keyboard navigation and focus states.
+- [x] Add in-game controls for board size and piece style.
 - [ ] Review promotion and confirmation interactions.
 
 ## 3. Complete the local-game experience — later

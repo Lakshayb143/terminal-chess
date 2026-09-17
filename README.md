@@ -56,8 +56,11 @@ The mouse-accessible actions let you undo, offer or accept a draw, resign, and
 restart. Potentially destructive actions require confirmation. The move list
 can be scrolled with the mouse wheel or `Page Up` and `Page Down`.
 
-Keyboard input remains fully supported. Type a move in SAN or coordinate
-notation, or type `help` during a game to see every available command.
+Keyboard input remains fully supported. Type anywhere to return focus to the
+move box. Use `Tab` or the arrow keys to move through every visible control,
+`Shift+Tab` to go backwards, and `Enter` to activate the focused button. The
+`Move` button returns the cursor to the move box, so draw, resign, restart, and
+all other game actions remain usable without a mouse.
 
 ## Board rendering
 
@@ -71,6 +74,12 @@ The default `auto` mode selects the best renderer available:
 | `pieces auto` | High-resolution inline images when supported, with a safe fallback |
 | `pieces art` | Portable true-colour artwork made from Unicode block elements |
 | `pieces glyph` | Chess characters supplied by the terminal font |
+
+The `Size` and `Piece` buttons change both settings while the game is running;
+no command is required. Each press on `Piece` cycles from `Auto` to `Glyph` to
+`Art`. If terminal images look soft or blurry, choose `Glyph` for the sharpest
+font-rendered pieces. `Art` is the portable drawn fallback for terminals that
+do not render inline images cleanly.
 
 For the sharpest large board on macOS, use a current version of iTerm2 and run:
 
