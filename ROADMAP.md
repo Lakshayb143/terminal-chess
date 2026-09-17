@@ -35,7 +35,7 @@ Turn the current game into a session players can leave, share, and customize.
 - [x] Persist player names, themes, clocks, sound, and board orientation.
 - [x] Add a first-run setup and straightforward configuration file.
 
-## 4. Private online games — in progress
+## 4. Private online games — complete
 
 Prove that two terminal clients can finish a reliable server-authoritative
 game before adding public accounts or ratings.
@@ -45,11 +45,11 @@ game before adding public accounts or ratings.
 - [x] Add an authoritative WebSocket server for legal moves and clocks.
 - [x] Add private guest rooms with invite codes.
 - [x] Add draw, resignation, disconnect, and reconnect behavior on the server.
-- [ ] Connect the terminal UI to create and join online games.
-- [ ] Show waiting, connection, reconnecting, and opponent-offline states.
-- [ ] Persist active server games across restarts.
-- [ ] Add deployment configuration, TLS, rate limits, and operational logging.
-- [ ] Test complete games between two clients under latency and disconnects.
+- [x] Connect the terminal UI to create and join online games.
+- [x] Show waiting, connection, reconnecting, and opponent-offline states.
+- [x] Persist active server games across restarts.
+- [x] Add deployment configuration, TLS, rate limits, and operational logging.
+- [x] Test complete games between two clients under latency and disconnects.
 
 ## 5. Accounts and game history — planned
 

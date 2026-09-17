@@ -7,13 +7,15 @@ feel of a graphical chess site to a native command-line program. It combines a
 responsive board, scalable vector pieces, clocks, move history, sound effects,
 and an embedded engine in a single executable.
 
-The long-term goal is a terminal-first place where people can play locally,
-against an engine, or eventually against another person over the network.
+The goal is a terminal-first place where people can play locally, against an
+engine, or against another person over the network.
 
 ## Highlights
 
 - Click a piece, inspect its legal moves, and click a destination to move.
 - Play against the built-in engine or another person at the same terminal.
+- Create a private online game, share its six-character code, and play from two
+  terminals with server-owned rules and clocks.
 - Use SAN (`Nf3`, `exd5`, `O-O`) or coordinate notation (`e2e4`) at any time.
 - Get a responsive layout with player panels, clocks, captured pieces, material
   advantage, move history, and clear game-over states.
@@ -39,6 +41,19 @@ To start a local two-player game immediately:
 
 ```sh
 cargo run --release -- --two
+```
+
+To play online against a local development server:
+
+```sh
+# Terminal 1: start the authoritative server
+cargo run --release --bin chess-server
+
+# Terminal 2: create a game and copy the invite code shown on the board
+cargo run --release -- online create --name Lakshay
+
+# Terminal 3: join with that code
+cargo run --release -- online join ABC123 --name Guest
 ```
 
 To install Terminal Chess as a normal command:
@@ -93,6 +108,31 @@ Set `TERMINAL_CHESS_CONFIG` to choose another location. Player names, theme,
 piece style, board size, sound mode, orientation, clock, and increment persist
 between launches. Run `setup` in the game to see the active config and autosave
 paths, or set names with `name white Lakshay` and `name black Guest`.
+
+## Private online games
+
+The server owns the position, legal-move validation, clocks, draw offers, and
+game result. The terminal client displays server snapshots and never advances
+the board optimistically, so reconnecting cannot leave the players with two
+different positions.
+
+Create or join a game with:
+
+```sh
+chess online create --name Lakshay --server wss://chess.example.com/ws
+chess online join ABC123 --name Guest --server wss://chess.example.com/ws
+```
+
+If the connection drops, the client reconnects automatically and restores the
+same seat using a local reconnect token. To return after closing the program,
+run `chess online resume`. The token is stored beside the config as
+`online-session.json`; treat that file as private because it grants control of
+the seat.
+
+Online games support mouse and keyboard moves, server clocks, draw offers,
+resignation, PGN export, sounds, both board orientations, and all rendering
+modes. The status line distinguishes waiting for an opponent, reconnecting,
+and an opponent who is temporarily offline.
 
 ## Board rendering
 
@@ -152,6 +192,11 @@ Terminal Chess uses the system audio player; other platforms use Rodio.
 --fen <position>     start from a FEN position
 --resume             continue the automatically saved game
 --load <file>        open a specific saved game
+online create        create a private online game
+online join <code>   join a private online game
+online resume        restore the last online seat
+--server <ws-url>    online endpoint (or CHESS_SERVER_URL)
+--name <name>        name shown in an online game
 ```
 
 Run `chess --help` for the complete reference.
@@ -173,13 +218,11 @@ view wrapped in a desktop shell. A few implementation details:
 
 The current product priorities are tracked in [ROADMAP.md](ROADMAP.md).
 
-## Multiplayer development preview
+## Running the multiplayer server
 
-Online play is under active development. The repository now includes an
-authoritative WebSocket server with private guest rooms, invite codes, legal
-move validation, server-owned clocks, and reconnect tokens. The terminal UI is
-not connected to it yet, so this is currently a development interface rather
-than a player-facing feature.
+The repository includes the authoritative WebSocket server used by online
+clients. It has durable active rooms, reconnect tokens, per-connection request
+limits, structured logs, and graceful shutdown.
 
 Run the server locally with:
 
@@ -188,9 +231,20 @@ cargo run --bin chess-server
 ```
 
 It listens on `127.0.0.1:3000` by default and exposes `/health` and `/ws`.
-Set `CHESS_SERVER_ADDR`, for example `0.0.0.0:3000`, to choose another bind
-address. Public deployments must place the WebSocket endpoint behind TLS and
-should not expose this preview without rate limits and persistence.
+Active games are atomically saved to `data/server-state.json`. The following
+environment variables configure it:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CHESS_SERVER_ADDR` | `127.0.0.1:3000` | TCP bind address |
+| `CHESS_SERVER_STATE` | `data/server-state.json` | Durable room state |
+| `CHESS_RATE_LIMIT_PER_10S` | `60` | Requests allowed per connection window |
+| `CHESS_LOG_FORMAT` | text | Set to `json` for structured logs |
+| `RUST_LOG` | `chess_server=info` | Log filter |
+
+For a public host, [deploy/README.md](deploy/README.md) provides Docker Compose
+and Caddy instructions. Caddy terminates TLS and upgrades `wss://` connections;
+the game server stays on the private container network.
 
 ## Development
 
