@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -23,25 +23,26 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 pub enum TransportEvent {
     Connecting { attempt: u32 },
     Connected,
-    Message(ServerEnvelope),
+    Message(Box<ServerEnvelope>),
     Disconnected { reason: String, retry_in: Duration },
     Stopped(String),
 }
 
 enum WorkerCommand {
     Send(ClientCommand),
-    Stop,
 }
 
 pub struct OnlineClient {
     commands: tokio_mpsc::UnboundedSender<WorkerCommand>,
     events: Receiver<TransportEvent>,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl OnlineClient {
     pub fn connect(url: String) -> OnlineClient {
         let (commands, command_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, events) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         thread::Builder::new()
             .name("terminal-chess-network".to_string())
             .spawn(move || {
@@ -49,7 +50,7 @@ impl OnlineClient {
                     .enable_all()
                     .build();
                 match runtime {
-                    Ok(runtime) => runtime.block_on(worker(url, command_rx, event_tx)),
+                    Ok(runtime) => runtime.block_on(worker(url, command_rx, event_tx, shutdown_rx)),
                     Err(error) => {
                         let _ = event_tx.send(TransportEvent::Stopped(format!(
                             "could not start network runtime: {error}"
@@ -58,7 +59,11 @@ impl OnlineClient {
                 }
             })
             .expect("could not start network thread");
-        OnlineClient { commands, events }
+        OnlineClient {
+            commands,
+            events,
+            shutdown: Some(shutdown_tx),
+        }
     }
 
     pub fn send(&self, command: ClientCommand) -> Result<(), String> {
@@ -74,7 +79,9 @@ impl OnlineClient {
 
 impl Drop for OnlineClient {
     fn drop(&mut self) {
-        let _ = self.commands.send(WorkerCommand::Stop);
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
     }
 }
 
@@ -82,6 +89,7 @@ async fn worker(
     url: String,
     mut commands: tokio_mpsc::UnboundedReceiver<WorkerCommand>,
     events: mpsc::Sender<TransportEvent>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut attempt = 0u32;
     let mut next_request_id = 1u64;
@@ -91,19 +99,22 @@ async fn worker(
         if events.send(TransportEvent::Connecting { attempt }).is_err() {
             return;
         }
-        let connected = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url)).await;
+        let connected = tokio::select! {
+            connected = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url)) => connected,
+            _ = &mut shutdown => return,
+        };
         let (mut socket, _) = match connected {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => {
-                if !retry(&mut commands, &events, attempt, error.to_string()).await {
+                if !retry(&events, &mut shutdown, attempt, error.to_string()).await {
                     return;
                 }
                 continue;
             }
             Err(_) => {
                 if !retry(
-                    &mut commands,
                     &events,
+                    &mut shutdown,
                     attempt,
                     format!(
                         "connection attempt timed out after {} seconds",
@@ -144,7 +155,7 @@ async fn worker(
                                 break format!("send failed: {error}");
                             }
                         }
-                        Some(WorkerCommand::Stop) | None => {
+                        None => {
                             let _ = socket.close(None).await;
                             return;
                         }
@@ -155,7 +166,10 @@ async fn worker(
                         Some(Ok(Message::Text(text))) => {
                             match serde_json::from_str::<ServerEnvelope>(&text) {
                                 Ok(message) => {
-                                    if events.send(TransportEvent::Message(message)).is_err() {
+                                    if events
+                                        .send(TransportEvent::Message(Box::new(message)))
+                                        .is_err()
+                                    {
                                         return;
                                     }
                                 }
@@ -184,18 +198,22 @@ async fn worker(
                         break format!("heartbeat failed: {error}");
                     }
                 }
+                _ = &mut shutdown => {
+                    let _ = socket.close(None).await;
+                    return;
+                }
             }
         };
 
-        if !retry(&mut commands, &events, 1, disconnect_reason).await {
+        if !retry(&events, &mut shutdown, 1, disconnect_reason).await {
             return;
         }
     }
 }
 
 async fn retry(
-    commands: &mut tokio_mpsc::UnboundedReceiver<WorkerCommand>,
     events: &mpsc::Sender<TransportEvent>,
+    shutdown: &mut oneshot::Receiver<()>,
     attempt: u32,
     reason: String,
 ) -> bool {
@@ -209,6 +227,6 @@ async fn retry(
     }
     tokio::select! {
         _ = tokio::time::sleep(retry_in) => true,
-        command = commands.recv() => !matches!(command, Some(WorkerCommand::Stop) | None),
+        _ = shutdown => false,
     }
 }

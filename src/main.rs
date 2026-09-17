@@ -552,6 +552,7 @@ struct OnlineDisplay {
     black_connected: bool,
     reconnect_deadline_ms: Option<u64>,
     move_pending: bool,
+    failure_help: Option<String>,
 }
 
 impl OnlineDisplay {
@@ -584,6 +585,7 @@ enum UiAction {
     Pause,
     Undo,
     Draw,
+    DeclineDraw,
     Resign,
     Restart,
     ToggleSize,
@@ -1538,7 +1540,12 @@ impl Screen {
             None => "Draw",
         };
         if let Some(online) = &self.online {
-            return vec![
+            let draw_label = match game.draw_offer {
+                Some(color) if Some(color) != online.your_side => "Accept",
+                Some(_) => "Offered",
+                None => "Draw",
+            };
+            let mut buttons = vec![
                 ButtonSpec {
                     action: UiAction::MoveInput,
                     label: "Move",
@@ -1553,6 +1560,21 @@ impl Screen {
                         && game.draw_offer != online.your_side
                         && outcome(game).is_none(),
                 },
+            ];
+            if online
+                .your_side
+                .is_some_and(|side| game.draw_offer == Some(side.flip()))
+            {
+                buttons.push(ButtonSpec {
+                    action: UiAction::DeclineDraw,
+                    label: "Decline",
+                    enabled: online.connection == ConnectionDisplay::Connected
+                        && online.white_connected
+                        && online.black_connected
+                        && outcome(game).is_none(),
+                });
+            }
+            buttons.extend([
                 ButtonSpec {
                     action: UiAction::Resign,
                     label: if self.confirming == Some(UiAction::Resign) {
@@ -1567,7 +1589,8 @@ impl Screen {
                 },
                 self.size_button(),
                 self.pieces_button(),
-            ];
+            ]);
+            return buttons;
         }
         vec![
             ButtonSpec {
@@ -1723,6 +1746,18 @@ impl Screen {
 
     fn state_line(&self, game: &Game) -> String {
         let theme = &self.theme;
+        if let Some(result) = outcome(game) {
+            let next = if self.online.is_some() {
+                "export PGN or quit"
+            } else {
+                "choose Rematch or Quit"
+            };
+            return format!(
+                "{}  {}",
+                theme.strong(theme.palette.accent, &describe(&result)),
+                theme.dim(next)
+            );
+        }
         if let Some(online) = &self.online {
             match online.connection {
                 ConnectionDisplay::Connecting => {
@@ -1743,7 +1778,12 @@ impl Screen {
                     return format!(
                         "{}  {}",
                         theme.strong(theme.palette.warn, "OFFLINE"),
-                        theme.dim("type quit, then run online resume to return")
+                        theme.dim(
+                            online
+                                .failure_help
+                                .as_deref()
+                                .unwrap_or("quit and run online resume to return"),
+                        )
                     );
                 }
                 ConnectionDisplay::Connected => {}
@@ -1764,13 +1804,6 @@ impl Screen {
                     );
                 }
             }
-        }
-        if let Some(result) = outcome(game) {
-            return format!(
-                "{}  {}",
-                theme.strong(theme.palette.accent, &describe(&result)),
-                theme.dim("choose Rematch or Quit")
-            );
         }
         if game.paused {
             return format!(
@@ -2008,6 +2041,7 @@ impl OnlineSession {
                 if let Some(online) = &mut screen.online {
                     online.connection = ConnectionDisplay::Stopped;
                     online.move_pending = false;
+                    online.failure_help = Some("quit, then retry your online command".to_string());
                 }
                 screen.note(screen.theme.warn(&error));
                 false
@@ -2126,6 +2160,7 @@ fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Resu
             black_connected: false,
             reconnect_deadline_ms: None,
             move_pending: true,
+            failure_help: None,
         }),
     };
     let _fullscreen = ui::Fullscreen::enter(&screen.theme);
@@ -2159,7 +2194,7 @@ fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Resu
             handle_transport_event(event, &mut session, &mut game, &mut screen)?;
         }
 
-        let preferences = online_preferences(&last_preferences, &screen, &session, &game);
+        let preferences = online_preferences(&last_preferences, &screen, &game);
         if preferences != last_preferences {
             if let Err(error) = storage::save_preferences(&config_path, &preferences) {
                 if !persistence_error_reported {
@@ -2394,6 +2429,7 @@ fn handle_transport_event(
             if let Some(online) = &mut screen.online {
                 online.connection = ConnectionDisplay::Connected;
                 online.move_pending = true;
+                online.failure_help = None;
             }
             session.send(
                 ClientCommand::Hello {
@@ -2429,6 +2465,7 @@ fn handle_transport_event(
             if let Some(online) = &mut screen.online {
                 online.connection = ConnectionDisplay::Reconnecting;
                 online.move_pending = true;
+                online.failure_help = None;
             }
             screen.show(vec![
                 screen
@@ -2444,6 +2481,7 @@ fn handle_transport_event(
             if let Some(online) = &mut screen.online {
                 online.connection = ConnectionDisplay::Stopped;
                 online.move_pending = false;
+                online.failure_help = Some("quit, then retry your online command".to_string());
             }
             screen.note(screen.theme.warn(&reason));
         }
@@ -2462,7 +2500,7 @@ fn handle_transport_event(
                     online.your_side = session.side;
                 }
                 session.save_seat()?;
-                apply_online_snapshot(snapshot, session, game, screen)?;
+                apply_online_snapshot(snapshot, session, game, screen, true)?;
             }
             ServerEvent::GameJoined {
                 reconnect_token,
@@ -2477,18 +2515,18 @@ fn handle_transport_event(
                     online.your_side = session.side;
                 }
                 session.save_seat()?;
-                apply_online_snapshot(snapshot, session, game, screen)?;
+                apply_online_snapshot(snapshot, session, game, screen, true)?;
                 screen.note(screen.theme.good("Connected to the game."));
             }
             ServerEvent::GameUpdated { game: snapshot } => {
-                apply_online_snapshot(snapshot, session, game, screen)?;
+                apply_online_snapshot(snapshot, session, game, screen, false)?;
             }
             ServerEvent::MoveRejected {
                 reason,
                 game: snapshot,
                 ..
             } => {
-                apply_online_snapshot(snapshot, session, game, screen)?;
+                apply_online_snapshot(snapshot, session, game, screen, true)?;
                 let reason = match reason {
                     MoveRejection::NotYourTurn => "It is not your turn.",
                     MoveRejection::IllegalMove => "That move is not legal.",
@@ -2530,19 +2568,41 @@ fn handle_transport_event(
                 screen.note(screen.theme.good("Your opponent reconnected."));
             }
             ServerEvent::Error { code, message } => {
-                if matches!(
+                let fatal = matches!(
                     code,
                     ErrorCode::UnsupportedProtocol
                         | ErrorCode::GameNotFound
+                        | ErrorCode::GameFull
                         | ErrorCode::InvalidReconnectToken
-                ) && session.reconnect_token.is_some()
-                {
+                );
+                if fatal {
+                    let recovery = match code {
+                        ErrorCode::UnsupportedProtocol => {
+                            "update Terminal Chess, then try the online command again"
+                        }
+                        ErrorCode::GameNotFound => {
+                            "quit, check the invite code, then run online join again"
+                        }
+                        ErrorCode::GameFull => {
+                            "quit and ask for a new invite; this game already has two players"
+                        }
+                        ErrorCode::InvalidReconnectToken => {
+                            "quit and create or join a new game; this saved seat is no longer valid"
+                        }
+                        _ => unreachable!("fatal error list is exhaustive"),
+                    };
                     if let Some(online) = &mut screen.online {
                         online.connection = ConnectionDisplay::Stopped;
                         online.move_pending = false;
+                        online.failure_help = Some(recovery.to_string());
                     }
+                    screen.show(vec![
+                        screen.theme.warn(&message),
+                        screen.theme.dim(recovery),
+                    ]);
+                } else {
+                    screen.note(screen.theme.warn(&message));
                 }
-                screen.note(screen.theme.warn(&message));
             }
         },
     }
@@ -2554,9 +2614,12 @@ fn apply_online_snapshot(
     session: &mut OnlineSession,
     game: &mut Game,
     screen: &mut Screen,
+    acknowledge_pending: bool,
 ) -> Result<(), String> {
     let previous_ply = game.sans.len();
+    let previous_revision = game.revision;
     let previous_finished = outcome(game).is_some();
+    let first_snapshot = !session.has_snapshot;
     let mut updated = Game::with_clock(
         Position::startpos(),
         (snapshot.time_control.initial_ms > 0)
@@ -2595,6 +2658,8 @@ fn apply_online_snapshot(
     updated.draw_offer = snapshot.draw_offer.map(side_color);
     apply_finished_status(&snapshot.status, &mut updated);
     updated.revision = snapshot.revision;
+    let revision_changed = updated.revision != previous_revision;
+    let finished_changed = outcome(&updated).is_some() != previous_finished;
 
     screen.player_names = [snapshot.white.name.clone(), snapshot.black.name.clone()];
     if let Some(online) = &mut screen.online {
@@ -2603,7 +2668,9 @@ fn apply_online_snapshot(
         online.white_connected = snapshot.white.connected;
         online.black_connected = snapshot.black.connected;
         online.reconnect_deadline_ms = None;
-        online.move_pending = false;
+        if acknowledge_pending || revision_changed || finished_changed {
+            online.move_pending = false;
+        }
     }
     let play_move_sound = session.has_snapshot && updated.sans.len() > previous_ply;
     let play_end_sound = session.has_snapshot
@@ -2612,7 +2679,12 @@ fn apply_online_snapshot(
         && !play_move_sound;
     *game = updated;
     session.has_snapshot = true;
-    screen.clear_marks();
+    // The server publishes clock snapshots every second. Preserve an in-flight
+    // click selection across those clock-only updates; clear it only when the
+    // position or game state actually changes.
+    if first_snapshot || revision_changed || finished_changed {
+        screen.clear_marks();
+    }
     if play_move_sound {
         screen.sound.play(sound_after_move(game));
     } else if play_end_sound {
@@ -2656,8 +2728,11 @@ fn handle_online_action(
             screen.focus_move_input();
         }
         UiAction::Draw => offer_or_accept_draw(session, game, screen),
+        UiAction::DeclineDraw => respond_to_draw(session, game, false, screen),
         UiAction::Resign => {
-            if screen.confirming == Some(UiAction::Resign) {
+            if !online_connected_for_actions(screen, game) {
+                explain_online_wait(game, screen);
+            } else if screen.confirming == Some(UiAction::Resign) {
                 send_resignation(session, game, screen);
             } else {
                 screen.confirming = Some(UiAction::Resign);
@@ -2677,6 +2752,10 @@ fn handle_online_action(
 }
 
 fn offer_or_accept_draw(session: &OnlineSession, game: &Game, screen: &mut Screen) {
+    if !online_draw_available(screen, game, session.side) {
+        explain_online_wait(game, screen);
+        return;
+    }
     let Some(game_id) = session.game_id.clone() else {
         explain_online_wait(game, screen);
         return;
@@ -2704,6 +2783,10 @@ fn offer_or_accept_draw(session: &OnlineSession, game: &Game, screen: &mut Scree
 }
 
 fn respond_to_draw(session: &OnlineSession, game: &Game, accept: bool, screen: &mut Screen) {
+    if !online_connected_for_actions(screen, game) {
+        explain_online_wait(game, screen);
+        return;
+    }
     let Some(side) = session.side else {
         explain_online_wait(game, screen);
         return;
@@ -2722,6 +2805,10 @@ fn send_resignation(session: &OnlineSession, game: &Game, screen: &mut Screen) {
         screen.note(screen.theme.dim("The game is already over."));
         return;
     }
+    if !online_connected_for_actions(screen, game) {
+        explain_online_wait(game, screen);
+        return;
+    }
     if let Some(game_id) = session.game_id.clone() {
         screen.confirming = None;
         session.send(ClientCommand::Resign { game_id }, screen);
@@ -2735,6 +2822,19 @@ fn online_can_move(screen: &Screen, game: &Game) -> bool {
         .online
         .as_ref()
         .is_some_and(|online| online.can_move(game))
+}
+
+fn online_connected_for_actions(screen: &Screen, game: &Game) -> bool {
+    outcome(game).is_none()
+        && screen.online.as_ref().is_some_and(|online| {
+            online.connection == ConnectionDisplay::Connected
+                && online.white_connected
+                && online.black_connected
+        })
+}
+
+fn online_draw_available(screen: &Screen, game: &Game, side: Option<Color>) -> bool {
+    online_connected_for_actions(screen, game) && game.draw_offer != side
 }
 
 fn explain_online_wait(game: &Game, screen: &mut Screen) {
@@ -2907,12 +3007,15 @@ fn online_board_click(
 fn online_preferences(
     previous: &storage::Preferences,
     screen: &Screen,
-    session: &OnlineSession,
     game: &Game,
 ) -> storage::Preferences {
     let mut preferences = runtime_preferences(screen, game);
-    preferences.white_name = session.player_name.clone();
+    preferences.white_name = previous.white_name.clone();
     preferences.black_name = previous.black_name.clone();
+    preferences.flipped = previous.flipped;
+    preferences.clock_enabled = previous.clock_enabled;
+    preferences.clock_minutes = previous.clock_minutes;
+    preferences.increment_seconds = previous.increment_seconds;
     preferences
 }
 
@@ -3570,6 +3673,7 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
                 )));
             }
         }
+        UiAction::DeclineDraw => {}
         UiAction::Resign => {
             if screen.confirming == Some(UiAction::Resign) {
                 game.resigned = Some(game.pos.side);
@@ -5330,5 +5434,82 @@ mod interaction_tests {
             Some(Piece::new(Color::White, PieceKind::Pawn))
         );
         assert_eq!(game.pos.at(e4), None);
+    }
+
+    #[test]
+    fn online_game_over_status_outranks_invite_and_disconnect_states() {
+        let mut game = Game::new(Position::startpos());
+        game.resigned = Some(Color::Black);
+        let mut screen = screen();
+        screen.online = Some(OnlineDisplay {
+            connection: ConnectionDisplay::Connected,
+            invite_code: Some("ABC123".to_string()),
+            your_side: Some(Color::White),
+            white_connected: true,
+            black_connected: false,
+            reconnect_deadline_ms: Some(unix_time_ms() + 30_000),
+            move_pending: false,
+            failure_help: None,
+        });
+
+        let status = screen.state_line(&game);
+        assert!(status.contains("resigns"));
+        assert!(status.contains("export PGN or quit"));
+        assert!(!status.contains("INVITE"));
+        assert!(!status.contains("OPPONENT OFFLINE"));
+    }
+
+    #[test]
+    fn online_draw_offer_has_accept_and_decline_controls() {
+        let mut game = Game::new(Position::startpos());
+        game.draw_offer = Some(Color::Black);
+        let mut screen = screen();
+        screen.online = Some(OnlineDisplay {
+            connection: ConnectionDisplay::Connected,
+            invite_code: None,
+            your_side: Some(Color::White),
+            white_connected: true,
+            black_connected: true,
+            reconnect_deadline_ms: None,
+            move_pending: false,
+            failure_help: None,
+        });
+
+        let buttons = screen.game_buttons(&game, Mode::TwoPlayer);
+        assert!(buttons
+            .iter()
+            .any(|button| button.label == "Accept" && button.enabled));
+        assert!(buttons
+            .iter()
+            .any(|button| button.label == "Decline" && button.enabled));
+    }
+
+    #[test]
+    fn online_session_does_not_overwrite_local_identity_clock_or_orientation() {
+        let previous = storage::Preferences {
+            white_name: "Local White".to_string(),
+            black_name: "Local Black".to_string(),
+            flipped: false,
+            clock_enabled: true,
+            clock_minutes: 15.0,
+            increment_seconds: 10.0,
+            ..storage::Preferences::default()
+        };
+        let mut screen = screen();
+        screen.player_names = ["Remote White".to_string(), "Remote Black".to_string()];
+        screen.flipped = true;
+        let game = Game::with_clock(
+            Position::startpos(),
+            Some(Duration::from_secs(60)),
+            Duration::ZERO,
+        );
+
+        let saved = online_preferences(&previous, &screen, &game);
+
+        assert_eq!(saved.white_name, "Local White");
+        assert_eq!(saved.black_name, "Local Black");
+        assert!(!saved.flipped);
+        assert_eq!(saved.clock_minutes, 15.0);
+        assert_eq!(saved.increment_seconds, 10.0);
     }
 }
