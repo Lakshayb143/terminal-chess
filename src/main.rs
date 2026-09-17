@@ -1047,7 +1047,8 @@ impl Screen {
                 ui::clip(&line, width)
             ));
         }
-        out.push_str(&format!("\x1b[{};1H\x1b[?25h\x1b[?2026l", self.rows));
+        out.push_str(&self.prompt_cursor_escape());
+        out.push_str("\x1b[?2026l");
         print!("{}", out);
         let _ = io::stdout().flush();
     }
@@ -1629,6 +1630,21 @@ impl Screen {
         print!("\r\x1b[K{}", line);
         let _ = io::stdout().flush();
         self.last_prompt = Some(line);
+    }
+
+    /// Return the cursor to the end of the command line after a partial
+    /// repaint. Clock updates touch rows above the prompt, so leaving their
+    /// final cursor position at column one makes the caret appear to jump
+    /// away from text that is still correctly cached on the bottom row.
+    fn prompt_cursor_escape(&self) -> String {
+        let column = self
+            .last_prompt
+            .as_deref()
+            .map(ui::width)
+            .unwrap_or(0)
+            .saturating_add(1)
+            .clamp(1, self.cols);
+        format!("\x1b[{};{}H\x1b[?25h", self.rows, column)
     }
 }
 
@@ -3420,5 +3436,15 @@ mod interaction_tests {
 
         assert_eq!(changed_frame_rows(&previous, &next, false), vec![2]);
         assert_eq!(changed_frame_rows(&previous, &next, true), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn clock_repaint_restores_the_prompt_cursor() {
+        let mut screen = screen();
+        screen.cols = 80;
+        screen.rows = 32;
+        screen.last_prompt = Some("    White › e4".to_string());
+
+        assert_eq!(screen.prompt_cursor_escape(), "\x1b[32;15H\x1b[?25h");
     }
 }
