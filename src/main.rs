@@ -497,6 +497,10 @@ struct Screen {
     indent: String,
     /// The playable 8x8 rectangle from the last frame, in terminal cells.
     board_hitbox: Option<BoardHitbox>,
+    /// Where the two player cards were drawn on the last frame. A ticking
+    /// clock repaints exactly these, and nothing at all when the window was
+    /// too small to draw them.
+    clock_rows: Vec<ClockRow>,
     body_top: usize,
     action_hitboxes: Vec<ActionHitbox>,
     /// The control currently selected for keyboard activation. Typing always
@@ -522,6 +526,10 @@ struct Screen {
     /// A page of text - the help, the move list, the score - shown in place of
     /// the board until the next thing is typed.
     page: Option<Page>,
+    /// The first line of the open page that is on screen, and how many of its
+    /// lines fit. A page longer than the window scrolls rather than being cut.
+    page_offset: usize,
+    page_capacity: usize,
     /// The terminal rows from the last completed paint. Keeping the styled
     /// strings lets a redraw touch only rows whose visible contents changed.
     last_frame: Vec<String>,
@@ -590,6 +598,7 @@ enum UiAction {
     Restart,
     ToggleSize,
     CyclePieces,
+    Flip,
     Rematch,
     Quit,
 }
@@ -617,9 +626,20 @@ struct RelativeAction {
     action: UiAction,
 }
 
+/// Where a player card sits, so that a ticking clock can be repainted
+/// without redrawing - or displacing - anything else on the frame.
+#[derive(Clone, Copy)]
+struct ClockRow {
+    left: usize,
+    row: usize,
+    width: usize,
+    color: Color,
+}
+
 struct RenderedBody {
     lines: Vec<String>,
     actions: Vec<RelativeAction>,
+    clocks: Vec<ClockRow>,
     history_capacity: usize,
 }
 
@@ -703,10 +723,14 @@ impl Screen {
         } else {
             ui::Metrics::COMPACT
         };
-        self.wide_panel = self
+        // A side panel is only worth the columns when it can carry the player
+        // cards and the controls together. Beside a short board there are too
+        // few rows for both unless the panel is also wide enough to lay the
+        // controls out in a row or two; below one there is the whole width.
+        let beside = self
             .cols
-            .saturating_sub(preferred.board_width() + self.gap_for(preferred) + 2)
-            >= 24;
+            .saturating_sub(preferred.board_width() + self.gap_for(preferred) + 2);
+        self.wide_panel = beside >= 24 && (preferred.board_height() >= 14 || beside >= 34);
         self.metrics = if live && !self.compact && !self.wide_panel {
             let pieces = if self.theme.ascii {
                 ui::Pieces::Glyph
@@ -786,6 +810,7 @@ impl Screen {
                 title: title.to_string(),
                 lines,
             });
+            self.page_offset = 0;
             self.redraw = true;
         } else {
             println!();
@@ -810,10 +835,82 @@ impl Screen {
         self.confirming = None;
     }
 
+    /// The reminder on the right of the top bar. Each state offers the same
+    /// advice at several lengths and the widest one the window can hold
+    /// beside the title wins, so the bar never runs its two halves together.
+    fn bar_hint(&self, game: &Game) -> &'static str {
+        let choices: &[&'static str] = if self.page.is_some() {
+            if self.page_capacity > 0
+                && self.page_capacity < self.page.as_ref().map_or(0, |page| page.lines.len())
+            {
+                &[
+                    "PgUp/PgDn scrolls  ·  return goes back",
+                    "PgUp/PgDn  ·  return",
+                    "return goes back",
+                ]
+            } else {
+                &["return goes back", "return"]
+            }
+        } else if outcome(game).is_some() {
+            &[
+                "Tab moves focus  ·  Enter selects  ·  type a command",
+                "Tab controls  ·  Enter selects",
+                "Tab controls",
+            ]
+        } else if game.paused {
+            &[
+                "game paused  ·  choose Resume or type a command",
+                "paused  ·  choose Resume",
+                "paused",
+            ]
+        } else if self.confirming.is_some() {
+            &[
+                "choose Confirm  ·  Escape cancels",
+                "Enter confirms  ·  esc cancels",
+                "Enter  ·  esc",
+            ]
+        } else if self.selected.is_some() {
+            &[
+                "choose a highlighted square  ·  Escape cancels",
+                "choose target  ·  esc cancels",
+                "choose target  ·  esc",
+            ]
+        } else {
+            &[
+                "type a move  ·  click a piece  ·  Tab controls  ·  ? for help",
+                "type a move  ·  Tab controls  ·  ? for help",
+                "type a move  ·  ? help",
+                "? help",
+            ]
+        };
+        // The bar writes " title ... hint " with at least two spaces between.
+        let room = self.cols.saturating_sub(ui::width("C H E S S") + 6);
+        choices
+            .iter()
+            .copied()
+            .find(|hint| ui::width(hint) <= room)
+            .unwrap_or_else(|| choices.last().copied().expect("every state offers a hint"))
+    }
+
     fn draw(&mut self, game: &Game, mode: Mode, limits: &Limits) {
         self.measure();
         self.board_hitbox = None;
         self.action_hitboxes.clear();
+        self.clock_rows.clear();
+        // Settle how much of an open page is in view before anything asks.
+        let page_lines = self.page.as_ref().map(|page| page.lines.len());
+        match page_lines {
+            Some(total) => {
+                self.page_capacity = self.page_window(total);
+                self.page_offset = self
+                    .page_offset
+                    .min(total.saturating_sub(self.page_capacity));
+            }
+            None => {
+                self.page_capacity = 0;
+                self.page_offset = 0;
+            }
+        }
         let wants_inline_board = self.inline_images
             && self.pieces == ui::Pieces::Auto
             && self.page.is_none()
@@ -822,6 +919,7 @@ impl Screen {
             Some(page) => RenderedBody {
                 lines: self.page_body(page),
                 actions: Vec::new(),
+                clocks: Vec::new(),
                 history_capacity: 0,
             },
             None => self.board_body(game, mode, limits),
@@ -829,6 +927,7 @@ impl Screen {
         let RenderedBody {
             lines: body,
             actions,
+            clocks,
             history_capacity,
         } = rendered;
         self.history_capacity = history_capacity;
@@ -842,33 +941,7 @@ impl Screen {
             return;
         }
 
-        let hint = if self.page.is_some() {
-            "return goes back"
-        } else if outcome(game).is_some() {
-            if self.cols < 55 {
-                "Tab controls  ·  Enter selects"
-            } else {
-                "Tab moves focus  ·  Enter selects  ·  type a command"
-            }
-        } else if game.paused {
-            "game paused  ·  choose Resume or type a command"
-        } else if self.confirming.is_some() {
-            if self.cols < 55 {
-                "Enter confirms  ·  esc cancels"
-            } else {
-                "choose Confirm  ·  Escape cancels"
-            }
-        } else if self.selected.is_some() {
-            if self.cols < 55 {
-                "choose target  ·  esc"
-            } else {
-                "choose a highlighted square  ·  Escape cancels"
-            }
-        } else if self.cols < 55 {
-            "type a move  ·  Tab controls"
-        } else {
-            "type a move  ·  click a piece  ·  Tab moves focus"
-        };
+        let hint = self.bar_hint(game);
         let mut frame = vec![self.theme.bar("C H E S S", hint, self.cols)];
         if !ui::tight(self.rows) {
             frame.push(String::new());
@@ -902,6 +975,13 @@ impl Screen {
                     top: body_start + target.row,
                     width: target.width,
                     action: target.action,
+                })
+                .collect();
+            self.clock_rows = clocks
+                .into_iter()
+                .map(|card| ClockRow {
+                    row: body_start + card.row,
+                    ..card
                 })
                 .collect();
         }
@@ -982,52 +1062,22 @@ impl Screen {
     }
 
     /// Update only the two player rows when a displayed second changes. This
-    /// avoids retransmitting an inline board image once a second.
+    /// avoids retransmitting an inline board image once a second, and it
+    /// repaints the rows the last frame really drew, so a window too small
+    /// for the player cards has nothing written over.
     fn draw_clock_tick(&self, game: &Game, mode: Mode, limits: &Limits) {
         if !self.theme.live || !self.theme.color || self.page.is_some() {
             return;
         }
-        let mut updates: Vec<(usize, usize, usize, Color)> = Vec::new();
-        if self.wide_panel {
-            let left = self.indent.len() + self.metrics.board_width() + self.gap();
-            let width = self.panel_width();
-            let top = if self.flipped {
-                Color::White
-            } else {
-                Color::Black
-            };
-            updates.push((left, self.body_top, width, top));
-            updates.push((
-                left,
-                self.body_top + self.metrics.board_height() - 1,
-                width,
-                top.flip(),
-            ));
-        } else {
-            let first =
-                self.body_top + self.metrics.board_height() + usize::from(!ui::tight(self.rows));
-            updates.push((
-                self.indent.len(),
-                first,
-                self.metrics.board_width(),
-                Color::White,
-            ));
-            updates.push((
-                self.indent.len(),
-                first + 1,
-                self.metrics.board_width(),
-                Color::Black,
-            ));
-        }
-
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
-        for (left, row, width, color) in updates {
-            let line = self.player_line(game, mode, limits, color, width, !self.wide_panel);
+        for card in &self.clock_rows {
+            let line =
+                self.player_line(game, mode, limits, card.color, card.width, !self.wide_panel);
             out.push_str(&format!(
                 "\x1b[{};{}H{}\x1b[K",
-                row + 1,
-                left + 1,
-                ui::clip(&line, width)
+                card.row + 1,
+                card.left + 1,
+                ui::clip(&line, card.width)
             ));
         }
         out.push_str(&self.prompt_cursor_escape());
@@ -1126,6 +1176,7 @@ impl Screen {
         let board = self.theme.board_lines(&view, m);
         let tight = ui::tight(self.rows);
         let mut actions = Vec::new();
+        let mut clocks = Vec::new();
         let history_capacity;
 
         let mut lines = if self.wide_panel {
@@ -1138,6 +1189,10 @@ impl Screen {
                 width: target.width,
                 action: target.action,
             }));
+            clocks.extend(panel.clocks.into_iter().map(|card| ClockRow {
+                left: panel_left + card.left,
+                ..card
+            }));
             history_capacity = panel.history_capacity;
             ui::beside(&board, &panel.lines, m.board_width(), self.gap())
                 .iter()
@@ -1148,8 +1203,28 @@ impl Screen {
                 .iter()
                 .map(|line| format!("{}{}", self.indent, line))
                 .collect();
-            let compact = self.compact_panel(game, mode, limits, m.board_width());
-            if !tight {
+            // Everything below the board has to be paid for out of rows the
+            // board has not taken, and the status line and its note are paid
+            // for first: a window too small for every control is still a
+            // window that has to be able to say "that is not a legal move".
+            let spent = 1 // the bar
+                + usize::from(!tight) // the blank under the bar
+                + m.board_height()
+                + usize::from(!tight) // the blank under the board
+                + 1 // the status line
+                + usize::from(!tight) // the blank above the note
+                + 1 // the note
+                + 1; // the command line
+            let budget = self.rows.saturating_sub(spent);
+            let compact = self.compact_panel(
+                game,
+                mode,
+                limits,
+                m.board_width(),
+                self.cols.saturating_sub(self.indent.len() + 1).max(20),
+                budget,
+            );
+            if !tight && !compact.lines.is_empty() {
                 stacked.push(String::new());
             }
             let compact_start = stacked.len();
@@ -1165,6 +1240,11 @@ impl Screen {
                 width: target.width,
                 action: target.action,
             }));
+            clocks.extend(compact.clocks.into_iter().map(|card| ClockRow {
+                left: self.indent.len() + card.left,
+                row: compact_start + card.row,
+                ..card
+            }));
             history_capacity = compact.history_capacity;
             stacked
         };
@@ -1178,12 +1258,13 @@ impl Screen {
         }
 
         let room = if self.wide_panel && !tight { 3 } else { 1 };
+        let note_width = self.cols.saturating_sub(self.indent.len());
         let mut notes: Vec<String> = self
             .analysis
             .iter()
             .chain(self.message.iter())
             .take(room)
-            .map(|line| format!("{}{}", self.indent, line))
+            .map(|line| format!("{}{}", self.indent, ui::clip_note(line, note_width)))
             .collect();
         if self.theme.live {
             while notes.len() < room {
@@ -1195,12 +1276,64 @@ impl Screen {
         RenderedBody {
             lines,
             actions,
+            clocks,
             history_capacity,
         }
     }
 
+    /// Rows an open page may spend on its own text, once the bar, the
+    /// heading and the command line have taken theirs.
+    fn page_rows(&self) -> usize {
+        let frame = 1 // the bar
+            + usize::from(!ui::tight(self.rows)) // the blank under it
+            + 1 // the row a page is offset from the top by
+            + 3 // title, rule, blank
+            + 1; // the command line
+        self.rows.saturating_sub(frame).max(1)
+    }
+
+    /// How many of a page's `total` lines are shown at once. A page that does
+    /// not fit keeps two rows back for the position indicator underneath it.
+    fn page_window(&self, total: usize) -> usize {
+        let room = self.page_rows();
+        if total <= room {
+            total
+        } else {
+            room.saturating_sub(2).max(1)
+        }
+    }
+
+    /// Move an over-long page by close to a windowful, the way a pager does.
+    /// Returns false when there is no page, so the caller can scroll the move
+    /// list instead.
+    fn scroll_page(&mut self, back: bool) -> bool {
+        let Some(page) = &self.page else {
+            return false;
+        };
+        let total = page.lines.len();
+        let capacity = self.page_capacity.max(self.page_window(total));
+        if total <= capacity {
+            return true;
+        }
+        let most = total - capacity;
+        let step = capacity.saturating_sub(1).max(1);
+        let next = if back {
+            self.page_offset.saturating_sub(step)
+        } else {
+            (self.page_offset + step).min(most)
+        };
+        if next != self.page_offset {
+            self.page_offset = next;
+            self.redraw = true;
+        }
+        true
+    }
+
     fn page_body(&self, page: &Page) -> Vec<String> {
         let theme = &self.theme;
+        let total = page.lines.len();
+        let capacity = self.page_window(total);
+        let offset = self.page_offset.min(total.saturating_sub(capacity));
         // An underline for the heading rather than a rule across the page,
         // which at this width would read as a wall.
         let longest = page
@@ -1215,9 +1348,33 @@ impl Screen {
             theme.rule(longest.min(self.cols.saturating_sub(8))),
             String::new(),
         ];
-        block.extend(page.lines.iter().cloned());
-        let widest = block.iter().map(|line| ui::width(line)).max().unwrap_or(0);
-        let left = " ".repeat(self.cols.saturating_sub(widest) / 2);
+        block.extend(page.lines[offset..offset + capacity].iter().cloned());
+        if total > capacity {
+            let scrolled = format!(
+                "{}-{} of {}   {}",
+                offset + 1,
+                offset + capacity,
+                total,
+                if offset + capacity < total {
+                    "↑↓ or PgUp/PgDn for more"
+                } else {
+                    "↑↓ or PgUp/PgDn to go back"
+                }
+            );
+            block.push(String::new());
+            block.push(theme.dim(&scrolled));
+        }
+        // Centre on the whole page rather than on the rows in view, so the
+        // text does not slide sideways as it is scrolled.
+        let widest = page
+            .lines
+            .iter()
+            .chain(std::iter::once(&page.title))
+            .map(|line| ui::width(line))
+            .max()
+            .unwrap_or(0)
+            .max(longest);
+        let left = " ".repeat(self.cols.saturating_sub(widest.min(self.cols)) / 2);
         block
             .iter()
             .map(|line| {
@@ -1244,6 +1401,7 @@ impl Screen {
             return RenderedBody {
                 lines: rows,
                 actions: Vec::new(),
+                clocks: Vec::new(),
                 history_capacity: 0,
             };
         }
@@ -1258,7 +1416,36 @@ impl Screen {
         rows[height - 2] = self.capture_line(game, bottom);
         rows[height - 1] = self.player_line(game, mode, limits, bottom, width, false);
 
-        if let Some(result) = outcome(game) {
+        let finished = outcome(game);
+        // The controls keep the same place on the panel whether the game is
+        // still running or already decided, so nothing jumps under the mouse
+        // at the moment a game ends.
+        let buttons = match finished {
+            Some(_) => self.render_buttons(&self.game_over_buttons(), width),
+            None => self.render_buttons(&self.game_buttons(game, mode), width),
+        };
+        let button_start = height.saturating_sub(buttons.lines.len() + 3);
+        // A panel this narrow can wrap the controls past its own bottom edge.
+        // Whatever is left out keeps its hitbox out of the frame with it.
+        let shown = buttons.lines.len().min(height - button_start);
+        let actions = buttons
+            .actions
+            .into_iter()
+            .filter(|target| target.row < shown)
+            .map(|target| RelativeAction {
+                row: button_start + target.row,
+                ..target
+            })
+            .collect();
+        for (offset, line) in buttons.lines.into_iter().take(shown).enumerate() {
+            rows[button_start + offset] = line;
+        }
+
+        // A finished game announces itself above the move list, which stays
+        // where it is: the first thing wanted after a result is the game it
+        // came from.
+        let mut first = 3;
+        if let Some(result) = finished {
             let title = match result {
                 Outcome::Checkmate(_) => "CHECKMATE",
                 Outcome::Resignation(_) => "RESIGNED",
@@ -1266,62 +1453,38 @@ impl Screen {
                 Outcome::Abandonment(_) => "ABANDONED",
                 _ => "DRAW",
             };
-            rows[3] = self.theme.strong(self.theme.palette.accent, "GAME OVER");
-            if height > 4 {
-                rows[4] = self.theme.bold(title);
-            }
             let detail = outcome_detail(&result);
             let score = score_tag(game);
-            if height > 5 {
-                rows[5] = self.theme.dim(&detail);
+            let mut result_rows = vec![
+                self.theme.strong(self.theme.palette.accent, "GAME OVER"),
+                self.theme.bold(title),
+            ];
+            if ui::width(&detail) + ui::width(score) + 2 <= width {
+                result_rows.push(format!(
+                    "{}  {}",
+                    self.theme.dim(&detail),
+                    self.theme.accent(score)
+                ));
+            } else {
+                result_rows.push(self.theme.dim(&detail));
+                result_rows.push(self.theme.accent(score));
             }
-            let detail_width = ui::width(&detail);
-            let mut result_rows = 1;
-            if detail_width + ui::width(score) + 2 <= width {
-                rows[5] = format!("{}  {}", rows[5], self.theme.accent(score));
-            } else if height > 6 {
-                rows[6] = self.theme.accent(score);
-                result_rows = 2;
-            }
-            let buttons = self.render_buttons(&self.game_over_buttons(), width);
-            let desired_start = 5 + result_rows + 1;
-            let start = desired_start.min(height.saturating_sub(buttons.lines.len() + 2));
-            let actions = buttons
-                .actions
-                .into_iter()
-                .map(|target| RelativeAction {
-                    row: start + target.row,
-                    ..target
-                })
-                .collect();
-            for (offset, line) in buttons.lines.into_iter().enumerate() {
-                if start + offset < height.saturating_sub(2) {
-                    rows[start + offset] = line;
+            for (offset, line) in result_rows.into_iter().enumerate() {
+                if 3 + offset < button_start {
+                    rows[3 + offset] = line;
+                    first = 3 + offset + 1;
                 }
             }
-            return RenderedBody {
-                lines: rows.iter().map(|row| ui::clip(row, width)).collect(),
-                actions,
-                history_capacity: 0,
-            };
+            first += 1;
         }
 
-        let buttons = self.render_buttons(&self.game_buttons(game, mode), width);
-        let button_start = height.saturating_sub(buttons.lines.len() + 3);
-        let actions = buttons
-            .actions
-            .into_iter()
-            .map(|target| RelativeAction {
-                row: button_start + target.row,
-                ..target
-            })
-            .collect();
-        for (offset, line) in buttons.lines.into_iter().enumerate() {
-            rows[button_start + offset] = line;
+        let mut history_capacity = button_start.saturating_sub(first + 1);
+        // Beside a short board the blank row above the move list is worth
+        // more as a move.
+        if history_capacity == 0 && first > 2 {
+            first = 2;
+            history_capacity = button_start.saturating_sub(first + 1);
         }
-
-        let first = 3;
-        let history_capacity = button_start.saturating_sub(first + 1);
         if history_capacity > 0 {
             let played = history_lines(game);
             rows[first] = self.history_heading(played.len(), history_capacity);
@@ -1338,60 +1501,95 @@ impl Screen {
         RenderedBody {
             lines: rows.iter().map(|row| ui::clip(row, width)).collect(),
             actions,
+            clocks: vec![
+                ClockRow {
+                    left: 0,
+                    row: 0,
+                    width,
+                    color: top,
+                },
+                ClockRow {
+                    left: 0,
+                    row: height - 1,
+                    width,
+                    color: bottom,
+                },
+            ],
             history_capacity,
         }
     }
 
+    /// The information strip under the board in a narrow window, fitted to
+    /// the rows left over once the board, the status line and its note have
+    /// been paid for. Player cards come first, then the controls, and the
+    /// move summary only when everything else already fits.
     fn compact_panel(
         &self,
         game: &Game,
         mode: Mode,
         limits: &Limits,
         width: usize,
+        outer_width: usize,
+        budget: usize,
     ) -> RenderedBody {
+        if budget < 2 {
+            return RenderedBody {
+                lines: Vec::new(),
+                actions: Vec::new(),
+                clocks: Vec::new(),
+                history_capacity: 0,
+            };
+        }
         let mut lines = vec![
             self.player_line(game, mode, limits, Color::White, width, true),
             self.player_line(game, mode, limits, Color::Black, width, true),
         ];
-        let history_capacity;
 
-        if let Some(result) = outcome(game) {
-            lines.push(self.theme.strong(
-                self.theme.palette.accent,
-                &format!("GAME OVER  {}", describe(&result)),
-            ));
-            history_capacity = 0;
+        // Controls may run wider than the board: below it there is nothing
+        // to line up with, and a row saved here is a row of chess.
+        let buttons = if outcome(game).is_some() {
+            self.render_buttons(&self.game_over_buttons(), outer_width.max(width))
         } else {
-            let played = history_lines(game);
-            let (start, end) = self.history_bounds(played.len(), 1);
-            let history = played
-                .get(start..end)
-                .and_then(|slice| slice.first())
-                .map(String::as_str)
-                .unwrap_or("No moves yet");
-            let heading = if played.len() > 1 {
-                "MOVES ↑↓"
+            self.render_buttons(&self.game_buttons(game, mode), outer_width.max(width))
+        };
+        let mut history_capacity = 0;
+        if budget > lines.len() + buttons.lines.len() {
+            if let Some(result) = outcome(game) {
+                lines.push(self.theme.strong(
+                    self.theme.palette.accent,
+                    &format!("GAME OVER  {}", describe(&result)),
+                ));
             } else {
-                "MOVES"
-            };
-            lines.push(format!(
-                "{}  {}",
-                self.theme.label(heading),
-                self.theme.dim(history)
-            ));
-            history_capacity = 1;
+                let played = history_lines(game);
+                let (start, end) = self.history_bounds(played.len(), 1);
+                let history = played
+                    .get(start..end)
+                    .and_then(|slice| slice.first())
+                    .map(String::as_str)
+                    .unwrap_or("No moves yet");
+                let heading = if played.len() > 1 {
+                    "MOVES ↑↓"
+                } else {
+                    "MOVES"
+                };
+                lines.push(format!(
+                    "{}  {}",
+                    self.theme.label(heading),
+                    self.theme.dim(history)
+                ));
+                history_capacity = 1;
+            }
         }
 
-        let buttons = if outcome(game).is_some() {
-            self.render_buttons(&self.game_over_buttons(), width)
-        } else {
-            self.render_buttons(&self.game_buttons(game, mode), width)
-        };
+        // Controls that do not fit are dropped along with their hitboxes, so
+        // nothing invisible can be clicked or reached with Tab.
         let button_start = lines.len();
-        lines.extend(buttons.lines);
+        let shown = budget.saturating_sub(button_start).min(buttons.lines.len());
+        lines.extend(buttons.lines.into_iter().take(shown));
         let actions = buttons
             .actions
             .into_iter()
+            .filter(|target| target.row < shown)
             .map(|target| RelativeAction {
                 row: button_start + target.row,
                 ..target
@@ -1401,9 +1599,23 @@ impl Screen {
         RenderedBody {
             lines: lines
                 .into_iter()
-                .map(|line| ui::clip(&line, width))
+                .map(|line| ui::clip(&line, outer_width.max(width)))
                 .collect(),
             actions,
+            clocks: vec![
+                ClockRow {
+                    left: 0,
+                    row: 0,
+                    width,
+                    color: Color::White,
+                },
+                ClockRow {
+                    left: 0,
+                    row: 1,
+                    width,
+                    color: Color::Black,
+                },
+            ],
             history_capacity,
         }
     }
@@ -1489,10 +1701,13 @@ impl Screen {
         format!("{}{}{}", left, " ".repeat(gap), clock)
     }
 
+    /// The pieces this side has taken, under its name. An empty row until
+    /// there is something to put in it: a standing "no captures" label is a
+    /// line of furniture that says nothing about the game.
     fn capture_line(&self, game: &Game, color: Color) -> String {
         let summary = self.capture_summary(game, color);
         if summary.is_empty() {
-            return self.theme.dim("  no captures");
+            return String::new();
         }
         format!("  {}", summary)
     }
@@ -1587,6 +1802,7 @@ impl Screen {
                         && online.white_connected
                         && online.black_connected,
                 },
+                self.flip_button(),
                 self.size_button(),
                 self.pieces_button(),
             ]);
@@ -1631,6 +1847,7 @@ impl Screen {
                 },
                 enabled: true,
             },
+            self.flip_button(),
             self.size_button(),
             self.pieces_button(),
         ]
@@ -1644,6 +1861,7 @@ impl Screen {
                     label: "Quit",
                     enabled: true,
                 },
+                self.flip_button(),
                 self.size_button(),
                 self.pieces_button(),
             ];
@@ -1664,9 +1882,21 @@ impl Screen {
                 label: "Quit",
                 enabled: true,
             },
+            self.flip_button(),
             self.size_button(),
             self.pieces_button(),
         ]
+    }
+
+    /// Turning the board round is the one view control a game at a shared
+    /// keyboard reaches for every move, so it sits with the others rather
+    /// than only behind a typed command.
+    fn flip_button(&self) -> ButtonSpec {
+        ButtonSpec {
+            action: UiAction::Flip,
+            label: "Flip",
+            enabled: true,
+        }
     }
 
     fn size_button(&self) -> ButtonSpec {
@@ -1740,6 +1970,7 @@ impl Screen {
         RenderedBody {
             lines,
             actions,
+            clocks: Vec::new(),
             history_capacity: 0,
         }
     }
@@ -2131,6 +2362,7 @@ fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Resu
         compact: options.compact,
         indent: "  ".to_string(),
         board_hitbox: None,
+        clock_rows: Vec::new(),
         body_top: 0,
         action_hitboxes: Vec::new(),
         focused: UiAction::MoveInput,
@@ -2146,6 +2378,8 @@ fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Resu
         invalid: None,
         promotions: Vec::new(),
         page: None,
+        page_offset: 0,
+        page_capacity: 0,
         last_frame: Vec::new(),
         last_size: None,
         inline_drawn: false,
@@ -2249,7 +2483,13 @@ fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Resu
                 continue;
             }
             InputAction::Focus { reverse } => {
-                screen.move_focus(reverse);
+                // Nothing on an open page can take focus, so the arrows and
+                // Tab move the page itself.
+                if screen.page.is_some() {
+                    screen.scroll_page(reverse);
+                } else {
+                    screen.move_focus(reverse);
+                }
                 continue;
             }
             InputAction::Resize => {
@@ -2258,7 +2498,11 @@ fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Resu
             }
             InputAction::Tick => continue,
             InputAction::History { older } => {
-                screen.scroll_history(&game, older);
+                // An open page is what the wheel and the paging keys are
+                // pointed at; the move list is underneath it.
+                if !screen.scroll_page(older) {
+                    screen.scroll_history(&game, older);
+                }
                 continue;
             }
             InputAction::Cancel => {
@@ -2745,6 +2989,7 @@ fn handle_online_action(
         }
         UiAction::ToggleSize => toggle_size(screen),
         UiAction::CyclePieces => cycle_pieces(screen),
+        UiAction::Flip => flip_board(screen),
         UiAction::Quit => return true,
         UiAction::Pause | UiAction::Undo | UiAction::Restart | UiAction::Rematch => {}
     }
@@ -3101,6 +3346,7 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
         compact: options.compact,
         indent: "  ".to_string(),
         board_hitbox: None,
+        clock_rows: Vec::new(),
         body_top: 0,
         action_hitboxes: Vec::new(),
         focused: UiAction::MoveInput,
@@ -3115,6 +3361,8 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
         invalid: None,
         promotions: Vec::new(),
         page: None,
+        page_offset: 0,
+        page_capacity: 0,
         last_frame: Vec::new(),
         last_size: None,
         inline_drawn: false,
@@ -3281,7 +3529,13 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
                 continue;
             }
             InputAction::Focus { reverse } => {
-                screen.move_focus(reverse);
+                // Nothing on an open page can take focus, so the arrows and
+                // Tab move the page itself.
+                if screen.page.is_some() {
+                    screen.scroll_page(reverse);
+                } else {
+                    screen.move_focus(reverse);
+                }
                 continue;
             }
             InputAction::Resize => {
@@ -3290,7 +3544,11 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
             }
             InputAction::Tick => continue,
             InputAction::History { older } => {
-                screen.scroll_history(&game, older);
+                // An open page is what the wheel and the paging keys are
+                // pointed at; the move list is underneath it.
+                if !screen.scroll_page(older) {
+                    screen.scroll_history(&game, older);
+                }
                 continue;
             }
             InputAction::Cancel => {
@@ -3707,6 +3965,7 @@ fn handle_ui_action(action: UiAction, game: &mut Game, mode: Mode, screen: &mut 
         }
         UiAction::ToggleSize => toggle_size(screen),
         UiAction::CyclePieces => cycle_pieces(screen),
+        UiAction::Flip => flip_board(screen),
         UiAction::Rematch => {
             game.restart();
             screen.clear_marks();
@@ -4337,6 +4596,11 @@ fn set_size(screen: &mut Screen, rest: &str) {
     screen.redraw = true;
 }
 
+fn flip_board(screen: &mut Screen) {
+    screen.flipped = !screen.flipped;
+    screen.redraw = true;
+}
+
 fn toggle_size(screen: &mut Screen) {
     screen.compact = !screen.compact;
     let size = if screen.compact { "small" } else { "big" };
@@ -4526,7 +4790,7 @@ fn help_lines(theme: &Theme) -> Vec<String> {
         ),
         format!(
             "  {}",
-            theme.dim("Page Up / Page Down also scroll the move list.")
+            theme.dim("Page Up / Page Down scroll this page and the move list.")
         ),
         String::new(),
         theme.bold("KEYBOARD"),
@@ -4973,6 +5237,7 @@ mod interaction_tests {
             compact: false,
             indent: String::new(),
             board_hitbox: None,
+            clock_rows: Vec::new(),
             body_top: 0,
             action_hitboxes: Vec::new(),
             focused: UiAction::MoveInput,
@@ -4987,6 +5252,8 @@ mod interaction_tests {
             invalid: None,
             promotions: Vec::new(),
             page: None,
+            page_offset: 0,
+            page_capacity: 0,
             last_frame: Vec::new(),
             last_size: None,
             inline_drawn: false,
@@ -5275,7 +5542,7 @@ mod interaction_tests {
         let buttons = screen.render_buttons(&screen.game_buttons(&game, Mode::TwoPlayer), 24);
 
         assert!(buttons.lines.len() >= 2);
-        assert_eq!(buttons.actions.len(), 7); // Undo starts disabled.
+        assert_eq!(buttons.actions.len(), 8); // Undo starts disabled.
         assert!(buttons
             .actions
             .iter()
@@ -5335,9 +5602,11 @@ mod interaction_tests {
 
         toggle_size(&mut screen);
         cycle_pieces(&mut screen);
+        flip_board(&mut screen);
 
         assert!(screen.compact);
         assert_eq!(screen.pieces, ui::Pieces::Art);
+        assert!(screen.flipped);
         assert!(screen.redraw);
     }
 
@@ -5355,6 +5624,116 @@ mod interaction_tests {
         assert_eq!(screen.history_offset, 1);
         screen.scroll_history(&game, false);
         assert_eq!(screen.history_offset, 0);
+    }
+
+    #[test]
+    fn a_long_page_scrolls_instead_of_being_cut() {
+        let mut screen = screen();
+        screen.theme = Theme::new(true, false, true, ui::THEMES[0].1);
+        screen.rows = 24;
+        let total = 60;
+        screen.open(
+            "HELP",
+            (1..=total).map(|line| format!("line {line}")).collect(),
+        );
+        let capacity = screen.page_window(total);
+        screen.page_capacity = capacity;
+        assert!(capacity > 0 && capacity < total);
+
+        let shown =
+            |screen: &Screen| screen.page_body(screen.page.as_ref().expect("the page is open"));
+        let top = shown(&screen);
+        assert!(top.iter().any(|line| line.contains("line 1")));
+        assert!(top.iter().any(|line| line.contains("of 60")));
+        assert!(!top.iter().any(|line| line.contains("line 60")));
+
+        assert!(screen.scroll_page(false));
+        assert!(screen.page_offset > 0);
+
+        // Past the end is the end, and the last line is reachable from there.
+        screen.page_offset = total;
+        let bottom = shown(&screen);
+        assert!(bottom.iter().any(|line| line.contains("line 60")));
+
+        while screen.page_offset > 0 {
+            screen.scroll_page(true);
+        }
+        assert!(shown(&screen).iter().any(|line| line.contains("line 1")));
+    }
+
+    #[test]
+    fn a_page_that_fits_says_nothing_about_scrolling() {
+        let mut screen = screen();
+        screen.theme = Theme::new(true, false, true, ui::THEMES[0].1);
+        screen.rows = 40;
+        screen.open("FEN", vec!["one".to_string(), "two".to_string()]);
+        screen.page_capacity = screen.page_window(2);
+
+        let body = screen.page_body(screen.page.as_ref().expect("the page is open"));
+        assert!(!body.iter().any(|line| line.contains("of 2")));
+    }
+
+    #[test]
+    fn a_finished_game_keeps_its_move_list_beside_the_board() {
+        let mut game = Game::new(Position::startpos());
+        for notation in ["e4", "e5", "Bc4", "Nc6", "Qh5", "Nf6", "Qxf7"] {
+            let movement = parse_move(&game.pos, notation).ok().unwrap();
+            game.play(movement);
+        }
+        assert!(outcome(&game).is_some());
+
+        let screen = screen();
+        let panel = screen.panel(&game, Mode::TwoPlayer, &Limits::default(), 18, 30);
+        let text = panel.lines.join("\n");
+        assert!(text.contains("GAME OVER"));
+        assert!(text.contains("CHECKMATE"));
+        assert!(panel.history_capacity > 0);
+        assert!(text.contains("Qxf7#"));
+        // The controls stay where they were while the game was running.
+        assert!(panel
+            .actions
+            .iter()
+            .all(|target| target.row + 1 < panel.lines.len()));
+    }
+
+    #[test]
+    fn a_short_window_keeps_the_status_line_before_the_controls() {
+        let game = Game::new(Position::startpos());
+        let mut screen = screen();
+        screen.cols = 46;
+        screen.rows = 16;
+        screen.wide_panel = false;
+        screen.message = vec!["not a legal move".to_string()];
+        let body = screen.board_body(&game, Mode::TwoPlayer, &Limits::default());
+
+        // The bar above and the command line below both have to fit as well.
+        assert!(body.lines.len() + 2 <= screen.rows);
+        let text = body.lines.join("\n");
+        assert!(text.contains("to move"));
+        assert!(text.contains("not a legal move"));
+        // Nothing may be clickable on a row that was never drawn.
+        assert!(body
+            .actions
+            .iter()
+            .all(|target| target.row < body.lines.len()));
+    }
+
+    #[test]
+    fn the_top_bar_never_runs_its_two_halves_together() {
+        let game = Game::new(Position::startpos());
+        let mut screen = screen();
+        for cols in 30..=120 {
+            screen.cols = cols;
+            let hint = screen.bar_hint(&game);
+            let bar = screen.theme.bar("C H E S S", hint, cols);
+            assert!(ui::width(&bar) <= cols, "the bar overflows at {cols}");
+            if cols >= ui::width("C H E S S") + 6 + ui::width(hint) {
+                assert!(
+                    bar.contains("C H E S S  ") || ui::width(hint) == 0,
+                    "no gap after the title at {cols}"
+                );
+            }
+        }
     }
 
     #[test]

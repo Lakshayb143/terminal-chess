@@ -69,9 +69,12 @@ Click a piece to select it. Legal destinations appear on the board; click one
 to complete the move. Click another friendly piece to change the selection, or
 press `Esc` to cancel. Promotions open a four-piece chooser on the board.
 
-The mouse-accessible actions let you undo, offer or accept a draw, resign, and
-restart. Potentially destructive actions require confirmation. The move list
-can be scrolled with the mouse wheel or `Page Up` and `Page Down`.
+The mouse-accessible actions let you undo, offer or accept a draw, resign,
+restart, turn the board around, and change the board size or piece style. Potentially destructive actions require confirmation. The move list
+can be scrolled with the mouse wheel or `Page Up` and `Page Down`, and so can
+any page of text that is longer than the window - `help`, `history`, `pgn` and
+the rest show where you are in them and scroll with the wheel, the arrow keys
+or `Page Up` and `Page Down`.
 
 Keyboard input remains fully supported. Type anywhere to return focus to the
 move box. Use `Tab` or the arrow keys to move through every visible control,

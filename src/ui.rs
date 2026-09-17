@@ -1149,6 +1149,15 @@ pub fn pad(text: &str, columns: usize) -> String {
     }
 }
 
+/// Cut `text` down to `columns`, marking the cut with an ellipsis so that a
+/// note trimmed by a narrow window does not read as a finished sentence.
+pub fn clip_note(text: &str, columns: usize) -> String {
+    if width(text) <= columns || columns == 0 {
+        return text.to_string();
+    }
+    format!("{}\u{2026}", clip(text, columns - 1))
+}
+
 /// Cut `text` down to `columns`, escape codes not counting towards the total.
 pub fn clip(text: &str, columns: usize) -> String {
     if width(text) <= columns {
