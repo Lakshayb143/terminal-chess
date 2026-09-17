@@ -633,6 +633,16 @@ struct Screen {
     /// A page of text - the help, the move list, the score - shown in place of
     /// the board until the next thing is typed.
     page: Option<Page>,
+    /// The terminal rows from the last completed paint. Keeping the styled
+    /// strings lets a redraw touch only rows whose visible contents changed.
+    last_frame: Vec<String>,
+    last_size: Option<(usize, usize)>,
+    /// The board image currently covering the Unicode fallback, if any.
+    inline_drawn: bool,
+    last_inline_board: Option<InlineBoardKey>,
+    /// The independently edited command row, cached so idle clock polls do
+    /// not keep sending the same cursor movement and text.
+    last_prompt: Option<String>,
     redraw: bool,
 }
 
@@ -679,6 +689,21 @@ struct RenderedBody {
     lines: Vec<String>,
     actions: Vec<RelativeAction>,
     history_capacity: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct InlineBoardKey {
+    position: u64,
+    flipped: bool,
+    last: Option<Move>,
+    check: Option<board::Square>,
+    selected: Option<board::Square>,
+    targets: Vec<board::Square>,
+    promotions: Vec<(board::Square, Piece)>,
+    palette: ui::Palette,
+    metrics: ui::Metrics,
+    left: usize,
+    top: usize,
 }
 
 struct ButtonSpec {
@@ -834,15 +859,10 @@ impl Screen {
         self.measure();
         self.board_hitbox = None;
         self.action_hitboxes.clear();
-        let inline_board = if self.inline_images
+        let wants_inline_board = self.inline_images
             && self.pieces == ui::Pieces::Auto
             && self.page.is_none()
-            && self.metrics.art
-        {
-            Some(self.theme.board_image(&self.board_view(game)))
-        } else {
-            None
-        };
+            && self.metrics.art;
         let rendered = match &self.page {
             Some(page) => RenderedBody {
                 lines: self.page_body(page),
@@ -919,21 +939,53 @@ impl Screen {
         }
         frame.truncate(self.rows.saturating_sub(1));
 
-        // Home the cursor and write over what is there rather than blanking
-        // the screen first, which is what keeps a redraw from flickering, and
-        // send the whole frame in one write for the same reason.
-        let mut out = if self.inline_images {
-            // Kitty placements are stateful; clearing both placements and the
-            // cell grid also gives iTerm-family implementations a clean frame.
-            String::from("\x1b[?25l\x1b_Ga=d\x1b\\\x1b[2J\x1b[H")
-        } else {
-            String::from("\x1b[?25l\x1b[H")
-        };
-        for line in &frame {
-            out.push_str(&ui::clip(line, self.cols));
-            out.push_str("\x1b[K\r\n");
+        let inline_key = wants_inline_board.then(|| InlineBoardKey {
+            position: game.pos.hash,
+            flipped: self.flipped,
+            last: game.last_move(),
+            check: in_check(&game.pos, game.pos.side)
+                .then_some(game.pos.king[game.pos.side.index()]),
+            selected: self.selected,
+            targets: self.targets.clone(),
+            promotions: self
+                .promotions
+                .iter()
+                .map(|choice| (choice.square, choice.piece))
+                .collect(),
+            palette: self.theme.palette,
+            metrics: self.metrics,
+            left: self.indent.len() + ui::GUTTER,
+            top: body_start + 1,
+        });
+        let image_changed = inline_key != self.last_inline_board;
+        let inline_board = (wants_inline_board && image_changed)
+            .then(|| self.theme.board_image(&self.board_view(game)));
+        let next_frame: Vec<String> = frame.iter().map(|line| ui::clip(line, self.cols)).collect();
+        let size_changed = self.last_size != Some((self.cols, self.rows));
+        let inline_transition = self.inline_drawn != wants_inline_board;
+        let full_redraw = self.last_frame.is_empty() || size_changed || inline_transition;
+
+        // Synchronized output lets supporting terminals present text and the
+        // replacement board image as one completed frame. Terminals that do
+        // not implement mode 2026 safely ignore it. Ordinary frames are row
+        // diffs; a full clear is reserved for geometry and image-mode changes.
+        let mut out = String::from("\x1b[?2026h\x1b[?25l");
+        if self.inline_drawn
+            && !ui::inline_images_replace_in_place()
+            && (full_redraw || image_changed)
+        {
+            out.push_str("\x1b_Ga=d,d=A\x1b\\");
         }
-        out.push_str("\x1b[J\x1b[?25h");
+        if full_redraw {
+            out.push_str("\x1b[2J");
+        }
+        for row in changed_frame_rows(&self.last_frame, &next_frame, full_redraw) {
+            out.push_str(&format!("\x1b[{};1H{}\x1b[K", row + 1, next_frame[row]));
+        }
+        // The command line is edited outside the frame cache and therefore
+        // must be reset on every structural redraw.
+        out.push_str(&format!("\x1b[{};1H\x1b[K", self.rows));
+        self.last_prompt = None;
         print!("{}", out);
         let _ = io::stdout().flush();
 
@@ -945,6 +997,13 @@ impl Screen {
                 body_start + 1,
             );
         }
+        print!("\x1b[{};1H\x1b[?25h\x1b[?2026l", self.rows);
+        let _ = io::stdout().flush();
+
+        self.last_frame = next_frame;
+        self.last_size = Some((self.cols, self.rows));
+        self.inline_drawn = wants_inline_board;
+        self.last_inline_board = inline_key;
     }
 
     /// Update only the two player rows when a displayed second changes. This
@@ -978,7 +1037,7 @@ impl Screen {
             ));
         }
 
-        let mut out = String::from("\x1b[?25l");
+        let mut out = String::from("\x1b[?2026h\x1b[?25l");
         for (left, row, width, color) in updates {
             let line = self.player_line(game, mode, limits, color, width, !self.wide_panel);
             out.push_str(&format!(
@@ -988,7 +1047,7 @@ impl Screen {
                 ui::clip(&line, width)
             ));
         }
-        out.push_str(&format!("\x1b[{};1H\x1b[?25h", self.rows));
+        out.push_str(&format!("\x1b[{};1H\x1b[?25h\x1b[?2026l", self.rows));
         print!("{}", out);
         let _ = io::stdout().flush();
     }
@@ -1562,10 +1621,22 @@ impl Screen {
     }
 
     /// Repaint the bottom-row command line without redrawing the board.
-    fn draw_prompt(&self, game: &Game, input: &str) {
-        print!("\r\x1b[K{}{}", self.prompt(game), input);
+    fn draw_prompt(&mut self, game: &Game, input: &str) {
+        let line = format!("{}{}", self.prompt(game), input);
+        if self.last_prompt.as_ref() == Some(&line) {
+            return;
+        }
+        print!("\r\x1b[K{}", line);
         let _ = io::stdout().flush();
+        self.last_prompt = Some(line);
     }
+}
+
+fn changed_frame_rows(previous: &[String], next: &[String], force_all: bool) -> Vec<usize> {
+    next.iter()
+        .enumerate()
+        .filter_map(|(row, line)| (force_all || previous.get(row) != Some(line)).then_some(row))
+        .collect()
 }
 
 /// `1. e4 e5` lines, one per move pair, from whatever side started.
@@ -1722,6 +1793,11 @@ fn play(options: Options) -> Result<(), String> {
         targets: Vec::new(),
         promotions: Vec::new(),
         page: None,
+        last_frame: Vec::new(),
+        last_size: None,
+        inline_drawn: false,
+        last_inline_board: None,
+        last_prompt: None,
         redraw: true,
     };
     // Held for as long as the game lasts. Whatever was on the terminal before
@@ -3093,6 +3169,11 @@ mod interaction_tests {
             targets: Vec::new(),
             promotions: Vec::new(),
             page: None,
+            last_frame: Vec::new(),
+            last_size: None,
+            inline_drawn: false,
+            last_inline_board: None,
+            last_prompt: None,
             redraw: false,
         }
     }
@@ -3322,5 +3403,22 @@ mod interaction_tests {
         assert_eq!(screen.history_offset, 1);
         screen.scroll_history(&game, false);
         assert_eq!(screen.history_offset, 0);
+    }
+
+    #[test]
+    fn frame_diff_only_repaints_changed_rows() {
+        let previous = vec![
+            "title".to_string(),
+            "board".to_string(),
+            "status".to_string(),
+        ];
+        let next = vec![
+            "title".to_string(),
+            "board".to_string(),
+            "new status".to_string(),
+        ];
+
+        assert_eq!(changed_frame_rows(&previous, &next, false), vec![2]);
+        assert_eq!(changed_frame_rows(&previous, &next, true), vec![0, 1, 2]);
     }
 }

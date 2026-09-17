@@ -19,7 +19,7 @@ use crate::board::{self, Color, Move, Piece, Position, Square};
 
 /// Colours are 256-colour indices, which every terminal worth colouring for
 /// has had for twenty years.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     light: u8,
     dark: u8,
@@ -129,6 +129,13 @@ pub fn detect_inline_images() -> bool {
         return true;
     }
     viuer::get_kitty_support() != viuer::KittySupport::None
+}
+
+/// iTerm's inline images replace the cells they cover. Kitty placements are
+/// separate objects and must be removed before a new anonymous placement is
+/// drawn in the same rectangle.
+pub fn inline_images_replace_in_place() -> bool {
+    viuer::is_iterm_supported()
 }
 
 /// Paint an already composed board into its reserved terminal rectangle. If a

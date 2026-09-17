@@ -4,15 +4,15 @@ Terminal Chess is being built in small, shippable stages. The immediate goal is
 to make local play feel as stable and natural as a graphical chess client before
 expanding into networked multiplayer.
 
-## 1. Zero-flicker rendering — in progress
+## 1. Zero-flicker rendering — complete
 
 Keep the board and surrounding interface visually stationary during play.
 
-- [ ] Stop clearing the whole terminal when the position changes.
-- [ ] Update only screen regions that actually changed.
-- [ ] Avoid blank frames while replacing an inline board image.
-- [ ] Preserve the existing low-cost clock refresh path.
-- [ ] Verify resizing and every piece-rendering mode.
+- [x] Stop clearing the whole terminal when the position changes.
+- [x] Update only screen regions that actually changed.
+- [x] Avoid blank frames while replacing an inline board image.
+- [x] Preserve the existing low-cost clock refresh path.
+- [x] Verify resizing and every piece-rendering mode.
 
 ## 2. Piece interaction polish — next
 

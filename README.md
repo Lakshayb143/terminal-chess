@@ -119,6 +119,8 @@ The project is intentionally built as a terminal application rather than a web
 view wrapped in a desktop shell. A few implementation details:
 
 - The UI negotiates terminal capabilities and keeps a portable ANSI fallback.
+- A cached row-diff renderer and synchronized terminal updates prevent partial
+  frames without repainting the whole screen after every move.
 - SVG piece assets are rasterized in-process and embedded in the release binary.
 - The chess engine uses iterative deepening, alpha-beta search, and a tapered
   positional evaluation.
