@@ -173,6 +173,25 @@ view wrapped in a desktop shell. A few implementation details:
 
 The current product priorities are tracked in [ROADMAP.md](ROADMAP.md).
 
+## Multiplayer development preview
+
+Online play is under active development. The repository now includes an
+authoritative WebSocket server with private guest rooms, invite codes, legal
+move validation, server-owned clocks, and reconnect tokens. The terminal UI is
+not connected to it yet, so this is currently a development interface rather
+than a player-facing feature.
+
+Run the server locally with:
+
+```sh
+cargo run --bin chess-server
+```
+
+It listens on `127.0.0.1:3000` by default and exposes `/health` and `/ws`.
+Set `CHESS_SERVER_ADDR`, for example `0.0.0.0:3000`, to choose another bind
+address. Public deployments must place the WebSocket endpoint behind TLS and
+should not expose this preview without rate limits and persistence.
+
 ## Development
 
 ```sh

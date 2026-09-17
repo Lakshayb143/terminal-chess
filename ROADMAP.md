@@ -35,5 +35,36 @@ Turn the current game into a session players can leave, share, and customize.
 - [x] Persist player names, themes, clocks, sound, and board orientation.
 - [x] Add a first-run setup and straightforward configuration file.
 
-Multiplayer, matchmaking, spectators, and SSH-hosted games will follow after
-these local foundations are solid.
+## 4. Private online games — in progress
+
+Prove that two terminal clients can finish a reliable server-authoritative
+game before adding public accounts or ratings.
+
+- [x] Extract the game model from terminal rendering and input.
+- [x] Define a versioned JSON protocol shared by clients and the server.
+- [x] Add an authoritative WebSocket server for legal moves and clocks.
+- [x] Add private guest rooms with invite codes.
+- [x] Add draw, resignation, disconnect, and reconnect behavior on the server.
+- [ ] Connect the terminal UI to create and join online games.
+- [ ] Show waiting, connection, reconnecting, and opponent-offline states.
+- [ ] Persist active server games across restarts.
+- [ ] Add deployment configuration, TLS, rate limits, and operational logging.
+- [ ] Test complete games between two clients under latency and disconnects.
+
+## 5. Accounts and game history — planned
+
+Add identity only after guest games are stable, so authentication does not hide
+problems in the core multiplayer loop.
+
+- [ ] Registration, login, recovery, and secure session tokens.
+- [ ] Persistent profiles and completed-game history.
+- [ ] Account and session management from the terminal.
+- [ ] Blocking, reporting, and basic abuse controls.
+
+## 6. Matchmaking and rated play — planned
+
+- [ ] Public challenges and time-control queues.
+- [ ] Ratings and rated/unrated games.
+- [ ] Rematches, friends, and direct challenges.
+- [ ] Spectators, leaderboards, and moderation tools.
+- [ ] SSH gateway after the packaged client/server experience is mature.
