@@ -1,0 +1,36 @@
+services:
+  chess-server:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      CHESS_SERVER_ADDR: 0.0.0.0:3000
+      CHESS_SERVER_STATE: /var/lib/terminal-chess/server-state.json
+      CHESS_RATE_LIMIT_PER_10S: ${CHESS_RATE_LIMIT_PER_10S:-60}
+      CHESS_LOG_FORMAT: json
+      RUST_LOG: ${RUST_LOG:-chess_server=info}
+    expose:
+      - "3000"
+    volumes:
+      - chess-data:/var/lib/terminal-chess
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - chess-server
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to the public hostname}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  chess-data:
+  caddy-data:
+  caddy-config:
