@@ -63,7 +63,7 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
     // in-game Piece control can switch to Auto later without querying the
     // terminal in the middle of raw event input.
     if screen.theme.live && !screen.theme.ascii {
-        screen.inline_images = ui::detect_inline_images();
+        screen.image_protocol = ui::detect_image_protocol();
     }
 
     let (mut game, mut mode) = match restored.take() {
@@ -117,6 +117,11 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
             .theme
             .dim("Type a move, click a piece, or press Tab for controls.")]
     };
+    if screen.pieces != ui::Pieces::Glyph && screen.theme.live {
+        if let Some(tip) = ui::terminal_tip(screen.image_protocol) {
+            screen.message.push(screen.theme.dim(tip));
+        }
+    }
     let mut saved_revision = game.revision;
     let mut persistence_error_reported = false;
 

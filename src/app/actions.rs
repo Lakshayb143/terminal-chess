@@ -683,8 +683,10 @@ pub(crate) fn cycle_pieces(screen: &mut Screen) {
     };
     apply_pieces(screen, pieces);
     let detail = match pieces {
-        ui::Pieces::Auto if screen.inline_images => "terminal images",
-        ui::Pieces::Auto => "the best available fallback",
+        ui::Pieces::Auto => match screen.image_protocol {
+            Some(protocol) => protocol.name(),
+            None => "the best available fallback",
+        },
         ui::Pieces::Glyph => "your terminal font for maximum sharpness",
         ui::Pieces::Art => "portable block artwork",
     };
