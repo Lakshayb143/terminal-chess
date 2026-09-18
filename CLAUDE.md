@@ -27,7 +27,7 @@ cargo run --bin chess-server   # local multiplayer server
 
 A Cargo workspace. Dependencies only point downwards: `chess-core` has no I/O, `chess-protocol` depends on core, `chess-server` on both, and the root `chess` package (the terminal client) on core and protocol.
 
-- `crates/chess-core`: `board` is the base, `movegen` depends on it, `san` and `eval` depend on both, `search` owns engine search, and `game` holds UI-independent game state and outcomes.
+- `crates/chess-core`: `board` is the base, `movegen` depends on it, `san` and `eval` depend on both, `search` owns engine search, and `game` holds UI-independent game state and outcomes. `tests/rules.rs` has perft, hashing, and notation round-trip tests; run them after touching move generation.
 - `crates/chess-protocol`: wire messages plus `From` conversions (`Color`↔`Side`, `Outcome`→`GameStatus`, `TimeControl`↔`Duration`). Add conversions here rather than in the client or server.
 - `crates/chess-server`: `hub` owns rooms, seats, clocks, and persistence and never touches a socket; `main.rs` is the axum transport.
 - Root package: `ui` owns terminal rendering and layout, `client` the WebSocket transport, `storage` local files, and `main.rs` the application loop.
