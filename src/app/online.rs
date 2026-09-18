@@ -23,7 +23,7 @@ use crate::app::actions::{
     cycle_pieces, flip_board, open_promotion_menu, set_pieces, set_size, set_sound, set_theme,
     sound_after_move, split_command, toggle_size,
 };
-use crate::app::cli::{Mode, OnlineIntent, Options};
+use crate::app::cli::{names_a_file, Mode, OnlineIntent, Options, HOSTED_FILES};
 use crate::app::format::kind_name;
 use crate::app::pages::{export_pgn, history_page, pgn_lines};
 use crate::app::parse::{nearby_moves, promotion_default};
@@ -152,6 +152,7 @@ pub(crate) fn play_online(
         screen.inline_images = ui::detect_inline_images();
     }
 
+    let hosted = options.hosted;
     let mut game = Game::with_clock(Position::startpos(), options.clock, options.increment);
     game.clock.pause();
     let client = OnlineClient::connect(options.server_url.clone());
@@ -324,6 +325,10 @@ pub(crate) fn play_online(
         }
 
         let (word, rest) = split_command(input);
+        if hosted && names_a_file(&word, rest) {
+            screen.note(screen.theme.warn(HOSTED_FILES));
+            continue;
+        }
         match word.as_str() {
             "quit" | "exit" | "q" => return Ok(()),
             "help" | "h" | "?" => {

@@ -17,7 +17,7 @@ use crate::app::actions::{
     play_promotion, set_depth, set_pieces, set_size, set_sound, set_theme, set_time, split_command,
     undo,
 };
-use crate::app::cli::{Mode, Options, StartChoice};
+use crate::app::cli::{names_a_file, Mode, Options, StartChoice, HOSTED_FILES};
 use crate::app::format::{format_score, white_pov};
 use crate::app::online::play_online;
 use crate::app::pages::{
@@ -340,6 +340,10 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
             }
         }
         let (word, rest) = split_command(input);
+        if options.hosted && names_a_file(&word, rest) {
+            screen.note(screen.theme.warn(HOSTED_FILES));
+            continue;
+        }
 
         match word.as_str() {
             "quit" | "exit" | "q" => {

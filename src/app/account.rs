@@ -35,7 +35,12 @@ pub(crate) struct AccountContext {
 impl AccountContext {
     pub(crate) fn load(config_path: &Path, server_url: &str, guest_name: String) -> AccountContext {
         let path = storage::default_account_path(config_path);
-        let (saved, notice) = match storage::load_account(&path) {
+        let handed_over = handed_over_session(server_url);
+        let loaded = match handed_over {
+            Some(account) => Ok(Some(account)),
+            None => storage::load_account(&path),
+        };
+        let (saved, notice) = match loaded {
             // An account on another server does not sign in to this one.
             Ok(saved) => (
                 saved.filter(|account| account.server_url == server_url),
@@ -80,6 +85,15 @@ impl AccountContext {
             self.notice = Some(error);
         }
     }
+}
+
+/// A session the SSH gateway started because the visitor's key is linked to
+/// an account.
+fn handed_over_session(server_url: &str) -> Option<SavedAccount> {
+    let token = std::env::var("CHESS_SESSION_TOKEN").ok()?;
+    let username = std::env::var("CHESS_SESSION_USERNAME").ok()?;
+    (!token.is_empty() && !username.is_empty())
+        .then(|| SavedAccount::new(server_url.to_string(), username, token))
 }
 
 /// The account page. Returns when the person goes back to the start menu.

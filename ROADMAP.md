@@ -51,14 +51,18 @@ game before adding public accounts or ratings.
 - [x] Add deployment configuration, TLS, rate limits, and operational logging.
 - [x] Test complete games between two clients under latency and disconnects.
 
-## 5. Accounts and game history — planned
+## 5. Accounts, game history, and SSH play — in progress
 
 Add identity only after guest games are stable, so authentication does not hide
-problems in the core multiplayer loop.
+problems in the core multiplayer loop. Guests can always play without one.
 
-- [ ] Registration, login, recovery, and secure session tokens.
-- [ ] Persistent profiles and completed-game history.
-- [ ] Account and session management from the terminal.
+- [x] Registration and login with Argon2id passwords and revocable session tokens.
+- [x] Completed online games recorded, with recent games on the account page.
+- [x] Play over plain `ssh`, with SSH keys linked to accounts for password-free sign-in.
+- [x] Sign out from the terminal.
+- [ ] Password change, account deletion, and unlinking SSH keys.
+- [ ] Account recovery by email, once there is a public deployment to send it.
+- [ ] Public profiles and full game replays from history.
 - [ ] Blocking, reporting, and basic abuse controls.
 
 ## 6. Matchmaking and rated play — planned
@@ -67,4 +71,3 @@ problems in the core multiplayer loop.
 - [ ] Ratings and rated/unrated games.
 - [ ] Rematches, friends, and direct challenges.
 - [ ] Spectators, leaderboards, and moderation tools.
-- [ ] SSH gateway after the packaged client/server experience is mature.
