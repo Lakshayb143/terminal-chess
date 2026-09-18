@@ -224,7 +224,8 @@ view wrapped in a desktop shell. A few implementation details:
 - Mouse events, keyboard commands, clocks, audio, and responsive rendering share
   one interactive game loop.
 
-The current product priorities are tracked in [ROADMAP.md](ROADMAP.md).
+The current product priorities are tracked in [ROADMAP.md](ROADMAP.md), and
+planned interface work in [UI_ROADMAP.md](UI_ROADMAP.md).
 
 ## Running the multiplayer server
 
