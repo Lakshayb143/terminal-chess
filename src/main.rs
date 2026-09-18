@@ -93,6 +93,8 @@ struct Options {
     ascii: bool,
     /// `None` means "colour if this is a terminal".
     color: Option<bool>,
+    /// `None` means "whatever the terminal appears to support".
+    depth: Option<ui::Depth>,
     palette: ui::Palette,
     pieces: ui::Pieces,
     /// Keep the old small board rather than filling the window.
@@ -151,6 +153,9 @@ LOOK:
         --ascii          letters instead of figurines, plain rules
         --no-colour      no escape codes at all (also honours NO_COLOR)
         --colour         colour even when the output is not a terminal
+        --truecolor      use 24-bit colour even if the terminal does not say
+                         it supports it (detected from COLORTERM and friends)
+        --256            round every colour to the 256-colour palette
     -h, --help           print this help
 
 IN THE GAME:
@@ -176,6 +181,7 @@ impl Options {
             limits: Limits::default(),
             ascii: false,
             color: None,
+            depth: None,
             palette: ui::palette(&preferences.theme).unwrap_or(ui::THEMES[0].1),
             pieces: ui::pieces_named(&preferences.pieces).unwrap_or(ui::Pieces::Auto),
             compact: preferences.compact,
@@ -226,6 +232,8 @@ impl Options {
                 }
                 "--no-color" | "--no-colour" | "--plain" => options.color = Some(false),
                 "--color" | "--colour" => options.color = Some(true),
+                "--truecolor" | "--truecolour" => options.depth = Some(ui::Depth::True),
+                "--256" => options.depth = Some(ui::Depth::Indexed),
                 "--theme" => {
                     let name = value("--theme")?;
                     options.palette = ui::palette(&name).ok_or(format!(
@@ -2349,7 +2357,8 @@ fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Resu
             options.ascii,
             color && Theme::detect_live(),
             options.palette,
-        ),
+        )
+        .with_depth(options.depth),
         sound: sound::Player::new(options.sound),
         inline_images: false,
         flipped: options.flipped || initial_side == Some(Color::Black),
@@ -2371,6 +2380,7 @@ fn play_online(mut options: Options, loaded: storage::LoadedPreferences) -> Resu
         confirming: None,
         analysis: Vec::new(),
         message: vec![Theme::new(color, options.ascii, color, options.palette)
+            .with_depth(options.depth)
             .dim("Connecting to the game server…")],
         selected: None,
         targets: Vec::new(),
@@ -3333,7 +3343,8 @@ fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), Stri
             options.ascii,
             color && Theme::detect_live(),
             options.palette,
-        ),
+        )
+        .with_depth(options.depth),
         sound: sound::Player::new(options.sound),
         inline_images: false,
         flipped: false,

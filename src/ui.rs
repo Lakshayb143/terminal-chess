@@ -17,38 +17,106 @@ use crate::board::{self, Color, Move, Piece, Position, Square};
 // Palettes
 // ---------------------------------------------------------------------------
 
-/// Colours are 256-colour indices, which every terminal worth colouring for
-/// has had for twenty years.
+/// A 24-bit colour. Terminals that only understand the 256-colour palette get
+/// the nearest entry in it instead; see [`Depth`].
+pub type Rgb = [u8; 3];
+
+const fn hex(value: u32) -> Rgb {
+    [(value >> 16) as u8, (value >> 8) as u8, value as u8]
+}
+
+/// Mix `amount` percent of `tint` into `base`.
+fn mix(base: Rgb, tint: Rgb, amount: u16) -> Rgb {
+    let channel = |b: u8, t: u8| ((b as u16 * (100 - amount) + t as u16 * amount + 50) / 100) as u8;
+    [
+        channel(base[0], tint[0]),
+        channel(base[1], tint[1]),
+        channel(base[2], tint[2]),
+    ]
+}
+
+/// Squares carry two colours; every highlight is a tint laid over them, so a
+/// marked light square still reads as light and a marked dark one as dark.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    light: u8,
-    dark: u8,
+    light: Rgb,
+    dark: Rgb,
     /// The two squares of the move just played.
-    light_last: u8,
-    dark_last: u8,
+    last: Rgb,
     /// The square of a king in check.
-    light_check: u8,
-    dark_check: u8,
+    check: Rgb,
     /// Squares a piece has been asked about, or a hinted move.
-    light_target: u8,
-    dark_target: u8,
+    target: Rgb,
     /// Legal destinations that take an opposing piece.
-    light_capture: u8,
-    dark_capture: u8,
+    capture: Rgb,
     /// A square the player clicked but cannot legally use.
-    light_invalid: u8,
-    dark_invalid: u8,
+    invalid: Rgb,
     /// The piece currently chosen with the mouse.
-    light_selected: u8,
-    dark_selected: u8,
-    white_piece: u8,
-    black_piece: u8,
+    selected: Rgb,
+    white_piece: Rgb,
+    black_piece: Rgb,
     /// The bar across the top of the screen.
-    bar: u8,
-    pub label: u8,
-    pub accent: u8,
-    pub warn: u8,
-    pub good: u8,
+    bar: Rgb,
+    pub label: Rgb,
+    pub accent: Rgb,
+    pub warn: Rgb,
+    pub good: Rgb,
+    /// Hand-picked 256-colour squares. Rounding a blended tint to the nearest
+    /// palette entry often lands back on the plain square, or on grey, so a
+    /// terminal without 24-bit colour gets these instead of the blends.
+    indexed: Indexed,
+}
+
+/// Plain, last move, check, target, capture, invalid, selected: light first.
+type Indexed = [[u8; 2]; 7];
+
+/// Why a square is drawn in something other than its plain colour, strongest
+/// reason first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mark {
+    Check,
+    Invalid,
+    Selected,
+    Capture,
+    Target,
+    Last,
+}
+
+impl Palette {
+    /// The background of one square. The strengths are shared by every theme
+    /// so that a highlight means the same thing whichever one is chosen: the
+    /// last move is a quiet wash, check is unmissable.
+    fn square(&self, light: bool, mark: Option<Mark>, depth: Depth) -> Rgb {
+        if depth == Depth::Indexed {
+            let row = match mark {
+                None => 0,
+                Some(Mark::Last) => 1,
+                Some(Mark::Check) => 2,
+                Some(Mark::Target) => 3,
+                Some(Mark::Capture) => 4,
+                Some(Mark::Invalid) => 5,
+                Some(Mark::Selected) => 6,
+            };
+            return ansi256_rgb(self.indexed[row][usize::from(!light)]);
+        }
+        let base = if light { self.light } else { self.dark };
+        let (tint, amount) = match mark {
+            None => return base,
+            Some(Mark::Check) => (self.check, 68),
+            Some(Mark::Invalid) => (self.invalid, 55),
+            Some(Mark::Selected) => (self.selected, 55),
+            Some(Mark::Capture) => (self.capture, 50),
+            Some(Mark::Target) => (self.target, 40),
+            Some(Mark::Last) => (self.last, 42),
+        };
+        mix(base, tint, amount)
+    }
+
+    /// Move dots and capture frames are a deeper shade of the square under
+    /// them, which keeps them legible on every tint without shouting.
+    fn marker(&self, square: Rgb) -> Rgb {
+        mix(square, hex(0x101418), 45)
+    }
 }
 
 /// Squares are deliberately mid-toned: white pieces are drawn in white and
@@ -57,105 +125,117 @@ pub const THEMES: [(&str, Palette); 4] = [
     (
         "slate",
         Palette {
-            light: 109,
-            dark: 66,
-            light_last: 180,
-            dark_last: 137,
-            light_check: 174,
-            dark_check: 131,
-            light_target: 151,
-            dark_target: 108,
-            light_capture: 186,
-            dark_capture: 143,
-            light_invalid: 174,
-            dark_invalid: 131,
-            light_selected: 153,
-            dark_selected: 110,
-            white_piece: 255,
-            black_piece: 233,
-            bar: 60,
-            label: 245,
-            accent: 110,
-            warn: 174,
-            good: 108,
+            light: hex(0x8eaeb4),
+            dark: hex(0x5c7f88),
+            last: hex(0xf2c95c),
+            check: hex(0xe5484d),
+            target: hex(0xa6e3a1),
+            capture: hex(0xf29e5a),
+            invalid: hex(0xe5484d),
+            selected: hex(0x9ccfff),
+            white_piece: hex(0xf4f4f4),
+            black_piece: hex(0x151515),
+            bar: hex(0x4b5872),
+            label: hex(0x8a9099),
+            accent: hex(0x86b3d9),
+            warn: hex(0xdc8c8c),
+            good: hex(0x8fbf8f),
+            indexed: [
+                [109, 66],
+                [180, 137],
+                [174, 131],
+                [151, 108],
+                [186, 143],
+                [174, 131],
+                [153, 110],
+            ],
         },
     ),
     (
         "wood",
         Palette {
-            light: 180,
-            dark: 137,
-            light_last: 186,
-            dark_last: 143,
-            light_check: 174,
-            dark_check: 131,
-            light_target: 151,
-            dark_target: 108,
-            light_capture: 153,
-            dark_capture: 110,
-            light_invalid: 174,
-            dark_invalid: 131,
-            light_selected: 153,
-            dark_selected: 110,
-            white_piece: 255,
-            black_piece: 233,
-            bar: 95,
-            label: 245,
-            accent: 179,
-            warn: 174,
-            good: 108,
+            light: hex(0xd6b088),
+            dark: hex(0xa57b53),
+            last: hex(0xf5dc6e),
+            check: hex(0xe5484d),
+            target: hex(0xa6e3a1),
+            capture: hex(0x8fc6ff),
+            invalid: hex(0xe5484d),
+            selected: hex(0x8fc6ff),
+            white_piece: hex(0xf4f4f4),
+            black_piece: hex(0x151515),
+            bar: hex(0x6e5040),
+            label: hex(0x928b84),
+            accent: hex(0xdcab5c),
+            warn: hex(0xdc8c8c),
+            good: hex(0x8fbf8f),
+            indexed: [
+                [180, 137],
+                [186, 143],
+                [174, 131],
+                [151, 108],
+                [153, 110],
+                [174, 131],
+                [153, 110],
+            ],
         },
     ),
     (
         "forest",
         Palette {
-            light: 108,
-            dark: 65,
-            light_last: 186,
-            dark_last: 143,
-            light_check: 174,
-            dark_check: 131,
-            light_target: 152,
-            dark_target: 109,
-            light_capture: 186,
-            dark_capture: 143,
-            light_invalid: 174,
-            dark_invalid: 131,
-            light_selected: 186,
-            dark_selected: 143,
-            white_piece: 255,
-            black_piece: 233,
-            bar: 59,
-            label: 245,
-            accent: 108,
-            warn: 174,
-            good: 114,
+            light: hex(0x8fb38a),
+            dark: hex(0x58805a),
+            last: hex(0xecd46a),
+            check: hex(0xe5484d),
+            target: hex(0xb0dcef),
+            capture: hex(0xf29e5a),
+            invalid: hex(0xe5484d),
+            selected: hex(0xfff09a),
+            white_piece: hex(0xf4f4f4),
+            black_piece: hex(0x151515),
+            bar: hex(0x3e5446),
+            label: hex(0x8a948b),
+            accent: hex(0x8fbf8a),
+            warn: hex(0xdc8c8c),
+            good: hex(0x8fd47f),
+            indexed: [
+                [108, 65],
+                [186, 143],
+                [174, 131],
+                [152, 109],
+                [186, 143],
+                [174, 131],
+                [186, 143],
+            ],
         },
     ),
     (
         "mono",
         Palette {
-            light: 145,
-            dark: 102,
-            light_last: 187,
-            dark_last: 144,
-            light_check: 181,
-            dark_check: 138,
-            light_target: 152,
-            dark_target: 109,
-            light_capture: 195,
-            dark_capture: 152,
-            light_invalid: 181,
-            dark_invalid: 138,
-            light_selected: 181,
-            dark_selected: 181,
-            white_piece: 255,
-            black_piece: 233,
-            bar: 238,
-            label: 245,
-            accent: 252,
-            warn: 181,
-            good: 252,
+            light: hex(0xa8a8ab),
+            dark: hex(0x707074),
+            last: hex(0xe8e0b8),
+            check: hex(0xe08c8c),
+            target: hex(0xbfe0e8),
+            capture: hex(0xe8f4ff),
+            invalid: hex(0xe08c8c),
+            selected: hex(0xf0c8c8),
+            white_piece: hex(0xf4f4f4),
+            black_piece: hex(0x151515),
+            bar: hex(0x3a3a3c),
+            label: hex(0x8a8a8a),
+            accent: hex(0xd4d4d4),
+            warn: hex(0xdcb0b0),
+            good: hex(0xd4d4d4),
+            indexed: [
+                [145, 102],
+                [187, 144],
+                [181, 138],
+                [152, 109],
+                [195, 152],
+                [181, 138],
+                [181, 181],
+            ],
         },
     ),
 ];
@@ -181,6 +261,115 @@ pub fn palette_name(palette: Palette) -> &'static str {
         .find(|(_, candidate)| *candidate == palette)
         .map(|(name, _)| *name)
         .unwrap_or("slate")
+}
+
+// ---------------------------------------------------------------------------
+// Colour depth
+// ---------------------------------------------------------------------------
+
+/// How many colours the terminal can show. Palettes are written in 24-bit
+/// colour; a 256-colour terminal gets each one rounded to its nearest entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Depth {
+    Indexed,
+    True,
+}
+
+impl Depth {
+    /// `COLORTERM` is the convention, but it rarely survives `ssh` or `sudo`,
+    /// so the terminals known to handle 24-bit colour are recognised by the
+    /// other markers they leave behind. Anything else gets the 256 colours
+    /// that every terminal worth colouring for has had for twenty years.
+    pub fn detect() -> Depth {
+        let get = |key: &str| std::env::var(key).unwrap_or_default().to_ascii_lowercase();
+        let set = |key: &str| std::env::var_os(key).is_some_and(|value| !value.is_empty());
+
+        let colorterm = get("COLORTERM");
+        if colorterm == "truecolor" || colorterm == "24bit" {
+            return Depth::True;
+        }
+        let term = get("TERM");
+        let program = get("TERM_PROGRAM");
+        let known_term = term.ends_with("-direct")
+            || [
+                "kitty",
+                "alacritty",
+                "ghostty",
+                "wezterm",
+                "foot",
+                "contour",
+            ]
+            .iter()
+            .any(|name| term.contains(name));
+        let known_program = matches!(
+            program.as_str(),
+            "iterm.app" | "wezterm" | "vscode" | "ghostty" | "hyper" | "tabby" | "rio"
+        );
+        let vte = get("VTE_VERSION")
+            .parse::<u32>()
+            .is_ok_and(|version| version >= 3600);
+        if known_term
+            || known_program
+            || vte
+            || get("LC_TERMINAL") == "iterm2"
+            || set("KITTY_WINDOW_ID")
+            || set("WT_SESSION")
+            || set("KONSOLE_VERSION")
+        {
+            Depth::True
+        } else {
+            Depth::Indexed
+        }
+    }
+
+    pub fn named(name: &str) -> Option<Depth> {
+        match name.to_ascii_lowercase().as_str() {
+            "24bit" | "truecolor" | "truecolour" | "true" => Some(Depth::True),
+            "256" | "indexed" => Some(Depth::Indexed),
+            _ => None,
+        }
+    }
+
+    /// The SGR parameters for `color` as a foreground (`38`) or background
+    /// (`48`) colour.
+    fn code(self, layer: u8, color: Rgb) -> String {
+        match self {
+            Depth::True => format!("{};2;{};{};{}", layer, color[0], color[1], color[2]),
+            Depth::Indexed => format!("{};5;{}", layer, ansi256_index(color)),
+        }
+    }
+
+    pub fn fg(self, color: Rgb) -> String {
+        self.code(38, color)
+    }
+
+    pub fn bg(self, color: Rgb) -> String {
+        self.code(48, color)
+    }
+}
+
+/// The 256-colour entry closest to `color`: the nearer of the best candidate
+/// in the 6x6x6 cube and the best in the grey ramp. The first sixteen are
+/// left alone because every terminal theme redefines them.
+fn ansi256_index(color: Rgb) -> u8 {
+    let level = |value: u8| match value {
+        0..=47 => 0,
+        48..=114 => 1,
+        _ => ((value as u16 - 35) / 40) as u8,
+    };
+    let cube = 16 + 36 * level(color[0]) + 6 * level(color[1]) + level(color[2]);
+    let average = (color[0] as u16 + color[1] as u16 + color[2] as u16) / 3;
+    let grey = 232 + ((average.saturating_sub(3)) / 10).min(23) as u8;
+    let distance = |index: u8| {
+        let candidate = ansi256_rgb(index);
+        let delta = |channel: usize| color[channel] as i32 - candidate[channel] as i32;
+        2 * delta(0).pow(2) + 4 * delta(1).pow(2) + delta(2).pow(2)
+    };
+    if distance(grey) < distance(cube) {
+        grey
+    } else {
+        cube
+    }
 }
 
 /// Probe for a real inline-image protocol. The Kitty query also works through
@@ -560,9 +749,8 @@ fn quadrant(pixels: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3], char) {
     (best.1, best.2, best.3)
 }
 
-fn art_row(piece: Piece, row: usize, metrics: Metrics, background: u8) -> String {
+fn art_row(piece: Piece, row: usize, metrics: Metrics, background: Rgb, depth: Depth) -> String {
     let sprite = piece_sprite(piece, metrics.cell_w * 2, metrics.cell_h * 2);
-    let background = ansi256_rgb(background);
     let pixel_width = metrics.cell_w * 2;
     debug_assert_eq!(sprite.len(), pixel_width * metrics.cell_h * 2 * 4);
     let mut output = String::with_capacity(metrics.cell_w * 34);
@@ -578,21 +766,13 @@ fn art_row(piece: Piece, row: usize, metrics: Metrics, background: u8) -> String
         ];
         let (foreground, background, glyph) = quadrant(pixels);
         if glyph == ' ' {
-            let _ = write!(
-                output,
-                "\x1b[48;2;{};{};{}m ",
-                background[0], background[1], background[2]
-            );
+            let _ = write!(output, "\x1b[{}m ", depth.bg(background));
         } else {
             let _ = write!(
                 output,
-                "\x1b[38;2;{};{};{};48;2;{};{};{}m{}",
-                foreground[0],
-                foreground[1],
-                foreground[2],
-                background[0],
-                background[1],
-                background[2],
+                "\x1b[{};{}m{}",
+                depth.fg(foreground),
+                depth.bg(background),
                 glyph
             );
         }
@@ -612,6 +792,8 @@ pub struct Theme {
     /// Redraw the screen in place rather than scrolling a log past.
     pub live: bool,
     pub palette: Palette,
+    /// 24-bit colour, or the nearest of the 256.
+    pub depth: Depth,
 }
 
 impl Theme {
@@ -621,7 +803,16 @@ impl Theme {
             ascii,
             live,
             palette,
+            depth: Depth::detect(),
         }
+    }
+
+    /// Override the detected colour depth, for `--truecolor` and `--256`.
+    pub fn with_depth(mut self, depth: Option<Depth>) -> Theme {
+        if let Some(depth) = depth {
+            self.depth = depth;
+        }
+        self
     }
 
     /// Colour unless the user, the terminal or the pipe says otherwise.
@@ -661,12 +852,12 @@ impl Theme {
         self.sgr("1", text)
     }
 
-    pub fn fg(&self, color: u8, text: &str) -> String {
-        self.sgr(&format!("38;5;{}", color), text)
+    pub fn fg(&self, color: Rgb, text: &str) -> String {
+        self.sgr(&self.depth.fg(color), text)
     }
 
-    pub fn strong(&self, color: u8, text: &str) -> String {
-        self.sgr(&format!("1;38;5;{}", color), text)
+    pub fn strong(&self, color: Rgb, text: &str) -> String {
+        self.sgr(&format!("1;{}", self.depth.fg(color)), text)
     }
 
     pub fn accent(&self, text: &str) -> String {
@@ -687,8 +878,8 @@ impl Theme {
 
     /// Keyboard focus is deliberately stronger than an ordinary accent: it
     /// must remain unmistakable across every board palette.
-    pub fn focused(&self, color: u8, text: &str) -> String {
-        self.sgr(&format!("1;7;38;5;{}", color), text)
+    pub fn focused(&self, color: Rgb, text: &str) -> String {
+        self.sgr(&format!("1;7;{}", self.depth.fg(color)), text)
     }
 
     // -- screen -------------------------------------------------------------
@@ -727,7 +918,12 @@ impl Theme {
         );
         let plain = pad(&format!(" {} ", plain), cols);
         if self.color {
-            format!("\x1b[48;5;{};38;5;231m{}\x1b[0m", self.palette.bar, plain)
+            format!(
+                "\x1b[{};{}m{}\x1b[0m",
+                self.depth.bg(self.palette.bar),
+                self.depth.fg(hex(0xffffff)),
+                plain
+            )
         } else {
             plain.trim_end().to_string()
         }
@@ -773,13 +969,10 @@ impl Theme {
         let piece = promotion
             .map(|choice| choice.piece)
             .or_else(|| view.pos.at(s));
-        let light = (board::file_of(s) + board::rank_of(s)) % 2 == 1;
-        let last = view.last.map_or(false, |mv| mv.from == s || mv.to == s);
-        let check = view.check == Some(s);
-        let invalid = view.invalid == Some(s);
-        let selected = promotion.is_none() && view.selected == Some(s);
-        let target = promotion.is_some() || view.targets.contains(&s);
-        let capture = promotion.is_none() && view.captures.contains(&s);
+        let (light, mark) = view.mark(s);
+        let target = matches!(mark, Some(Mark::Target | Mark::Capture));
+        let capture = mark == Some(Mark::Capture);
+        let invalid = mark == Some(Mark::Invalid);
 
         if !self.color {
             let glyph = match piece {
@@ -789,41 +982,21 @@ impl Theme {
             };
             // Brackets, parentheses and stars are all one column wide, so a
             // plain board can mark squares without any of it sliding sideways.
-            let (open, close) = if check {
-                ('[', ']')
-            } else if invalid {
-                ('!', '!')
-            } else if selected {
-                ('<', '>')
-            } else if capture {
-                ('x', 'x')
-            } else if target {
-                ('*', '*')
-            } else if last {
-                ('(', ')')
-            } else {
-                (' ', ' ')
+            let (open, close) = match mark {
+                Some(Mark::Check) => ('[', ']'),
+                Some(Mark::Invalid) => ('!', '!'),
+                Some(Mark::Selected) => ('<', '>'),
+                Some(Mark::Capture) => ('x', 'x'),
+                Some(Mark::Target) => ('*', '*'),
+                Some(Mark::Last) => ('(', ')'),
+                None => (' ', ' '),
             };
             return format!("{}{}{}", open, glyph, close);
         }
 
         let p = &self.palette;
-        let bg = match (check, invalid, selected, capture, target, last, light) {
-            (true, _, _, _, _, _, true) => p.light_check,
-            (true, _, _, _, _, _, false) => p.dark_check,
-            (_, true, _, _, _, _, true) => p.light_invalid,
-            (_, true, _, _, _, _, false) => p.dark_invalid,
-            (_, _, true, _, _, _, true) => p.light_selected,
-            (_, _, true, _, _, _, false) => p.dark_selected,
-            (_, _, _, true, _, _, true) => p.light_capture,
-            (_, _, _, true, _, _, false) => p.dark_capture,
-            (_, _, _, _, true, _, true) => p.light_target,
-            (_, _, _, _, true, _, false) => p.dark_target,
-            (_, _, _, _, _, true, true) => p.light_last,
-            (_, _, _, _, _, true, false) => p.dark_last,
-            (_, _, _, _, _, false, true) => p.light,
-            (_, _, _, _, _, false, false) => p.dark,
-        };
+        let d = self.depth;
+        let bg = p.square(light, mark, d);
         let middle = m.cell_h / 2;
 
         match piece {
@@ -833,7 +1006,7 @@ impl Theme {
                     Color::Black => (p.black_piece, ""),
                 };
                 let content = if m.art {
-                    art_row(piece, row, m, bg)
+                    art_row(piece, row, m, bg, d)
                 } else if row == middle {
                     center(&self.glyph(piece).to_string(), m.cell_w)
                 } else {
@@ -842,17 +1015,23 @@ impl Theme {
                 if m.art {
                     format!("{}\x1b[0m", content)
                 } else {
-                    format!("\x1b[48;5;{};38;5;{}{}m{}\x1b[0m", bg, fg, weight, content)
+                    format!(
+                        "\x1b[{};{}{}m{}\x1b[0m",
+                        d.bg(bg),
+                        d.fg(fg),
+                        weight,
+                        content
+                    )
                 }
             }
             // An empty square worth looking at gets a dot to look at.
             None if (target || invalid) && row == middle => format!(
-                "\x1b[48;5;{};38;5;{}m{}\x1b[0m",
-                bg,
-                p.label,
+                "\x1b[{};{}m{}\x1b[0m",
+                d.bg(bg),
+                d.fg(p.marker(bg)),
                 center(if capture || invalid { "×" } else { "\u{2022}" }, m.cell_w)
             ),
-            None => format!("\x1b[48;5;{}m{}\x1b[0m", bg, " ".repeat(m.cell_w)),
+            None => format!("\x1b[{}m{}\x1b[0m", d.bg(bg), " ".repeat(m.cell_w)),
         }
     }
 
@@ -886,34 +1065,12 @@ impl Theme {
                     .promotions
                     .iter()
                     .find(|choice| choice.square == square);
-                let light = (file + rank) % 2 == 1;
-                let last = view
-                    .last
-                    .map_or(false, |mv| mv.from == square || mv.to == square);
-                let check = view.check == Some(square);
-                let invalid = view.invalid == Some(square);
-                let selected = promotion.is_none() && view.selected == Some(square);
-                let target = promotion.is_some() || view.targets.contains(&square);
-                let capture = promotion.is_none() && view.captures.contains(&square);
+                let (light, mark) = view.mark(square);
+                let target = matches!(mark, Some(Mark::Target | Mark::Capture));
+                let capture = mark == Some(Mark::Capture);
                 let p = &self.palette;
-                let background = ansi256_rgb(
-                    match (check, invalid, selected, capture, target, last, light) {
-                        (true, _, _, _, _, _, true) => p.light_check,
-                        (true, _, _, _, _, _, false) => p.dark_check,
-                        (_, true, _, _, _, _, true) => p.light_invalid,
-                        (_, true, _, _, _, _, false) => p.dark_invalid,
-                        (_, _, true, _, _, _, true) => p.light_selected,
-                        (_, _, true, _, _, _, false) => p.dark_selected,
-                        (_, _, _, true, _, _, true) => p.light_capture,
-                        (_, _, _, true, _, _, false) => p.dark_capture,
-                        (_, _, _, _, true, _, true) => p.light_target,
-                        (_, _, _, _, true, _, false) => p.dark_target,
-                        (_, _, _, _, _, true, true) => p.light_last,
-                        (_, _, _, _, _, true, false) => p.dark_last,
-                        (_, _, _, _, _, false, true) => p.light,
-                        (_, _, _, _, _, false, false) => p.dark,
-                    },
-                );
+                // An inline image is 24-bit whatever the text around it is.
+                let background = p.square(light, mark, Depth::True);
                 let origin_x = display_file * TILE;
                 let origin_y = display_rank * TILE;
 
@@ -940,7 +1097,7 @@ impl Theme {
                         }
                     }
                 } else if target && !capture {
-                    let marker = ansi256_rgb(p.label);
+                    let marker = p.marker(background);
                     let radius = (TILE / 10) as isize;
                     let center = (TILE / 2) as isize;
                     for y in 0..TILE {
@@ -958,7 +1115,7 @@ impl Theme {
                 // An occupied legal destination gets a quiet inset frame;
                 // empty destinations keep the conventional center dot above.
                 if capture {
-                    let marker = ansi256_rgb(p.label);
+                    let marker = p.marker(background);
                     let inset = TILE / 18;
                     let thickness = (TILE / 32).max(2);
                     for y in inset..TILE - inset {
@@ -1046,6 +1203,34 @@ pub struct BoardView<'a> {
     pub invalid: Option<Square>,
     /// A temporary, chess-client-style promotion menu drawn over one file.
     pub promotions: &'a [PromotionOption],
+}
+
+impl BoardView<'_> {
+    /// Whether `square` is a light one, and the strongest reason to highlight
+    /// it. A promotion menu hides the selection and capture marks beneath it.
+    fn mark(&self, square: Square) -> (bool, Option<Mark>) {
+        let light = (board::file_of(square) + board::rank_of(square)) % 2 == 1;
+        let promotion = self.promotions.iter().any(|choice| choice.square == square);
+        let mark = if self.check == Some(square) {
+            Some(Mark::Check)
+        } else if self.invalid == Some(square) {
+            Some(Mark::Invalid)
+        } else if !promotion && self.selected == Some(square) {
+            Some(Mark::Selected)
+        } else if !promotion && self.captures.contains(&square) {
+            Some(Mark::Capture)
+        } else if promotion || self.targets.contains(&square) {
+            Some(Mark::Target)
+        } else if self
+            .last
+            .is_some_and(|mv| mv.from == square || mv.to == square)
+        {
+            Some(Mark::Last)
+        } else {
+            None
+        };
+        (light, mark)
+    }
 }
 
 /// One clickable entry in the promotion menu.
@@ -1210,5 +1395,69 @@ mod tests {
         let board = theme.board_image(&view).to_rgba8();
         assert_eq!(board.dimensions(), (768, 768));
         assert!(board.pixels().all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn indexed_colours_round_to_their_own_palette_entry() {
+        // Every cube and grey entry is its own nearest match.
+        for index in 16..=255u8 {
+            assert_eq!(ansi256_index(ansi256_rgb(index)), index);
+        }
+        assert_eq!(Depth::Indexed.bg(hex(0x87afaf)), "48;5;109");
+        assert_eq!(Depth::True.fg(hex(0x87afaf)), "38;2;135;175;175");
+    }
+
+    #[test]
+    fn highlights_keep_light_and_dark_squares_apart() {
+        for (name, palette) in THEMES {
+            for mark in [
+                None,
+                Some(Mark::Last),
+                Some(Mark::Check),
+                Some(Mark::Target),
+                Some(Mark::Capture),
+                Some(Mark::Selected),
+            ] {
+                let light = palette.square(true, mark, Depth::True);
+                let dark = palette.square(false, mark, Depth::True);
+                let luma = |c: Rgb| 2 * c[0] as u32 + 5 * c[1] as u32 + c[2] as u32;
+                assert!(luma(light) > luma(dark), "{name} {mark:?}");
+                if mark.is_some() {
+                    assert_ne!(light, palette.light, "{name} {mark:?}");
+                    assert_ne!(dark, palette.dark, "{name} {mark:?}");
+                    // The 256-colour fallback must also show every mark.
+                    for side in [true, false] {
+                        assert_ne!(
+                            palette.square(side, mark, Depth::Indexed),
+                            palette.square(side, None, Depth::Indexed),
+                            "{name} {mark:?} indexed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_strongest_highlight_wins() {
+        let position = Position::startpos();
+        let e4 = board::sq(4, 3);
+        let d5 = board::sq(3, 4);
+        let last = Move::normal(board::sq(4, 1), e4);
+        let view = BoardView {
+            pos: &position,
+            flipped: false,
+            last: Some(last),
+            check: None,
+            selected: Some(e4),
+            targets: &[d5],
+            captures: &[d5],
+            invalid: None,
+            promotions: &[],
+        };
+        assert_eq!(view.mark(e4).1, Some(Mark::Selected));
+        assert_eq!(view.mark(d5).1, Some(Mark::Capture));
+        assert_eq!(view.mark(board::sq(4, 1)).1, Some(Mark::Last));
+        assert_eq!(view.mark(board::sq(0, 0)), (false, None));
     }
 }

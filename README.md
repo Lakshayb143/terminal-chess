@@ -189,6 +189,8 @@ Terminal Chess uses the system audio player; other platforms use Rodio.
 --no-clock           play without chess clocks
 --theme <name>       slate, wood, forest, or mono
 --pieces <kind>      auto, art, or glyph
+--truecolor          force 24-bit colour
+--256                limit colours to the 256-colour palette
 --compact            keep the small board
 --sound <mode>       auto, on, or off
 --mute               disable sound effects
@@ -210,6 +212,9 @@ The project is intentionally built as a terminal application rather than a web
 view wrapped in a desktop shell. A few implementation details:
 
 - The UI negotiates terminal capabilities and keeps a portable ANSI fallback.
+- Themes are designed in 24-bit colour, with highlights blended over each
+  square. 24-bit output is used when `COLORTERM` or the terminal's own markers
+  say it is supported; other terminals get hand-tuned 256-colour squares.
 - A cached row-diff renderer and synchronized terminal updates prevent partial
   frames without repainting the whole screen after every move.
 - SVG piece assets are rasterized in-process and embedded in the release binary.
