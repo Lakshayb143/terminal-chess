@@ -47,6 +47,9 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 viuer = "0.11.0"
 
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi = "0.9"
+
 [dev-dependencies]
 chess-server.workspace = true
 

@@ -632,13 +632,15 @@ impl Screen {
         let full_redraw = self.last_frame.is_empty() || size_changed || inline_transition;
         let changed_rows = changed_frame_rows(&self.last_frame, &next_frame, full_redraw);
         // Rewriting a row that crosses the board writes the text board over
-        // any picture that is painted into the cells, so such a picture has
-        // to be drawn again even when the position has not changed.
+        // the picture. Most terminals keep pictures in the cells they cover,
+        // so the text erases it, and it is drawn again even when the position
+        // has not changed. Even Kitty's own protocol is stored that way by
+        // some terminals that speak it, such as VS Code.
         let protocol = self.image_protocol.filter(|_| wants_inline_board);
         let board_top = body_start + 1;
         let board_rows = board_top..board_top + 8 * self.metrics.cell_h;
-        let board_overwritten = protocol.is_some_and(ui::ImageProtocol::replaces_in_place)
-            && changed_rows.iter().any(|row| board_rows.contains(row));
+        let board_overwritten =
+            protocol.is_some() && changed_rows.iter().any(|row| board_rows.contains(row));
         let draw_image = image_changed || full_redraw || board_overwritten;
 
         // Synchronized output lets supporting terminals present text and the
@@ -648,7 +650,9 @@ impl Screen {
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
         let kitty_drawn =
             self.inline_drawn && self.image_protocol == Some(ui::ImageProtocol::Kitty);
-        if kitty_drawn && (full_redraw || image_changed) {
+        // Kitty placements that float above the text would otherwise pile up
+        // under each redrawn picture.
+        if kitty_drawn && draw_image {
             out.push_str("\x1b_Ga=d,d=A\x1b\\");
         }
         if full_redraw {

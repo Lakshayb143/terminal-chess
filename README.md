@@ -174,9 +174,9 @@ so detection works on a remote machine too.
 | --- | --- |
 | iTerm2, WezTerm | iTerm2 images |
 | Kitty, Ghostty, Konsole | Kitty images |
-| foot, xterm (`-ti vt340`), Windows Terminal, VTE builds with sixel | Sixel images |
+| Windows Terminal 1.22+ (cmd, PowerShell, WSL, SSH), foot, xterm (`-ti vt340`), VTE builds with sixel | Sixel images |
 | VS Code with `terminal.integrated.enableImages` | iTerm2 images |
-| GNOME Terminal, Ptyxis, Alacritty, and others | Unicode block art |
+| GNOME Terminal, Ptyxis, Alacritty, the classic Windows console, and others | Unicode block art |
 
 Terminals without image support draw the board with block art. VS Code
 recolours text it considers low-contrast, which spoils the art's shading; set

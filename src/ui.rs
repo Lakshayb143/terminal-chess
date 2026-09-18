@@ -394,14 +394,6 @@ impl ImageProtocol {
             ImageProtocol::Sixel { .. } => "sixel images",
         }
     }
-
-    /// iTerm pictures and sixels are painted into the cells they cover, so
-    /// a new one simply replaces the old, and text written over them erases
-    /// them. Kitty placements are separate objects above the text and must be
-    /// removed before a new one is drawn in the same rectangle.
-    pub fn replaces_in_place(self) -> bool {
-        !matches!(self, ImageProtocol::Kitty)
-    }
 }
 
 /// Probe for a real inline-image protocol. The queries also work through SSH
@@ -415,22 +407,34 @@ pub fn detect_image_protocol() -> Option<ImageProtocol> {
     if viuer::is_iterm_supported() {
         return Some(ImageProtocol::Iterm);
     }
+    // VS Code only draws pictures once its `enableImages` setting is on, and
+    // then says so by answering the Kitty query or offering sixels. Its
+    // pictures of every kind live in the text cells, so it is sent iTerm's
+    // PNGs, which the board redraws whenever text lands on them; placing
+    // Kitty images there would leave them erased by the next panel update.
+    let vscode = std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "vscode");
     if viuer::get_kitty_support() != viuer::KittySupport::None {
-        return Some(ImageProtocol::Kitty);
+        return Some(if vscode {
+            ImageProtocol::Iterm
+        } else {
+            ImageProtocol::Kitty
+        });
     }
     let reply = query_terminal("\x1b[16t\x1b[14t\x1b[?2;1;0S\x1b[c")?;
     let answers = TerminalAnswers::parse(&reply);
     if !answers.sixel {
         return None;
     }
-    // VS Code only draws pictures once its `enableImages` setting is on, and
-    // then says so by offering sixels. The same support takes iTerm's PNGs,
-    // which keep full colour and need no pixel measurements.
-    if std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "vscode") {
+    if vscode {
         return Some(ImageProtocol::Iterm);
     }
     let (cols, rows) = terminal_size()?;
-    let (cell_width, cell_height) = answers.cell_size(cols, rows)?;
+    // Windows Terminal scales every sixel from the VT340's 10 by 20 pixel
+    // cell to its real font, so that size is right there even unanswered.
+    let windows_terminal = std::env::var_os("WT_SESSION").is_some();
+    let (cell_width, cell_height) = answers
+        .cell_size(cols, rows)
+        .or(windows_terminal.then_some((10, 20)))?;
     Some(ImageProtocol::Sixel {
         cell_width,
         cell_height,
@@ -511,6 +515,7 @@ impl TerminalAnswers {
 /// in order, so its reply marks the end of everything the terminal will say.
 /// The terminal is switched to raw input for the exchange, with reads that
 /// give up after a tenth of a second, and two seconds in all.
+#[cfg(unix)]
 fn query_terminal(queries: &str) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -545,6 +550,62 @@ fn query_terminal(queries: &str) -> Option<String> {
     }
     stty(&[saved]);
     ends_with_device_attributes(&reply).then(|| String::from_utf8_lossy(&reply).into_owned())
+}
+
+/// The Windows console form of the exchange above, for cmd and PowerShell in
+/// Windows Terminal. The console hands replies over as typed characters once
+/// virtual terminal input is on, so input is switched to that, unechoed, and
+/// polled until the device attributes arrive or two seconds pass.
+#[cfg(windows)]
+fn query_terminal(queries: &str) -> Option<String> {
+    use crossterm_winapi::{Console, ConsoleMode, Handle, InputRecord};
+    use std::time::{Duration, Instant};
+
+    const PROCESSED_INPUT: u32 = 0x0001;
+    const LINE_INPUT: u32 = 0x0002;
+    const ECHO_INPUT: u32 = 0x0004;
+    const VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+    let handle = Handle::current_in_handle().ok()?;
+    let mode = ConsoleMode::from(handle.clone());
+    let saved = mode.mode().ok()?;
+    mode.set_mode((saved | VIRTUAL_TERMINAL_INPUT) & !(PROCESSED_INPUT | LINE_INPUT | ECHO_INPUT))
+        .ok()?;
+    let console = Console::from(handle);
+
+    let mut reply = String::new();
+    let mut out = io::stdout();
+    let _ = out.write_all(queries.as_bytes());
+    let _ = out.flush();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !ends_with_device_attributes(reply.as_bytes()) {
+        match console.number_of_console_input_events() {
+            Ok(0) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(_) => {
+                let Ok(records) = console.read_console_input() else {
+                    break;
+                };
+                let units: Vec<u16> = records
+                    .into_iter()
+                    .filter_map(|record| match record {
+                        InputRecord::KeyEvent(key) if key.key_down && key.u_char != 0 => {
+                            Some(key.u_char)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                reply.push_str(&String::from_utf16_lossy(&units));
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = mode.set_mode(saved);
+    ends_with_device_attributes(reply.as_bytes()).then_some(reply)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn query_terminal(_queries: &str) -> Option<String> {
+    None
 }
 
 fn ends_with_device_attributes(reply: &[u8]) -> bool {

@@ -250,6 +250,7 @@ dependencies = [
  "chess-protocol",
  "chess-server",
  "crossterm",
+ "crossterm_winapi",
  "futures-util",
  "icy_sixel",
  "image",
