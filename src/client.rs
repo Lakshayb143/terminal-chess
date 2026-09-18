@@ -14,7 +14,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::protocol::{ClientCommand, ClientEnvelope, ServerEnvelope};
+use chess_protocol::{ClientCommand, ClientEnvelope, ServerEnvelope};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);

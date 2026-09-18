@@ -213,7 +213,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 name = "chess"
 version = "0.1.0"
 dependencies = [
- "axum",
+ "chess-core",
+ "chess-protocol",
+ "chess-server",
  "crossterm",
  "futures-util",
  "image",
@@ -225,10 +227,37 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.28.0",
  "toml",
+ "viuer",
+]
+
+[[package]]
+name = "chess-core"
+version = "0.1.0"
+
+[[package]]
+name = "chess-protocol"
+version = "0.1.0"
+dependencies = [
+ "chess-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "chess-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chess-core",
+ "chess-protocol",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
- "viuer",
 ]
 
 [[package]]

@@ -215,6 +215,12 @@ pub struct SavedGame {
     pub agreed_draw: bool,
 }
 
+impl Default for SavedGame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SavedGame {
     pub fn new() -> SavedGame {
         SavedGame {

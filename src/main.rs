@@ -7,21 +7,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::time::Instant;
 
-use chess::board::{self, Color, Move, MoveKind, Piece, PieceKind, Position};
 use chess::client::{OnlineClient, TransportEvent};
-#[cfg(test)]
-use chess::game::GameClock;
-use chess::game::{describe, outcome, outcome_detail, score_tag, Game, Outcome};
 use chess::input::{Action as InputAction, TerminalInput};
-use chess::movegen::{generate_legal, in_check};
-use chess::protocol::{
-    ClientCommand, ErrorCode, FinishReason, GameResult, GameSnapshot, GameStatus, MoveRejection,
-    ServerEvent, Side, TimeControl,
-};
-use chess::san::{parse_move, to_san, to_san_with, ParseError};
-use chess::search::{self, Limits, Search, SearchResult};
 use chess::ui::{self, BoardView, Theme};
-use chess::{eval, sound, storage};
+use chess::{sound, storage};
+use chess_core::board::{self, Color, Move, MoveKind, Piece, PieceKind, Position};
+use chess_core::eval;
+#[cfg(test)]
+use chess_core::game::GameClock;
+use chess_core::game::{describe, outcome, outcome_detail, score_tag, Game, Outcome};
+use chess_core::movegen::{generate_legal, in_check};
+use chess_core::san::{parse_move, to_san, to_san_with, ParseError};
+use chess_core::search::{self, Limits, Search, SearchResult};
+use chess_protocol::{
+    ClientCommand, ErrorCode, FinishReason, GameSnapshot, GameStatus, MoveRejection, ServerEvent,
+    TimeControl,
+};
 
 fn main() {
     let loaded = storage::load_preferences();
@@ -2696,15 +2697,7 @@ fn handle_transport_event(
                 .unwrap_or_else(|| match &session.intent {
                     OnlineIntent::Create => ClientCommand::CreateGame {
                         player_name: session.player_name.clone(),
-                        time_control: TimeControl {
-                            initial_ms: game
-                                .clock
-                                .initial
-                                .map(|time| time.as_millis().min(u64::MAX as u128) as u64)
-                                .unwrap_or(0),
-                            increment_ms: game.clock.increment.as_millis().min(u64::MAX as u128)
-                                as u64,
-                        },
+                        time_control: TimeControl::new(game.clock.initial, game.clock.increment),
                     },
                     OnlineIntent::Join(code) => ClientCommand::JoinGame {
                         invite_code: code.clone(),
@@ -2876,9 +2869,8 @@ fn apply_online_snapshot(
     let first_snapshot = !session.has_snapshot;
     let mut updated = Game::with_clock(
         Position::startpos(),
-        (snapshot.time_control.initial_ms > 0)
-            .then(|| Duration::from_millis(snapshot.time_control.initial_ms)),
-        Duration::from_millis(snapshot.time_control.increment_ms),
+        snapshot.time_control.initial(),
+        snapshot.time_control.increment(),
     );
     for (index, notation) in snapshot.moves.iter().enumerate() {
         let movement = parse_move(&updated.pos, notation).map_err(|_| {
@@ -2895,21 +2887,21 @@ fn apply_online_snapshot(
     let mut remaining = [snapshot.clock.white_ms, snapshot.clock.black_ms];
     if let Some(running) = snapshot.clock.running {
         let elapsed = unix_time_ms().saturating_sub(snapshot.clock.server_time_ms);
-        let index = side_color(running).index();
+        let index = Color::from(running).index();
         remaining[index] = remaining[index].saturating_sub(elapsed);
     }
     let active = matches!(snapshot.status, GameStatus::Active);
     let clock_side = snapshot
         .clock
         .running
-        .map(side_color)
+        .map(Color::from)
         .unwrap_or(updated.pos.side);
     updated.clock.restore(
         remaining,
         clock_side,
         active && snapshot.clock.running.is_some(),
     );
-    updated.draw_offer = snapshot.draw_offer.map(side_color);
+    updated.draw_offer = snapshot.draw_offer.map(Color::from);
     apply_finished_status(&snapshot.status, &mut updated);
     updated.revision = snapshot.revision;
     let revision_changed = updated.revision != previous_revision;
@@ -2952,11 +2944,7 @@ fn apply_finished_status(status: &GameStatus, game: &mut Game) {
     let GameStatus::Finished { result, reason } = status else {
         return;
     };
-    let loser = match result {
-        GameResult::WhiteWins => Some(Color::Black),
-        GameResult::BlackWins => Some(Color::White),
-        GameResult::Draw => None,
-    };
+    let loser = result.loser();
     match reason {
         FinishReason::Resignation => game.resigned = loser,
         FinishReason::Timeout => game.clock.flagged = loser,
@@ -3292,13 +3280,6 @@ fn online_help_lines(theme: &Theme) -> Vec<String> {
         String::new(),
         theme.dim("If the connection drops, this client reconnects and restores your seat."),
     ]
-}
-
-fn side_color(side: Side) -> Color {
-    match side {
-        Side::White => Color::White,
-        Side::Black => Color::Black,
-    }
 }
 
 fn unix_time_ms() -> u64 {
@@ -4429,7 +4410,7 @@ fn set_depth(limits: &mut Limits, screen: &mut Screen, rest: &str) {
         return;
     }
     match rest.parse::<u32>() {
-        Ok(depth) if depth >= 1 && depth <= search::MAX_DEPTH => {
+        Ok(depth) if (1..=search::MAX_DEPTH).contains(&depth) => {
             limits.depth = depth;
             // A depth asked for by name is a depth to reach, not to give up on.
             limits.movetime = None;
@@ -4761,7 +4742,7 @@ fn command_guess(word: &str) -> Option<&'static str> {
     let mut best: Option<(usize, &'static str)> = None;
     for name in names {
         let distance = edit_distance(word, name);
-        if distance <= 2 && best.map_or(true, |(d, _)| distance < d) {
+        if distance <= 2 && best.is_none_or(|(d, _)| distance < d) {
             best = Some((distance, name));
         }
     }
@@ -4829,7 +4810,7 @@ fn help_lines(theme: &Theme) -> Vec<String> {
         theme.bold("COMMANDS"),
     ];
     // Two columns, so the list stays one glance rather than one scroll.
-    let half = (COMMANDS.len() + 1) / 2;
+    let half = COMMANDS.len().div_ceil(2);
     for row in 0..half {
         let mut line = String::new();
         for column in [row, row + half] {
@@ -4964,7 +4945,7 @@ fn history_page(theme: &Theme, game: &Game) -> Vec<String> {
         return vec![theme.dim("No moves played yet.")];
     }
     // Two columns of move pairs, oldest first.
-    let half = (played.len() + 1) / 2;
+    let half = played.len().div_ceil(2);
     (0..half)
         .map(|row| {
             let mut line = String::new();

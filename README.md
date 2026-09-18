@@ -59,7 +59,7 @@ cargo run --release -- online join ABC123 --name Guest
 To install Terminal Chess as a normal command:
 
 ```sh
-cargo install --git https://github.com/Lakshayb143/terminal-chess --locked
+cargo install --git https://github.com/Lakshayb143/terminal-chess --locked chess
 chess
 ```
 
@@ -260,9 +260,19 @@ the game server stays on the private container network.
 ```sh
 cargo test
 cargo clippy --all-targets
-cargo fmt --check
+cargo fmt --all --check
 cargo build --release
 ```
+
+The repository is a Cargo workspace. The root package is the terminal client;
+the other crates are shared by the client and the server:
+
+| Crate | Contents |
+| --- | --- |
+| `chess` (root) | Terminal UI, input, sound, local storage, and the network client |
+| `crates/chess-core` | Rules, notation, evaluation, engine search, and game state; no I/O |
+| `crates/chess-protocol` | Versioned wire messages and their conversions to the game model |
+| `crates/chess-server` | The authoritative room hub and its WebSocket transport |
 
 Contributions and issue reports are welcome. UI reports are most useful when
 they include the terminal application, operating system, window dimensions,

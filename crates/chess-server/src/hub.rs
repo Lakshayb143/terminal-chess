@@ -9,14 +9,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::board::{Color, Position};
-use crate::game::{outcome, Game, Outcome};
-use crate::protocol::{
+use chess_core::board::{Color, Position};
+use chess_core::game::{outcome, Game, Outcome};
+use chess_core::san::parse_move;
+use chess_protocol::{
     ClientCommand, ClientEnvelope, ClockSnapshot, ErrorCode, FinishReason, GameResult,
     GameSnapshot, GameStatus, MoveRejection, PlayerSnapshot, ServerEnvelope, ServerEvent, Side,
     TimeControl, PROTOCOL_VERSION,
 };
-use crate::san::parse_move;
 
 pub type ConnectionId = u64;
 

@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::board::{self, Color, Move, Piece, Position, Square};
+use chess_core::board::{self, Color, Move, Piece, Position, Square};
 
 // ---------------------------------------------------------------------------
 // Palettes

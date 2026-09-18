@@ -155,11 +155,11 @@ fn table_for(kind: PieceKind, endgame: bool) -> &'static [i32; 64] {
 /// 24 in the opening, 0 with only kings and pawns left.
 fn phase_of(counts: &[[u32; 6]; 2]) -> i32 {
     let mut phase = 0i32;
-    for c in 0..2 {
-        phase += counts[c][PieceKind::Knight.index()] as i32;
-        phase += counts[c][PieceKind::Bishop.index()] as i32;
-        phase += counts[c][PieceKind::Rook.index()] as i32 * 2;
-        phase += counts[c][PieceKind::Queen.index()] as i32 * 4;
+    for side in counts {
+        phase += side[PieceKind::Knight.index()] as i32;
+        phase += side[PieceKind::Bishop.index()] as i32;
+        phase += side[PieceKind::Rook.index()] as i32 * 2;
+        phase += side[PieceKind::Queen.index()] as i32 * 4;
     }
     phase.min(24)
 }

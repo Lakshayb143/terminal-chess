@@ -133,7 +133,7 @@ pub fn rank_of(s: Square) -> u8 {
 }
 #[inline]
 pub fn on_board(s: i16) -> bool {
-    s >= 0 && s < 128 && (s & 0x88) == 0
+    (0..128).contains(&s) && (s & 0x88) == 0
 }
 /// Compress a 0x88 square to 0..64 (rank * 8 + file), for tables.
 #[inline]
