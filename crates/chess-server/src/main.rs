@@ -19,6 +19,12 @@ async fn main() {
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|&value| value > 0)
             .unwrap_or(60),
+        database_path: match env::var("CHESS_SERVER_DB") {
+            // An empty value runs a guests-only server with no database.
+            Ok(path) if path.is_empty() => None,
+            Ok(path) => Some(PathBuf::from(path)),
+            Err(_) => Some(PathBuf::from("data/chess.db")),
+        },
     };
     let listener = tokio::net::TcpListener::bind(&address)
         .await

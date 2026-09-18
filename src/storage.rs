@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 const CONFIG_VERSION: u32 = 1;
 const SESSION_VERSION: u32 = 1;
 const ONLINE_SESSION_VERSION: u32 = 1;
+const ACCOUNT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -198,6 +199,67 @@ pub fn load_online_seat(path: &Path) -> Result<SavedOnlineSeat, String> {
         ));
     }
     Ok(seat)
+}
+
+pub fn default_account_path(config: &Path) -> PathBuf {
+    config
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("account.json")
+}
+
+/// The account this computer stays signed in to. Like the online seat, the
+/// file is private: its token signs in without a password.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedAccount {
+    pub version: u32,
+    pub server_url: String,
+    pub username: String,
+    pub session_token: String,
+}
+
+impl SavedAccount {
+    pub fn new(server_url: String, username: String, session_token: String) -> SavedAccount {
+        SavedAccount {
+            version: ACCOUNT_VERSION,
+            server_url,
+            username,
+            session_token,
+        }
+    }
+}
+
+pub fn save_account(path: &Path, account: &SavedAccount) -> Result<(), String> {
+    let text = serde_json::to_vec_pretty(account)
+        .map_err(|error| format!("could not encode account: {error}"))?;
+    atomic_write(path, &text)
+}
+
+/// `Ok(None)` when this computer is not signed in.
+pub fn load_account(path: &Path) -> Result<Option<SavedAccount>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not open {}: {error}", path.display())),
+    };
+    let account: SavedAccount = serde_json::from_str(&text)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if account.version != ACCOUNT_VERSION {
+        return Err(format!(
+            "{} uses unsupported account version {}",
+            path.display(),
+            account.version
+        ));
+    }
+    Ok(Some(account))
+}
+
+pub fn forget_account(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +467,29 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_account_round_trips_and_can_be_forgotten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = default_account_path(&directory.path().join("config.toml"));
+        assert_eq!(load_account(&path).unwrap(), None);
+        let account = SavedAccount::new(
+            "wss://example.com/ws".to_string(),
+            "anna".to_string(),
+            "token".to_string(),
+        );
+        save_account(&path, &account).unwrap();
+        assert_eq!(load_account(&path).unwrap(), Some(account));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "the token must not be readable by others");
+        }
+        forget_account(&path).unwrap();
+        forget_account(&path).unwrap();
+        assert_eq!(load_account(&path).unwrap(), None);
+    }
 
     #[test]
     fn preferences_round_trip_as_readable_toml() {

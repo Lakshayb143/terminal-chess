@@ -7,14 +7,14 @@
 
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use chess_protocol::{ClientCommand, ClientEnvelope, ServerEnvelope};
+use chess_protocol::{ClientCommand, ClientEnvelope, ServerEnvelope, ServerEvent};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -74,6 +74,44 @@ impl OnlineClient {
 
     pub fn try_recv(&self) -> Option<TransportEvent> {
         self.events.try_recv().ok()
+    }
+
+    /// Send `command` and wait for the server's answer, for one-off requests
+    /// such as signing in that happen outside a game. The answer is the next
+    /// event other than a greeting; a server error is an answer too.
+    pub fn request(
+        &self,
+        command: ClientCommand,
+        timeout: Duration,
+    ) -> Result<ServerEvent, String> {
+        self.send(command)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("the server took too long to answer".to_string());
+            }
+            match self
+                .events
+                .recv_timeout(left.min(Duration::from_millis(100)))
+            {
+                Ok(TransportEvent::Message(envelope)) => match envelope.event {
+                    ServerEvent::Welcome { .. } | ServerEvent::Pong => {}
+                    event => return Ok(event),
+                },
+                // A request sent on a dropped connection may never arrive, so
+                // report the failure rather than wait for the retry.
+                Ok(TransportEvent::Disconnected { reason, .. }) => {
+                    return Err(format!("could not reach the server: {reason}"))
+                }
+                Ok(TransportEvent::Stopped(reason)) => return Err(reason),
+                Ok(TransportEvent::Connecting { .. } | TransportEvent::Connected) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("the network worker has stopped".to_string())
+                }
+            }
+        }
     }
 }
 

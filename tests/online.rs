@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use chess::client::{OnlineClient, TransportEvent};
 use chess_protocol::{
-    ClientCommand, FinishReason, GameResult, GameSnapshot, GameStatus, ServerEvent, TimeControl,
+    ClientCommand, ErrorCode, FinishReason, GameResult, GameSnapshot, GameStatus, ServerEvent,
+    TimeControl,
 };
 use tokio::sync::oneshot;
 
@@ -22,6 +23,7 @@ impl Server {
         let config = chess_server::Config {
             state_path: state.to_path_buf(),
             requests_per_window: 60,
+            database_path: Some(state.with_file_name("chess.db")),
         };
         let (shutdown, stop) = oneshot::channel::<()>();
         let (bound, address) = std::sync::mpsc::channel();
@@ -82,6 +84,162 @@ fn updated_to_ply(client: &OnlineClient, ply: usize) -> GameSnapshot {
         ServerEvent::MoveRejected { reason, .. } => panic!("move rejected: {reason:?}"),
         _ => None,
     })
+}
+
+/// Create a game as White and have a second client join it as Black.
+fn start_game(white: &OnlineClient, black: &OnlineClient, black_name: &str) -> GameSnapshot {
+    white
+        .send(ClientCommand::CreateGame {
+            player_name: "ignored for accounts".to_string(),
+            time_control: TimeControl {
+                initial_ms: 60_000,
+                increment_ms: 0,
+            },
+        })
+        .unwrap();
+    let invite_code = expect(white, |event| match event {
+        ServerEvent::GameCreated { invite_code, .. } => Some(invite_code),
+        _ => None,
+    });
+    black
+        .send(ClientCommand::JoinGame {
+            invite_code,
+            player_name: black_name.to_string(),
+        })
+        .unwrap();
+    expect(black, |event| match event {
+        ServerEvent::GameJoined { game, .. } => Some(game),
+        _ => None,
+    })
+}
+
+fn play_fools_mate(white: &OnlineClient, black: &OnlineClient, game_id: &str) {
+    let moves = [
+        (white, "f2f3"),
+        (black, "e7e5"),
+        (white, "g2g4"),
+        (black, "d8h4"),
+    ];
+    for (ply, (client, uci)) in moves.into_iter().enumerate() {
+        client
+            .send(ClientCommand::PlayMove {
+                game_id: game_id.to_string(),
+                expected_ply: ply as u32,
+                uci: uci.to_string(),
+            })
+            .unwrap();
+        updated_to_ply(white, ply + 1);
+        updated_to_ply(black, ply + 1);
+    }
+}
+
+fn error_code(client: &OnlineClient) -> ErrorCode {
+    expect(client, |event| match event {
+        ServerEvent::Error { code, .. } => Some(code),
+        _ => None,
+    })
+}
+
+#[test]
+fn an_account_keeps_its_games_across_connections() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server::start(&directory.path().join("server-state.json"));
+
+    let white = OnlineClient::connect(server.url());
+    white
+        .send(ClientCommand::Register {
+            username: "Ada".to_string(),
+            password: "analytical engine".to_string(),
+        })
+        .unwrap();
+    let token = expect(&white, |event| match event {
+        ServerEvent::SignedIn {
+            account,
+            session_token,
+        } => {
+            assert_eq!(account.username, "Ada");
+            session_token
+        }
+        _ => None,
+    });
+
+    let black = OnlineClient::connect(server.url());
+    black
+        .send(ClientCommand::Register {
+            username: "ada".to_string(),
+            password: "someone else".to_string(),
+        })
+        .unwrap();
+    assert_eq!(error_code(&black), ErrorCode::UsernameTaken);
+    black
+        .send(ClientCommand::LogIn {
+            username: "ada".to_string(),
+            password: "wrong password".to_string(),
+        })
+        .unwrap();
+    assert_eq!(error_code(&black), ErrorCode::InvalidCredentials);
+    black.send(ClientCommand::ListGames { limit: 5 }).unwrap();
+    assert_eq!(error_code(&black), ErrorCode::NotSignedIn);
+
+    // Black stays a guest; White plays under the account's username.
+    let game = start_game(&white, &black, "Grace");
+    assert_eq!(game.white.name, "Ada");
+    assert!(game.white.registered);
+    assert!(!game.black.registered);
+    play_fools_mate(&white, &black, &game.game_id);
+    drop(white);
+    drop(black);
+
+    // A new connection signs in with the saved token alone.
+    let returning = OnlineClient::connect(server.url());
+    returning
+        .send(ClientCommand::Authenticate {
+            session_token: token.clone(),
+        })
+        .unwrap();
+    let username = expect(&returning, |event| match event {
+        ServerEvent::SignedIn {
+            account,
+            session_token: None,
+        } => Some(account.username),
+        _ => None,
+    });
+    assert_eq!(username, "Ada");
+    // Finished games are recorded on the next clock tick.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let games = loop {
+        returning
+            .send(ClientCommand::ListGames { limit: 5 })
+            .unwrap();
+        let games = expect(&returning, |event| match event {
+            ServerEvent::GameList { games } => Some(games),
+            _ => None,
+        });
+        if !games.is_empty() || Instant::now() > deadline {
+            break games;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(games.len(), 1);
+    assert_eq!(games[0].game_id, game.game_id);
+    assert_eq!(games[0].black.name, "Grace");
+    assert_eq!(games[0].result, GameResult::BlackWins);
+    assert_eq!(games[0].reason, FinishReason::Checkmate);
+    assert_eq!(games[0].moves, ["f2f3", "e7e5", "g2g4", "d8h4"]);
+
+    returning.send(ClientCommand::LogOut).unwrap();
+    expect(&returning, |event| {
+        matches!(event, ServerEvent::SignedOut).then_some(())
+    });
+    returning
+        .send(ClientCommand::Authenticate {
+            session_token: token,
+        })
+        .unwrap();
+    assert_eq!(error_code(&returning), ErrorCode::InvalidSession);
+
+    drop(returning);
+    server.stop();
 }
 
 #[test]

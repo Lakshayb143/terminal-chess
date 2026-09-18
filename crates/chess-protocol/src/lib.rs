@@ -6,8 +6,11 @@ use chess_core::board::Color;
 use chess_core::game::Outcome;
 use serde::{Deserialize, Serialize};
 
-/// Increment this only for a breaking wire-format or behavior change.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// The version this build speaks. Version 3 added accounts and game history.
+pub const PROTOCOL_VERSION: u16 = 3;
+/// The oldest version a server still accepts. Version 3 only added commands
+/// and optional fields, so version 2 guests keep working unchanged.
+pub const MIN_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientEnvelope {
@@ -62,6 +65,29 @@ pub enum ClientCommand {
         game_id: String,
     },
     Ping,
+    /// Create an account and sign this connection in to it.
+    Register {
+        username: String,
+        password: String,
+    },
+    LogIn {
+        username: String,
+        password: String,
+    },
+    /// Sign in with a session token from an earlier `SignedIn`.
+    Authenticate {
+        session_token: String,
+    },
+    /// Sign out and revoke this connection's session token.
+    LogOut,
+    /// The signed-in player's most recent finished games, newest first.
+    ListGames {
+        limit: u32,
+    },
+    /// Let the SSH key behind `ticket` sign in to the current account.
+    LinkSshKey {
+        ticket: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +146,45 @@ pub enum ServerEvent {
         message: String,
     },
     Pong,
+    /// The connection is signed in. `session_token` is only sent when a new
+    /// session was created, after registering or logging in.
+    SignedIn {
+        account: Account,
+        session_token: Option<String>,
+    },
+    SignedOut,
+    GameList {
+        games: Vec<GameRecord>,
+    },
+    SshKeyLinked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub username: String,
+    pub created_at_ms: u64,
+}
+
+/// A finished game as it is kept in the player's history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameRecord {
+    pub game_id: String,
+    pub white: RecordedPlayer,
+    pub black: RecordedPlayer,
+    pub time_control: TimeControl,
+    /// Every move in coordinate notation, from the starting position.
+    pub moves: Vec<String>,
+    pub result: GameResult,
+    pub reason: FinishReason,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedPlayer {
+    pub name: String,
+    /// Whether `name` is an account's username rather than a guest's choice.
+    pub registered: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +213,9 @@ pub struct GameSnapshot {
 pub struct PlayerSnapshot {
     pub name: String,
     pub connected: bool,
+    /// Whether `name` is an account's username rather than a guest's choice.
+    #[serde(default)]
+    pub registered: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +286,15 @@ pub enum ErrorCode {
     InvalidReconnectToken,
     RateLimited,
     Internal,
+    UsernameTaken,
+    /// The username or password was wrong. Which one is never said.
+    InvalidCredentials,
+    /// The session token has expired or been revoked; sign in again.
+    InvalidSession,
+    /// The command needs a signed-in account.
+    NotSignedIn,
+    /// Accounts are not enabled on this server.
+    AccountsUnavailable,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +407,25 @@ mod tests {
     }
 
     #[test]
+    fn version_2_snapshots_without_the_registered_flag_still_parse() {
+        let json = r#"{"name":"Guest","connected":true}"#;
+        let player: PlayerSnapshot = serde_json::from_str(json).unwrap();
+        assert!(!player.registered);
+    }
+
+    #[test]
+    fn account_commands_use_snake_case_tags() {
+        let json = serde_json::to_value(ClientCommand::LogIn {
+            username: "magnus".to_string(),
+            password: "hunter22".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "log_in");
+        let json = serde_json::to_value(ClientCommand::LogOut).unwrap();
+        assert_eq!(json["type"], "log_out");
+    }
+
+    #[test]
     fn every_outcome_maps_to_the_matching_result() {
         use chess_core::board::Color::{Black, White};
         let cases = [
@@ -415,10 +511,12 @@ mod tests {
             white: PlayerSnapshot {
                 name: "White".to_string(),
                 connected: true,
+                registered: true,
             },
             black: PlayerSnapshot {
                 name: "Black".to_string(),
                 connected: false,
+                registered: false,
             },
             clock: ClockSnapshot {
                 white_ms: 299_000,

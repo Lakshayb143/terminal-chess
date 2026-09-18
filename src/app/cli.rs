@@ -37,6 +37,8 @@ impl Mode {
 pub(crate) enum StartChoice {
     Mode(Mode),
     Resume,
+    /// Play online, under the given name if not signed in.
+    Online(OnlineIntent, String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

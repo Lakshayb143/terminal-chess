@@ -6,6 +6,7 @@ services:
     environment:
       CHESS_SERVER_ADDR: 0.0.0.0:3000
       CHESS_SERVER_STATE: /var/lib/terminal-chess/server-state.json
+      CHESS_SERVER_DB: /var/lib/terminal-chess/chess.db
       CHESS_RATE_LIMIT_PER_10S: ${CHESS_RATE_LIMIT_PER_10S:-60}
       CHESS_LOG_FORMAT: json
       RUST_LOG: ${RUST_LOG:-chess_server=info}

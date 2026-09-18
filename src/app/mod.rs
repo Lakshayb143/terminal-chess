@@ -2,6 +2,7 @@
 //! local and online game loops. Chess rules live in `chess-core`; this module
 //! only presents them and turns input into game actions.
 
+pub(crate) mod account;
 pub(crate) mod actions;
 pub(crate) mod cli;
 pub(crate) mod format;

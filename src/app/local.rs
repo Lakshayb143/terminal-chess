@@ -11,6 +11,7 @@ use chess_core::eval;
 use chess_core::game::{outcome, Game};
 use chess_core::search::Search;
 
+use crate::app::account::AccountContext;
 use crate::app::actions::{
     confirm_new, engine_move, handle_board_click, handle_ui_action, hint, make_move,
     play_promotion, set_depth, set_pieces, set_size, set_sound, set_theme, set_time, split_command,
@@ -30,7 +31,7 @@ use crate::app::screen::{Screen, UiAction};
 
 pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), String> {
     if options.online.is_some() {
-        return play_online(options, loaded);
+        return play_online(options, loaded.path, loaded.preferences);
     }
     let config_path = loaded.path;
     let session_path = storage::default_session_path(&config_path);
@@ -72,13 +73,28 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
             let mut stdin = io::stdin().lock();
             let choice = match options.mode {
                 Some(mode) => StartChoice::Mode(mode),
-                None => match ask_mode(&mut stdin, &mut screen, session_path.exists())? {
-                    Some(choice) => choice,
-                    None => return Ok(()),
-                },
+                None => {
+                    let mut account = AccountContext::load(
+                        &config_path,
+                        &options.server_url,
+                        options.online_name.clone(),
+                    );
+                    match ask_mode(&mut stdin, &mut screen, session_path.exists(), &mut account)? {
+                        Some(choice) => choice,
+                        None => return Ok(()),
+                    }
+                }
             };
             drop(stdin);
             match choice {
+                StartChoice::Online(intent, name) => {
+                    // The online game sets up its own screen.
+                    drop(_fullscreen);
+                    let mut options = options;
+                    options.online = Some(intent);
+                    options.online_name = name;
+                    return play_online(options, config_path, last_preferences);
+                }
                 StartChoice::Mode(mode) => (
                     Game::with_clock(
                         start.expect("new games have a starting position"),
