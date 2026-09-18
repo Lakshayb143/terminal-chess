@@ -29,8 +29,8 @@ A Cargo workspace. Dependencies only point downwards: `chess-core` has no I/O, `
 
 - `crates/chess-core`: `board` is the base, `movegen` depends on it, `san` and `eval` depend on both, `search` owns engine search, and `game` holds UI-independent game state and outcomes. `tests/rules.rs` has perft, hashing, and notation round-trip tests; run them after touching move generation.
 - `crates/chess-protocol`: wire messages plus `From` conversions (`Color`↔`Side`, `Outcome`→`GameStatus`, `TimeControl`↔`Duration`). Add conversions here rather than in the client or server.
-- `crates/chess-server`: `hub` owns rooms, seats, clocks, and persistence and never touches a socket; `main.rs` is the axum transport.
-- Root package: `ui` owns terminal rendering and layout, `client` the WebSocket transport, `storage` local files, and `main.rs` the application loop.
+- `crates/chess-server`: `hub` owns rooms, seats, clocks, eviction, and persistence and never touches a socket; `server` is the axum transport; `main.rs` only reads the environment.
+- Root package: `ui` owns terminal rendering and layout, `client` the WebSocket transport, `storage` local files, and `main.rs` the application loop. `tests/online.rs` runs a real server in-process against two clients.
 
 **`src/ui.rs`: terminal presentation**
 - `Metrics` fits the board to the current terminal dimensions.

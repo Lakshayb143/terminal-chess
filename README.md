@@ -240,8 +240,10 @@ cargo run --bin chess-server
 ```
 
 It listens on `127.0.0.1:3000` by default and exposes `/health` and `/ws`.
-Active games are atomically saved to `data/server-state.json`. The following
-environment variables configure it:
+Active games are atomically saved to `data/server-state.json` whenever a move,
+join, or result changes them. Finished games are kept for 10 minutes so both
+players can see the result, and rooms nobody has been connected to for 30
+minutes are discarded. The following environment variables configure it:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

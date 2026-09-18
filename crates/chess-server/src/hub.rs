@@ -10,17 +10,21 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use chess_core::board::{Color, Position};
-use chess_core::game::{outcome, Game, Outcome};
+use chess_core::game::{outcome, Game};
 use chess_core::san::parse_move;
 use chess_protocol::{
-    ClientCommand, ClientEnvelope, ClockSnapshot, ErrorCode, FinishReason, GameResult,
-    GameSnapshot, GameStatus, MoveRejection, PlayerSnapshot, ServerEnvelope, ServerEvent, Side,
-    TimeControl, PROTOCOL_VERSION,
+    ClientCommand, ClientEnvelope, ClockSnapshot, ErrorCode, GameSnapshot, GameStatus,
+    MoveRejection, PlayerSnapshot, ServerEnvelope, ServerEvent, Side, TimeControl,
+    PROTOCOL_VERSION,
 };
 
 pub type ConnectionId = u64;
 
 const RECONNECT_GRACE: Duration = Duration::from_secs(60);
+/// How long a finished game stays reachable so both players can see the result.
+const FINISHED_RETENTION: Duration = Duration::from_secs(10 * 60);
+/// How long a room with nobody connected is kept before it is discarded.
+const IDLE_ROOM_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_NAME_CHARS: usize = 32;
 const MAX_INITIAL_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_INCREMENT_MS: u64 = 60 * 60 * 1_000;
@@ -52,7 +56,8 @@ struct Room {
     game: Game,
     white: PlayerSlot,
     black: Option<PlayerSlot>,
-    abandoned: Option<Color>,
+    /// When the server first saw the game finished; drives eviction.
+    finished_at: Option<Instant>,
 }
 
 impl Room {
@@ -79,7 +84,29 @@ impl Room {
     }
 
     fn is_active(&self) -> bool {
-        self.black.is_some() && self.abandoned.is_none() && outcome(&self.game).is_none()
+        self.black.is_some() && outcome(&self.game).is_none()
+    }
+
+    fn players(&self) -> impl Iterator<Item = &PlayerSlot> {
+        [Some(&self.white), self.black.as_ref()]
+            .into_iter()
+            .flatten()
+    }
+
+    /// Whether the room has served its purpose and can be dropped at `now`.
+    fn expired(&self, now: Instant) -> bool {
+        if self
+            .finished_at
+            .is_some_and(|since| now.duration_since(since) >= FINISHED_RETENTION)
+        {
+            return true;
+        }
+        self.players().all(|player| {
+            player.connection.is_none()
+                && player
+                    .disconnected_at
+                    .is_some_and(|since| now.duration_since(since) >= IDLE_ROOM_TTL)
+        })
     }
 }
 
@@ -134,12 +161,10 @@ impl Hub {
         let downtime_ms = unix_time_ms().saturating_sub(stored.saved_at_ms);
         let mut hub = Hub::new();
         for saved in stored.rooms {
-            let initial = (saved.time_control.initial_ms > 0)
-                .then(|| Duration::from_millis(saved.time_control.initial_ms));
             let mut game = Game::with_clock(
                 Position::startpos(),
-                initial,
-                Duration::from_millis(saved.time_control.increment_ms),
+                saved.time_control.initial(),
+                saved.time_control.increment(),
             );
             for (index, notation) in saved.moves.iter().enumerate() {
                 let movement = parse_move(&game.pos, notation).map_err(|_| {
@@ -153,22 +178,22 @@ impl Hub {
             }
             let mut remaining = saved.remaining_ms;
             if let Some(running) = saved.running {
-                let index = color(running).index();
+                let index = Color::from(running).index();
                 remaining[index] = remaining[index].saturating_sub(downtime_ms);
             }
             let running = saved.running.is_some() && remaining.iter().all(|&time| time > 0);
             game.clock.restore(remaining, game.pos.side, running);
             if let Some(running_side) = saved.running {
-                let running_color = color(running_side);
+                let running_color = Color::from(running_side);
                 if remaining[running_color.index()] == 0 && game.clock.initial.is_some() {
                     game.clock.flagged = Some(running_color);
                     game.clock.running = None;
                 }
             }
-            game.resigned = saved.resigned.map(color);
-            game.draw_offer = saved.draw_offer.map(color);
+            game.resigned = saved.resigned.map(Color::from);
+            game.draw_offer = saved.draw_offer.map(Color::from);
             game.agreed_draw = saved.agreed_draw;
-            game.abandoned = saved.abandoned.map(color);
+            game.abandoned = saved.abandoned.map(Color::from);
             game.revision = saved.revision;
 
             let disconnected_at = Some(now);
@@ -178,7 +203,7 @@ impl Hub {
                 game,
                 white: saved.white.restore(disconnected_at),
                 black: saved.black.map(|player| player.restore(disconnected_at)),
-                abandoned: saved.abandoned.map(color),
+                finished_at: None,
             };
             hub.invites.insert(saved.invite_code, saved.game_id.clone());
             hub.rooms.insert(saved.game_id, room);
@@ -186,28 +211,49 @@ impl Hub {
         Ok(hub)
     }
 
-    /// Atomically save every room, including reconnect credentials. The file
-    /// is private on Unix because possession of a token grants a player's seat.
+    /// Atomically save every room, including reconnect credentials.
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
+        let bytes = self.encode()?;
+        write_state(path, &bytes)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Encode the durable state if it changed since the last successful call.
+    ///
+    /// Encoding is cheap and happens under the hub lock; the caller writes the
+    /// bytes with [`write_state`] after releasing it, and calls
+    /// [`Hub::mark_dirty`] if that write fails so the next attempt retries.
+    pub fn encode_if_dirty(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if !self.dirty {
+            return Ok(None);
+        }
+        let bytes = self.encode()?;
+        self.dirty = false;
+        Ok(Some(bytes))
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn encode(&mut self) -> Result<Vec<u8>, String> {
         let saved_at_ms = unix_time_ms();
         let rooms = self
             .rooms
             .values_mut()
             .map(PersistedRoom::capture)
             .collect();
-        let text = serde_json::to_vec_pretty(&PersistedHub {
+        serde_json::to_vec(&PersistedHub {
             version: STATE_VERSION,
             saved_at_ms,
             rooms,
         })
-        .map_err(|error| format!("could not encode server state: {error}"))?;
-        atomic_write(path, &text)?;
-        self.dirty = false;
-        Ok(())
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
+        .map_err(|error| format!("could not encode server state: {error}"))
     }
 
     pub fn connect(&mut self) -> ConnectionId {
@@ -295,7 +341,6 @@ impl Hub {
         let Some(membership) = self.memberships.remove(&connection) else {
             return Vec::new();
         };
-        self.dirty = true;
         let now = Instant::now();
         let deadline = unix_time_ms().saturating_add(RECONNECT_GRACE.as_millis() as u64);
         let (targets, game_id) = {
@@ -326,14 +371,21 @@ impl Hub {
             .collect()
     }
 
-    /// Advance clocks and enforce the reconnect grace period.
+    /// Advance clocks, enforce the reconnect grace period, and discard rooms
+    /// that are finished or have been left empty.
     pub fn tick(&mut self) -> Vec<Delivery> {
-        let now = Instant::now();
+        self.tick_at(Instant::now())
+    }
+
+    fn tick_at(&mut self, now: Instant) -> Vec<Delivery> {
         let mut updates = Vec::new();
 
         for room in self.rooms.values_mut() {
+            let was_active = room.is_active();
+            // A clock-only change is re-derived on restore from the saved
+            // remaining time, so it is broadcast but not persisted.
             let mut changed = room.game.clock.tick();
-            if room.is_active() {
+            if was_active {
                 for side in [Color::White, Color::Black] {
                     let expired = room
                         .player(side)
@@ -343,7 +395,7 @@ impl Hub {
                         .player(side.flip())
                         .is_some_and(|player| player.connection.is_some());
                     if expired && opponent_online {
-                        room.abandoned = Some(side);
+                        room.game.abandoned = Some(side);
                         room.game.clock.pause();
                         room.game.changed();
                         changed = true;
@@ -351,14 +403,15 @@ impl Hub {
                     }
                 }
             }
+            if room.black.is_some() && room.finished_at.is_none() && !room.is_active() {
+                room.finished_at = Some(now);
+                self.dirty |= was_active;
+            }
             if changed {
                 updates.push((room.targets(), snapshot(room)));
             }
         }
-
-        if !updates.is_empty() {
-            self.dirty = true;
-        }
+        self.evict_expired(now);
 
         let mut deliveries = Vec::new();
         for (targets, game) in updates {
@@ -371,6 +424,26 @@ impl Hub {
             }
         }
         deliveries
+    }
+
+    fn evict_expired(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .rooms
+            .values()
+            .filter(|room| room.expired(now))
+            .map(|room| room.game_id.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for game_id in &expired {
+            if let Some(room) = self.rooms.remove(game_id) {
+                self.invites.remove(&room.invite_code);
+            }
+        }
+        self.memberships
+            .retain(|_, membership| !expired.contains(&membership.game_id));
+        self.dirty = true;
     }
 
     fn create_game(
@@ -412,12 +485,10 @@ impl Hub {
         let game_id = Uuid::new_v4().to_string();
         let invite_code = self.unique_invite_code();
         let reconnect_token = Uuid::new_v4().to_string();
-        let initial =
-            (time_control.initial_ms > 0).then(|| Duration::from_millis(time_control.initial_ms));
         let mut game = Game::with_clock(
             Position::startpos(),
-            initial,
-            Duration::from_millis(time_control.increment_ms),
+            time_control.initial(),
+            time_control.increment(),
         );
         game.clock.pause();
         let room = Room {
@@ -431,7 +502,7 @@ impl Hub {
                 disconnected_at: None,
             },
             black: None,
-            abandoned: None,
+            finished_at: None,
         };
         self.invites.insert(invite_code.clone(), game_id.clone());
         self.memberships.insert(
@@ -561,7 +632,7 @@ impl Hub {
             };
             let side = [Color::White, Color::Black].into_iter().find(|&side| {
                 room.player(side)
-                    .is_some_and(|player| player.reconnect_token == reconnect_token)
+                    .is_some_and(|player| tokens_match(&player.reconnect_token, reconnect_token))
             });
             let Some(side) = side else {
                 return self.direct_error(
@@ -879,25 +950,17 @@ fn snapshot(room: &mut Room) -> GameSnapshot {
             .map(|undo| undo.mv.to_uci())
             .collect(),
         last_move: room.game.last_move().map(|movement| movement.to_uci()),
-        side_to_move: side(room.game.pos.side),
-        time_control: TimeControl {
-            initial_ms: room
-                .game
-                .clock
-                .initial
-                .map(|time| time.as_millis().min(u64::MAX as u128) as u64)
-                .unwrap_or(0),
-            increment_ms: room.game.clock.increment.as_millis().min(u64::MAX as u128) as u64,
-        },
+        side_to_move: room.game.pos.side.into(),
+        time_control: time_control(&room.game),
         white: player_snapshot(Some(&room.white)),
         black: player_snapshot(room.black.as_ref()),
         clock: ClockSnapshot {
             white_ms: remaining[Color::White.index()],
             black_ms: remaining[Color::Black.index()],
-            running: room.game.clock.running.map(|(color, _)| side(color)),
+            running: room.game.clock.running.map(|(color, _)| color.into()),
             server_time_ms: unix_time_ms(),
         },
-        draw_offer: room.game.draw_offer.map(side),
+        draw_offer: room.game.draw_offer.map(Side::from),
         status,
     }
 }
@@ -913,52 +976,11 @@ fn room_status(room: &Room) -> GameStatus {
     if room.black.is_none() {
         return GameStatus::WaitingForOpponent;
     }
-    if let Some(loser) = room.abandoned {
-        return finished(loser.flip(), FinishReason::Abandonment);
-    }
-    match outcome(&room.game) {
-        Some(Outcome::Checkmate(winner)) => finished(winner, FinishReason::Checkmate),
-        Some(Outcome::Resignation(loser)) => finished(loser.flip(), FinishReason::Resignation),
-        Some(Outcome::Timeout(loser)) => finished(loser.flip(), FinishReason::Timeout),
-        Some(Outcome::Abandonment(loser)) => finished(loser.flip(), FinishReason::Abandonment),
-        Some(Outcome::DrawAgreement) => drawn(FinishReason::DrawAgreement),
-        Some(Outcome::Stalemate) => drawn(FinishReason::Stalemate),
-        Some(Outcome::FiftyMove) => drawn(FinishReason::FiftyMove),
-        Some(Outcome::Threefold) => drawn(FinishReason::Threefold),
-        Some(Outcome::Insufficient) => drawn(FinishReason::InsufficientMaterial),
-        None => GameStatus::Active,
-    }
+    outcome(&room.game).map_or(GameStatus::Active, GameStatus::from)
 }
 
-fn finished(winner: Color, reason: FinishReason) -> GameStatus {
-    GameStatus::Finished {
-        result: match winner {
-            Color::White => GameResult::WhiteWins,
-            Color::Black => GameResult::BlackWins,
-        },
-        reason,
-    }
-}
-
-fn drawn(reason: FinishReason) -> GameStatus {
-    GameStatus::Finished {
-        result: GameResult::Draw,
-        reason,
-    }
-}
-
-fn side(color: Color) -> Side {
-    match color {
-        Color::White => Side::White,
-        Color::Black => Side::Black,
-    }
-}
-
-fn color(side: Side) -> Color {
-    match side {
-        Side::White => Color::White,
-        Side::Black => Color::Black,
-    }
+fn time_control(game: &Game) -> TimeControl {
+    TimeControl::new(game.clock.initial, game.clock.increment)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -998,23 +1020,15 @@ impl PersistedRoom {
                 .iter()
                 .map(|undo| undo.mv.to_uci())
                 .collect(),
-            time_control: TimeControl {
-                initial_ms: room
-                    .game
-                    .clock
-                    .initial
-                    .map(|time| time.as_millis().min(u64::MAX as u128) as u64)
-                    .unwrap_or(0),
-                increment_ms: room.game.clock.increment.as_millis().min(u64::MAX as u128) as u64,
-            },
+            time_control: time_control(&room.game),
             remaining_ms,
-            running: room.game.clock.running.map(|(color, _)| side(color)),
+            running: room.game.clock.running.map(|(color, _)| color.into()),
             white: PersistedPlayer::capture(&room.white),
             black: room.black.as_ref().map(PersistedPlayer::capture),
-            resigned: room.game.resigned.map(side),
-            draw_offer: room.game.draw_offer.map(side),
+            resigned: room.game.resigned.map(Side::from),
+            draw_offer: room.game.draw_offer.map(Side::from),
             agreed_draw: room.game.agreed_draw,
-            abandoned: room.abandoned.map(side),
+            abandoned: room.game.abandoned.map(Side::from),
         }
     }
 }
@@ -1043,7 +1057,21 @@ impl PersistedPlayer {
     }
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Compare secrets without an early exit that would leak how many leading
+/// characters of a guessed token were correct.
+fn tokens_match(stored: &str, offered: &str) -> bool {
+    let (stored, offered) = (stored.as_bytes(), offered.as_bytes());
+    stored.len() == offered.len()
+        && stored
+            .iter()
+            .zip(offered)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
+/// Atomically replace the server state file. It is private on Unix because
+/// possession of a reconnect token grants a player's seat.
+pub fn write_state(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             format!(
@@ -1087,6 +1115,8 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chess_core::game::Outcome;
+    use chess_protocol::{FinishReason, GameResult};
 
     fn create(hub: &mut Hub, connection: ConnectionId) -> (String, String, String) {
         let response = hub.handle(
@@ -1386,5 +1416,121 @@ mod tests {
                 }
             ));
         }
+    }
+
+    fn resign(hub: &mut Hub, connection: ConnectionId, game_id: &str) {
+        hub.handle(
+            connection,
+            ClientEnvelope::new(
+                9,
+                ClientCommand::Resign {
+                    game_id: game_id.to_string(),
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn clock_ticks_are_broadcast_but_not_persisted() {
+        let mut hub = Hub::new();
+        let white = hub.connect();
+        let black = hub.connect();
+        let (code, _, _) = create(&mut hub, white);
+        join(&mut hub, black, &code);
+        assert!(hub.encode_if_dirty().unwrap().is_some());
+
+        let later = Instant::now() + Duration::from_secs(2);
+        std::thread::sleep(Duration::from_millis(1_100));
+        let updates = hub.tick_at(later);
+
+        assert!(!updates.is_empty(), "the running clock is broadcast");
+        assert!(hub.encode_if_dirty().unwrap().is_none());
+    }
+
+    #[test]
+    fn finished_games_are_evicted_after_the_retention_period() {
+        let mut hub = Hub::new();
+        let white = hub.connect();
+        let black = hub.connect();
+        let (code, white_token, game_id) = create(&mut hub, white);
+        join(&mut hub, black, &code);
+        resign(&mut hub, white, &game_id);
+
+        let now = Instant::now();
+        hub.tick_at(now);
+        assert!(hub.rooms.contains_key(&game_id), "result stays visible");
+        hub.encode_if_dirty().unwrap();
+
+        hub.tick_at(now + FINISHED_RETENTION);
+        assert!(hub.rooms.is_empty());
+        assert!(hub.invites.is_empty());
+        assert!(hub.memberships.is_empty());
+        assert!(hub.is_dirty(), "eviction is persisted");
+
+        let returning = hub.connect();
+        let events = hub.handle(
+            returning,
+            ClientEnvelope::new(
+                10,
+                ClientCommand::Reconnect {
+                    game_id,
+                    reconnect_token: white_token,
+                },
+            ),
+        );
+        assert!(matches!(
+            events[0].message.event,
+            ServerEvent::Error {
+                code: ErrorCode::GameNotFound,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rooms_left_empty_are_evicted_but_occupied_rooms_are_kept() {
+        let mut hub = Hub::new();
+        let abandoned_creator = hub.connect();
+        let waiting_creator = hub.connect();
+        let (_, _, empty_id) = create(&mut hub, abandoned_creator);
+        let (_, _, waiting_id) = create(&mut hub, waiting_creator);
+        hub.disconnect(abandoned_creator);
+
+        let now = Instant::now();
+        hub.tick_at(now + IDLE_ROOM_TTL - Duration::from_secs(1));
+        assert!(hub.rooms.contains_key(&empty_id));
+
+        hub.tick_at(now + IDLE_ROOM_TTL + Duration::from_secs(1));
+        assert!(!hub.rooms.contains_key(&empty_id));
+        assert!(hub.rooms.contains_key(&waiting_id));
+    }
+
+    #[test]
+    fn abandonment_is_recorded_on_the_game_and_survives_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rooms.json");
+        let mut hub = Hub::new();
+        let white = hub.connect();
+        let black = hub.connect();
+        let (code, _, game_id) = create(&mut hub, white);
+        join(&mut hub, black, &code);
+        hub.disconnect(black);
+        hub.tick_at(Instant::now() + RECONNECT_GRACE);
+        hub.save(&path).unwrap();
+
+        let restored = Hub::load(&path).unwrap();
+        let room = &restored.rooms[&game_id];
+        assert_eq!(
+            outcome(&room.game),
+            Some(Outcome::Abandonment(Color::Black))
+        );
+    }
+
+    #[test]
+    fn token_comparison_requires_an_exact_match() {
+        assert!(tokens_match("abc-123", "abc-123"));
+        assert!(!tokens_match("abc-123", "abc-124"));
+        assert!(!tokens_match("abc-123", "abc-12"));
+        assert!(!tokens_match("abc", ""));
     }
 }
