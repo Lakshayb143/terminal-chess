@@ -1,0 +1,7 @@
+[package]
+name = "chess-core"
+version.workspace = true
+edition.workspace = true
+description = "Chess rules, notation, engine search, and UI-independent game state"
+
+[dependencies]

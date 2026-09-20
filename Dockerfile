@@ -1,20 +1,18 @@
 FROM rust:1.90-bookworm AS builder
 
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends \
-        clang cmake libasound2-dev pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
+# The server crate is pure Rust; the terminal client's audio and image
+# dependencies are workspace members but are never compiled here.
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY assets ./assets
-RUN cargo build --locked --release --bin chess-server
+COPY crates ./crates
+RUN cargo build --locked --release --package chess-server
 
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libasound2 \
+    && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system chess \
     && useradd --system --gid chess --home-dir /var/lib/terminal-chess chess \

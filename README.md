@@ -19,8 +19,8 @@ engine, or against another person over the network.
 - Use SAN (`Nf3`, `exd5`, `O-O`) or coordinate notation (`e2e4`) at any time.
 - Get a responsive layout with player panels, clocks, captured pieces, material
   advantage, move history, and clear game-over states.
-- Render crisp vector-derived pieces through iTerm2 and Kitty image protocols,
-  with true-colour and Unicode fallbacks for other terminals.
+- Render crisp vector-derived pieces through the iTerm2, Kitty, and sixel image
+  protocols, with true-colour and Unicode fallbacks for other terminals.
 - Hear distinct sounds for moves, captures, checks, castling, promotions, and
   game endings.
 - Choose between four board themes and several piece-rendering modes.
@@ -59,7 +59,7 @@ cargo run --release -- online join ABC123 --name Guest
 To install Terminal Chess as a normal command:
 
 ```sh
-cargo install --git https://github.com/Lakshayb143/terminal-chess --locked
+cargo install --git https://github.com/Lakshayb143/terminal-chess --locked chess
 chess
 ```
 
@@ -146,7 +146,7 @@ The default `auto` mode selects the best renderer available:
 
 | Command | Rendering mode |
 | --- | --- |
-| `pieces auto` | High-resolution inline images when supported, with a safe fallback |
+| `pieces auto` | High-resolution inline images (iTerm2, Kitty, or sixel) when supported, with a safe fallback |
 | `pieces art` | Portable true-colour artwork made from Unicode block elements |
 | `pieces glyph` | Chess characters supplied by the terminal font |
 
@@ -165,6 +165,24 @@ pieces auto
 
 Image rendering also works when iTerm2 is connected to a Linux machine over
 SSH. If detection fails, confirm that `LC_TERMINAL=iTerm2` reaches the server.
+
+At startup the game asks the terminal which image protocols it supports and how
+large its character cells are. The question and the answer travel through SSH,
+so detection works on a remote machine too.
+
+| Terminal | Large board with `pieces auto` |
+| --- | --- |
+| iTerm2, WezTerm | iTerm2 images |
+| Kitty, Ghostty, Konsole | Kitty images |
+| Windows Terminal 1.22+ (cmd, PowerShell, WSL, SSH), foot, xterm (`-ti vt340`), VTE builds with sixel | Sixel images |
+| VS Code with `terminal.integrated.enableImages` | iTerm2 images |
+| GNOME Terminal, Ptyxis, Alacritty, the classic Windows console, and others | Unicode block art |
+
+Terminals without image support draw the board with block art. VS Code
+recolours text it considers low-contrast, which spoils the art's shading; set
+`terminal.integrated.minimumContrastRatio` to `1`, or turn on
+`terminal.integrated.enableImages` to get the image board instead. The game
+shows this tip when it starts in VS Code without images.
 
 ## Sound
 
@@ -240,8 +258,10 @@ cargo run --bin chess-server
 ```
 
 It listens on `127.0.0.1:3000` by default and exposes `/health` and `/ws`.
-Active games are atomically saved to `data/server-state.json`. The following
-environment variables configure it:
+Active games are atomically saved to `data/server-state.json` whenever a move,
+join, or result changes them. Finished games are kept for 10 minutes so both
+players can see the result, and rooms nobody has been connected to for 30
+minutes are discarded. The following environment variables configure it:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -260,9 +280,19 @@ the game server stays on the private container network.
 ```sh
 cargo test
 cargo clippy --all-targets
-cargo fmt --check
+cargo fmt --all --check
 cargo build --release
 ```
+
+The repository is a Cargo workspace. The root package is the terminal client;
+the other crates are shared by the client and the server:
+
+| Crate | Contents |
+| --- | --- |
+| `chess` (root) | Terminal UI, input, sound, local storage, and the network client |
+| `crates/chess-core` | Rules, notation, evaluation, engine search, and game state; no I/O |
+| `crates/chess-protocol` | Versioned wire messages and their conversions to the game model |
+| `crates/chess-server` | The authoritative room hub and its WebSocket transport |
 
 Contributions and issue reports are welcome. UI reports are most useful when
 they include the terminal application, operating system, window dimensions,

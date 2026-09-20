@@ -311,7 +311,7 @@ impl Search {
             return DRAW;
         }
         self.nodes += 1;
-        if self.nodes % CLOCK_INTERVAL == 0 && self.past_deadline() {
+        if self.nodes.is_multiple_of(CLOCK_INTERVAL) && self.past_deadline() {
             self.stopped = true;
             return DRAW;
         }
@@ -467,7 +467,7 @@ impl Search {
             return DRAW;
         }
         self.nodes += 1;
-        if self.nodes % CLOCK_INTERVAL == 0 && self.past_deadline() {
+        if self.nodes.is_multiple_of(CLOCK_INTERVAL) && self.past_deadline() {
             self.stopped = true;
             return DRAW;
         }

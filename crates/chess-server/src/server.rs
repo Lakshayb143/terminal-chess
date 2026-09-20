@@ -1,7 +1,7 @@
 //! WebSocket transport for authoritative online guest games.
 
 use std::collections::HashMap;
-use std::env;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,60 +11,74 @@ use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{any, get};
 use axum::Router;
-use chess::online::{ConnectionId, Delivery, Hub};
-use chess::protocol::{ClientCommand, ClientEnvelope, ServerEnvelope};
+use chess_protocol::{ClientCommand, ClientEnvelope, ServerEnvelope};
 use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+
+use crate::hub::{write_state, ConnectionId, Delivery, Hub};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+/// Events queued for one client before it is treated as stalled and dropped.
+const OUTBOX_CAPACITY: usize = 256;
+const TICK_INTERVAL: Duration = Duration::from_millis(200);
+const PERSIST_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 struct AppState {
     hub: Arc<Mutex<Hub>>,
-    peers: Arc<Mutex<HashMap<ConnectionId, mpsc::UnboundedSender<ServerEnvelope>>>>,
+    peers: Arc<Mutex<HashMap<ConnectionId, mpsc::Sender<ServerEnvelope>>>>,
     state_path: Arc<PathBuf>,
+    /// Serializes state writes so an older snapshot never replaces a newer one.
+    persist_lock: Arc<Mutex<()>>,
     requests_per_window: u32,
 }
 
-#[tokio::main]
-async fn main() {
-    init_logging();
-    let address = env::var("CHESS_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-    let state_path = PathBuf::from(
-        env::var("CHESS_SERVER_STATE").unwrap_or_else(|_| "data/server-state.json".to_string()),
-    );
-    let requests_per_window = env::var("CHESS_RATE_LIMIT_PER_10S")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or(60);
-    let hub = Hub::load(&state_path).unwrap_or_else(|error| {
-        panic!("could not restore server state: {error}");
-    });
+/// Server settings, independent of where they were read from.
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Durable room state; created on first save.
+    pub state_path: PathBuf,
+    /// Requests one connection may send in each 10-second window.
+    pub requests_per_window: u32,
+}
+
+/// Serve `/health` and `/ws` on `listener` until `shutdown` resolves, then
+/// flush state to disk.
+pub async fn serve(
+    listener: TcpListener,
+    config: Config,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
+    let hub = Hub::load(&config.state_path)
+        .map_err(|error| format!("could not restore server state: {error}"))?;
     let state = AppState {
         hub: Arc::new(Mutex::new(hub)),
         peers: Arc::new(Mutex::new(HashMap::new())),
-        state_path: Arc::new(state_path),
-        requests_per_window,
+        state_path: Arc::new(config.state_path),
+        persist_lock: Arc::new(Mutex::new(())),
+        requests_per_window: config.requests_per_window,
     };
 
-    spawn_ticker(state.clone());
+    let ticker = spawn_ticker(state.clone());
+    let persister = spawn_persister(state.clone());
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ws", any(websocket))
         .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind(&address)
+    if let Ok(address) = listener.local_addr() {
+        info!(%address, state = %state.state_path.display(), "server listening");
+    }
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
         .await
-        .unwrap_or_else(|error| panic!("could not listen on {address}: {error}"));
-    info!(%address, state = %state.state_path.display(), "server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server failed");
+        .map_err(|error| format!("server failed: {error}"));
+    ticker.abort();
+    persister.abort();
     persist(&state).await;
     info!("server stopped");
+    served
 }
 
 async fn websocket(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
@@ -74,23 +88,33 @@ async fn websocket(ws: WebSocketUpgrade, State(state): State<AppState>) -> Respo
 async fn serve_socket(socket: WebSocket, state: AppState) {
     let connection = state.hub.lock().await.connect();
     info!(connection, "client connected");
-    let (outgoing, mut receiver) = mpsc::unbounded_channel::<ServerEnvelope>();
+    let (outgoing, mut receiver) = mpsc::channel::<ServerEnvelope>(OUTBOX_CAPACITY);
     state.peers.lock().await.insert(connection, outgoing);
 
     let (mut writer, mut reader) = socket.split();
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(envelope) = receiver.recv().await {
             let Ok(json) = serde_json::to_string(&envelope) else {
                 continue;
             };
             if writer.send(Message::Text(json.into())).await.is_err() {
-                break;
+                return;
             }
         }
+        // The sender was dropped because this client fell too far behind.
+        let _ = writer.send(Message::Close(None)).await;
     });
 
     let mut rate = RequestRate::new(state.requests_per_window);
-    while let Some(message) = reader.next().await {
+    loop {
+        let message = tokio::select! {
+            message = reader.next() => message,
+            // The socket failed or the client stalled; stop reading from it.
+            _ = &mut write_task => break,
+        };
+        let Some(message) = message else {
+            break;
+        };
         let deliveries = match message {
             Ok(Message::Text(text)) if text.len() > MAX_MESSAGE_BYTES => state
                 .hub
@@ -134,47 +158,65 @@ async fn serve_socket(socket: WebSocket, state: AppState) {
     info!(connection, "client disconnected");
 }
 
-fn spawn_ticker(state: AppState) {
+fn spawn_ticker(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let mut interval = tokio::time::interval(TICK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let deliveries = state.hub.lock().await.tick();
             dispatch(&state, deliveries).await;
+        }
+    })
+}
+
+/// Disk writes run on their own schedule so a slow disk never delays clocks.
+fn spawn_persister(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PERSIST_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
             persist(&state).await;
         }
-    });
+    })
 }
 
 async fn dispatch(state: &AppState, deliveries: Vec<Delivery>) {
-    let peers = state.peers.lock().await;
+    let mut peers = state.peers.lock().await;
     for delivery in deliveries {
-        if let Some(sender) = peers.get(&delivery.target) {
-            let _ = sender.send(delivery.message);
+        let target = delivery.target;
+        let Some(sender) = peers.get(&target) else {
+            continue;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(delivery.message) {
+            // Dropping the sender ends the writer task, which closes the socket.
+            warn!(connection = target, "client outbox full; disconnecting");
+            peers.remove(&target);
         }
     }
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut terminate = signal(SignalKind::terminate()).expect("could not listen for SIGTERM");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn persist(state: &AppState) {
-    let mut hub = state.hub.lock().await;
-    if hub.is_dirty() {
-        if let Err(error) = hub.save(&state.state_path) {
-            error!(%error, path = %state.state_path.display(), "could not persist server state");
+    let _writer = state.persist_lock.lock().await;
+    // Only encoding holds the hub lock; the write and fsync happen after it
+    // is released so game traffic never waits on the disk.
+    let encoded = state.hub.lock().await.encode_if_dirty();
+    let bytes = match encoded {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return,
+        Err(error) => {
+            error!(%error, "could not encode server state");
+            return;
         }
+    };
+    let path = Arc::clone(&state.state_path);
+    let written = tokio::task::spawn_blocking(move || write_state(&path, &bytes))
+        .await
+        .unwrap_or_else(|error| Err(format!("state writer panicked: {error}")));
+    if let Err(error) = written {
+        error!(%error, path = %state.state_path.display(), "could not persist server state");
+        state.hub.lock().await.mark_dirty();
     }
 }
 
@@ -214,19 +256,5 @@ fn command_name(command: &ClientCommand) -> &'static str {
         ClientCommand::RespondDraw { .. } => "respond_draw",
         ClientCommand::Resign { .. } => "resign",
         ClientCommand::Ping => "ping",
-    }
-}
-
-fn init_logging() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("chess_server=info"));
-    if env::var("CHESS_LOG_FORMAT").is_ok_and(|value| value.eq_ignore_ascii_case("json")) {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .with_current_span(false)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 }

@@ -1,5 +1,9 @@
 //! Versioned messages exchanged by terminal clients and the game server.
 
+use std::time::Duration;
+
+use chess_core::board::Color;
+use chess_core::game::Outcome;
 use serde::{Deserialize, Serialize};
 
 /// Increment this only for a breaking wire-format or behavior change.
@@ -216,6 +220,89 @@ pub enum ErrorCode {
     Internal,
 }
 
+// ---------------------------------------------------------------------------
+// Conversions between wire types and the shared game model
+// ---------------------------------------------------------------------------
+
+impl From<Color> for Side {
+    fn from(color: Color) -> Side {
+        match color {
+            Color::White => Side::White,
+            Color::Black => Side::Black,
+        }
+    }
+}
+
+impl From<Side> for Color {
+    fn from(side: Side) -> Color {
+        match side {
+            Side::White => Color::White,
+            Side::Black => Color::Black,
+        }
+    }
+}
+
+impl TimeControl {
+    /// An untimed game is sent as `initial_ms: 0`.
+    pub fn new(initial: Option<Duration>, increment: Duration) -> TimeControl {
+        TimeControl {
+            initial_ms: initial.map_or(0, duration_ms),
+            increment_ms: duration_ms(increment),
+        }
+    }
+
+    pub fn initial(&self) -> Option<Duration> {
+        (self.initial_ms > 0).then(|| Duration::from_millis(self.initial_ms))
+    }
+
+    pub fn increment(&self) -> Duration {
+        Duration::from_millis(self.increment_ms)
+    }
+}
+
+/// Milliseconds as sent on the wire, saturating rather than wrapping.
+pub fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+impl From<Outcome> for GameStatus {
+    fn from(outcome: Outcome) -> GameStatus {
+        let won = |winner: Color, reason| GameStatus::Finished {
+            result: match winner {
+                Color::White => GameResult::WhiteWins,
+                Color::Black => GameResult::BlackWins,
+            },
+            reason,
+        };
+        let drawn = |reason| GameStatus::Finished {
+            result: GameResult::Draw,
+            reason,
+        };
+        match outcome {
+            Outcome::Checkmate(winner) => won(winner, FinishReason::Checkmate),
+            Outcome::Resignation(loser) => won(loser.flip(), FinishReason::Resignation),
+            Outcome::Timeout(loser) => won(loser.flip(), FinishReason::Timeout),
+            Outcome::Abandonment(loser) => won(loser.flip(), FinishReason::Abandonment),
+            Outcome::DrawAgreement => drawn(FinishReason::DrawAgreement),
+            Outcome::Stalemate => drawn(FinishReason::Stalemate),
+            Outcome::FiftyMove => drawn(FinishReason::FiftyMove),
+            Outcome::Threefold => drawn(FinishReason::Threefold),
+            Outcome::Insufficient => drawn(FinishReason::InsufficientMaterial),
+        }
+    }
+}
+
+impl GameResult {
+    /// The side that lost, or `None` for a draw.
+    pub fn loser(self) -> Option<Color> {
+        match self {
+            GameResult::WhiteWins => Some(Color::Black),
+            GameResult::BlackWins => Some(Color::White),
+            GameResult::Draw => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +327,76 @@ mod tests {
             serde_json::from_value::<ClientEnvelope>(json).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn every_outcome_maps_to_the_matching_result() {
+        use chess_core::board::Color::{Black, White};
+        let cases = [
+            (
+                Outcome::Checkmate(White),
+                GameResult::WhiteWins,
+                FinishReason::Checkmate,
+            ),
+            (
+                Outcome::Resignation(White),
+                GameResult::BlackWins,
+                FinishReason::Resignation,
+            ),
+            (
+                Outcome::Timeout(Black),
+                GameResult::WhiteWins,
+                FinishReason::Timeout,
+            ),
+            (
+                Outcome::Abandonment(Black),
+                GameResult::WhiteWins,
+                FinishReason::Abandonment,
+            ),
+            (
+                Outcome::DrawAgreement,
+                GameResult::Draw,
+                FinishReason::DrawAgreement,
+            ),
+            (
+                Outcome::Stalemate,
+                GameResult::Draw,
+                FinishReason::Stalemate,
+            ),
+            (
+                Outcome::FiftyMove,
+                GameResult::Draw,
+                FinishReason::FiftyMove,
+            ),
+            (
+                Outcome::Threefold,
+                GameResult::Draw,
+                FinishReason::Threefold,
+            ),
+            (
+                Outcome::Insufficient,
+                GameResult::Draw,
+                FinishReason::InsufficientMaterial,
+            ),
+        ];
+        for (outcome, result, reason) in cases {
+            assert_eq!(
+                GameStatus::from(outcome),
+                GameStatus::Finished { result, reason }
+            );
+        }
+        assert_eq!(GameResult::BlackWins.loser(), Some(White));
+        assert_eq!(GameResult::Draw.loser(), None);
+    }
+
+    #[test]
+    fn untimed_games_round_trip_as_zero_initial_time() {
+        let untimed = TimeControl::new(None, Duration::from_secs(2));
+        assert_eq!(untimed.initial_ms, 0);
+        assert_eq!(untimed.initial(), None);
+        assert_eq!(untimed.increment(), Duration::from_secs(2));
+        let timed = TimeControl::new(Some(Duration::from_secs(300)), Duration::ZERO);
+        assert_eq!(timed.initial(), Some(Duration::from_secs(300)));
     }
 
     #[test]

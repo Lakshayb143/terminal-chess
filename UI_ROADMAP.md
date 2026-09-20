@@ -50,6 +50,17 @@ Make every page and every terminal render cleanly before adding new surfaces.
       overrides.
 - [x] Keep hand-tuned 256-colour squares where blended tints would collapse.
 - [x] Make the art renderer respect the detected colour depth.
+- [x] Draw the image board with sixel where the terminal offers it (foot,
+      xterm, Windows Terminal, VTE), sized to the measured cell.
+- [x] Ask Windows Terminal about sixel from native cmd and PowerShell, not
+      only through SSH and WSL.
+- [x] Redraw the image board whenever text lands on it, for terminals that
+      keep pictures in text cells (VS Code, and possibly others).
+- [x] Recognise VS Code's image support and send it iTerm2 images.
+- [x] Sharpen block art: hard piece silhouettes and colours taken from the
+      piece, with no grey fringe.
+- [x] Explain the VS Code settings that improve the board when it starts
+      without images.
 
 ### 2. Keyboard board cursor — next
 

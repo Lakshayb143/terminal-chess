@@ -1,0 +1,12 @@
+[package]
+name = "chess-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Versioned wire messages shared by terminal clients and the game server"
+
+[dependencies]
+chess-core.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

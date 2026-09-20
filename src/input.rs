@@ -51,6 +51,12 @@ impl TerminalInput {
         &self.buffer
     }
 
+    /// Forget what has been typed, for screens where a key is a shortcut
+    /// rather than the start of a command.
+    pub fn clear_buffer(&mut self) {
+        self.buffer.clear();
+    }
+
     /// Temporarily return stdin to ordinary line input, for a confirmation
     /// whose wording is already handled by the existing prompt code.
     pub fn suspend(&mut self) -> Result<(), String> {
