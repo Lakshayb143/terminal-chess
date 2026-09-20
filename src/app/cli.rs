@@ -37,8 +37,8 @@ impl Mode {
 pub(crate) enum StartChoice {
     Mode(Mode),
     Resume,
-    /// Only the home page offers this; the command line has `online`.
-    Online(OnlineIntent),
+    /// Play online, under the given name if not signed in.
+    Online(OnlineIntent, String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +75,23 @@ pub(crate) struct Options {
     pub(crate) online: Option<OnlineIntent>,
     pub(crate) server_url: String,
     pub(crate) online_name: String,
+    /// Running on a server for someone else, as the SSH gateway does: the
+    /// files are the server's, not the player's, so file commands are off.
+    pub(crate) hosted: bool,
+}
+
+/// What file commands say when the game is hosted.
+pub(crate) const HOSTED_FILES: &str =
+    "Files are off when playing over SSH. Type `pgn` to show the game, then copy it from the screen.";
+
+/// Whether `word` with argument `rest` reads or writes a file of the
+/// player's choosing, which a hosted game must not do.
+pub(crate) fn names_a_file(word: &str, rest: &str) -> bool {
+    match word {
+        "export" | "import" => true,
+        "save" | "load" => !rest.is_empty(),
+        _ => false,
+    }
 }
 
 pub(crate) const HELP: &str = "\
@@ -163,6 +180,7 @@ impl Options {
             server_url: std::env::var("CHESS_SERVER_URL")
                 .unwrap_or_else(|_| "ws://127.0.0.1:3000/ws".to_string()),
             online_name: preferences.white_name.clone(),
+            hosted: std::env::var("CHESS_HOSTED").is_ok_and(|value| value == "1"),
         };
         // Tracked so that `--depth` alone means "this depth, no clock", while
         // `--depth` with `--time` means "this depth, but stop when time runs out".
@@ -292,9 +310,29 @@ impl Options {
             .filter(|character| !character.is_control())
             .take(32)
             .collect();
+        if options.hosted && options.load.is_some() {
+            return Err(HOSTED_FILES.to_string());
+        }
         if options.online.is_some() && options.online_name.is_empty() {
             return Err("--name cannot be empty".to_string());
         }
         Ok(Some(options))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::names_a_file;
+
+    #[test]
+    fn hosted_games_refuse_only_commands_that_name_a_file() {
+        assert!(names_a_file("export", ""));
+        assert!(names_a_file("import", "game.pgn"));
+        assert!(names_a_file("save", "/etc/passwd"));
+        assert!(names_a_file("load", "../../chess.db"));
+        // The default autosave lives in the visitor's own temporary folder.
+        assert!(!names_a_file("save", ""));
+        assert!(!names_a_file("load", ""));
+        assert!(!names_a_file("pgn", ""));
     }
 }

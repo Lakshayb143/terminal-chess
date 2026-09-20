@@ -1,4 +1,5 @@
-//! Authoritative, transport-independent state for online guest matches.
+//! Authoritative, transport-independent state for online matches between
+//! guests and signed-in players.
 
 use std::collections::HashMap;
 use std::fs;
@@ -15,8 +16,10 @@ use chess_core::san::parse_move;
 use chess_protocol::{
     ClientCommand, ClientEnvelope, ClockSnapshot, ErrorCode, GameSnapshot, GameStatus,
     MoveRejection, PlayerSnapshot, ServerEnvelope, ServerEvent, Side, TimeControl,
-    PROTOCOL_VERSION,
+    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
+
+use crate::store::{FinishedGame, FinishedPlayer, UserId};
 
 pub type ConnectionId = u64;
 
@@ -37,6 +40,13 @@ pub struct Delivery {
     pub message: ServerEnvelope,
 }
 
+/// The account a connection has signed in to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub user: UserId,
+    pub username: String,
+}
+
 #[derive(Clone, Debug)]
 struct Membership {
     game_id: String,
@@ -45,6 +55,8 @@ struct Membership {
 
 struct PlayerSlot {
     name: String,
+    /// The account playing this seat; `None` for a guest.
+    user: Option<UserId>,
     reconnect_token: String,
     connection: Option<ConnectionId>,
     disconnected_at: Option<Instant>,
@@ -56,6 +68,8 @@ struct Room {
     game: Game,
     white: PlayerSlot,
     black: Option<PlayerSlot>,
+    /// Unix time when the second player joined and the clocks started.
+    started_at_ms: u64,
     /// When the server first saw the game finished; drives eviction.
     finished_at: Option<Instant>,
 }
@@ -116,6 +130,9 @@ pub struct Hub {
     rooms: HashMap<String, Room>,
     invites: HashMap<String, String>,
     memberships: HashMap<ConnectionId, Membership>,
+    identities: HashMap<ConnectionId, Identity>,
+    /// Games that ended since the last [`Hub::take_finished_games`].
+    finished_games: Vec<FinishedGame>,
     next_connection_id: ConnectionId,
     next_event_id: u64,
     dirty: bool,
@@ -133,6 +150,8 @@ impl Hub {
             rooms: HashMap::new(),
             invites: HashMap::new(),
             memberships: HashMap::new(),
+            identities: HashMap::new(),
+            finished_games: Vec::new(),
             next_connection_id: 1,
             next_event_id: 1,
             dirty: false,
@@ -203,6 +222,7 @@ impl Hub {
                 game,
                 white: saved.white.restore(disconnected_at),
                 black: saved.black.map(|player| player.restore(disconnected_at)),
+                started_at_ms: saved.started_at_ms,
                 finished_at: None,
             };
             hub.invites.insert(saved.invite_code, saved.game_id.clone());
@@ -262,16 +282,35 @@ impl Hub {
         id
     }
 
+    /// Record which account `connection` belongs to. Games it creates or
+    /// joins from now on are played under that account's username.
+    pub fn sign_in(&mut self, connection: ConnectionId, identity: Identity) {
+        self.identities.insert(connection, identity);
+    }
+
+    pub fn sign_out(&mut self, connection: ConnectionId) {
+        self.identities.remove(&connection);
+    }
+
+    pub fn identity(&self, connection: ConnectionId) -> Option<&Identity> {
+        self.identities.get(&connection)
+    }
+
+    /// Games that finished since the last call, for the history database.
+    pub fn take_finished_games(&mut self) -> Vec<FinishedGame> {
+        std::mem::take(&mut self.finished_games)
+    }
+
+    /// Answer a request, or explain why it cannot be answered. Account
+    /// commands are the transport's job; the hub only reports that accounts
+    /// are unavailable if one reaches it.
     pub fn handle(&mut self, connection: ConnectionId, request: ClientEnvelope) -> Vec<Delivery> {
-        if request.protocol != PROTOCOL_VERSION {
+        if let Some(error) = unsupported_protocol(request.protocol) {
             return self.direct_error(
                 connection,
                 Some(request.request_id),
                 ErrorCode::UnsupportedProtocol,
-                format!(
-                    "protocol {} is not supported; this server uses {}",
-                    request.protocol, PROTOCOL_VERSION
-                ),
+                error,
             );
         }
 
@@ -279,7 +318,8 @@ impl Hub {
         if !matches!(
             request.command,
             ClientCommand::Hello { .. } | ClientCommand::Ping
-        ) {
+        ) && !is_account_command(&request.command)
+        {
             self.dirty = true;
         }
         match request.command {
@@ -317,7 +357,39 @@ impl Hub {
             ClientCommand::Ping => {
                 vec![self.delivery(connection, Some(request_id), ServerEvent::Pong)]
             }
+            ClientCommand::Register { .. }
+            | ClientCommand::LogIn { .. }
+            | ClientCommand::Authenticate { .. }
+            | ClientCommand::LogOut
+            | ClientCommand::ListGames { .. }
+            | ClientCommand::LinkSshKey { .. } => self.direct_error(
+                connection,
+                Some(request_id),
+                ErrorCode::AccountsUnavailable,
+                "this server does not have accounts enabled",
+            ),
         }
+    }
+
+    /// A reply to one request, numbered in this hub's event sequence. The
+    /// transport uses it for the account commands it answers itself.
+    pub fn reply(
+        &mut self,
+        connection: ConnectionId,
+        request_id: u64,
+        event: ServerEvent,
+    ) -> Vec<Delivery> {
+        vec![self.delivery(connection, Some(request_id), event)]
+    }
+
+    pub fn reply_error(
+        &mut self,
+        connection: ConnectionId,
+        request_id: u64,
+        code: ErrorCode,
+        message: impl Into<String>,
+    ) -> Vec<Delivery> {
+        self.direct_error(connection, Some(request_id), code, message)
     }
 
     pub fn invalid_request(
@@ -338,6 +410,7 @@ impl Hub {
     }
 
     pub fn disconnect(&mut self, connection: ConnectionId) -> Vec<Delivery> {
+        self.identities.remove(&connection);
         let Some(membership) = self.memberships.remove(&connection) else {
             return Vec::new();
         };
@@ -406,6 +479,7 @@ impl Hub {
             if room.black.is_some() && room.finished_at.is_none() && !room.is_active() {
                 room.finished_at = Some(now);
                 self.dirty |= was_active;
+                self.finished_games.extend(finished_game(room));
             }
             if changed {
                 updates.push((room.targets(), snapshot(room)));
@@ -461,8 +535,8 @@ impl Hub {
                 "leave the current game before creating another one",
             );
         }
-        let player_name = match clean_player_name(&player_name) {
-            Ok(name) => name,
+        let (player_name, user) = match self.seat_name(connection, &player_name) {
+            Ok(seat) => seat,
             Err(message) => {
                 return self.direct_error(
                     connection,
@@ -497,11 +571,13 @@ impl Hub {
             game,
             white: PlayerSlot {
                 name: player_name,
+                user,
                 reconnect_token: reconnect_token.clone(),
                 connection: Some(connection),
                 disconnected_at: None,
             },
             black: None,
+            started_at_ms: 0,
             finished_at: None,
         };
         self.invites.insert(invite_code.clone(), game_id.clone());
@@ -541,8 +617,8 @@ impl Hub {
                 "leave the current game before joining another one",
             );
         }
-        let player_name = match clean_player_name(&player_name) {
-            Ok(name) => name,
+        let (player_name, user) = match self.seat_name(connection, &player_name) {
+            Ok(seat) => seat,
             Err(message) => {
                 return self.direct_error(
                     connection,
@@ -574,10 +650,12 @@ impl Hub {
             }
             room.black = Some(PlayerSlot {
                 name: player_name,
+                user,
                 reconnect_token: reconnect_token.clone(),
                 connection: Some(connection),
                 disconnected_at: None,
             });
+            room.started_at_ms = unix_time_ms();
             room.game.clock.resume(Color::White);
             room.game.changed();
             let creator = room.white.connection;
@@ -845,6 +923,19 @@ impl Hub {
         self.broadcast_update(targets, connection, request_id, game)
     }
 
+    /// The name and account a new seat for `connection` is played under: the
+    /// username when signed in, otherwise the guest's chosen name.
+    fn seat_name(
+        &self,
+        connection: ConnectionId,
+        requested: &str,
+    ) -> Result<(String, Option<UserId>), &'static str> {
+        match self.identities.get(&connection) {
+            Some(identity) => Ok((identity.username.clone(), Some(identity.user))),
+            None => clean_player_name(requested).map(|name| (name, None)),
+        }
+    }
+
     fn member_side(
         &self,
         connection: ConnectionId,
@@ -921,6 +1012,54 @@ impl Hub {
     }
 }
 
+fn unsupported_protocol(version: u16) -> Option<String> {
+    (!(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)).then(|| {
+        format!(
+            "protocol {version} is not supported; this server accepts {MIN_PROTOCOL_VERSION} to {PROTOCOL_VERSION}"
+        )
+    })
+}
+
+fn is_account_command(command: &ClientCommand) -> bool {
+    matches!(
+        command,
+        ClientCommand::Register { .. }
+            | ClientCommand::LogIn { .. }
+            | ClientCommand::Authenticate { .. }
+            | ClientCommand::LogOut
+            | ClientCommand::ListGames { .. }
+            | ClientCommand::LinkSshKey { .. }
+    )
+}
+
+/// The history record for a room whose game has just ended.
+fn finished_game(room: &Room) -> Option<FinishedGame> {
+    let black = room.black.as_ref()?;
+    let GameStatus::Finished { result, reason } = GameStatus::from(outcome(&room.game)?) else {
+        return None;
+    };
+    let player = |slot: &PlayerSlot| FinishedPlayer {
+        name: slot.name.clone(),
+        user: slot.user,
+    };
+    Some(FinishedGame {
+        game_id: room.game_id.clone(),
+        white: player(&room.white),
+        black: player(black),
+        time_control: time_control(&room.game),
+        moves: room
+            .game
+            .undos
+            .iter()
+            .map(|undo| undo.mv.to_uci())
+            .collect(),
+        result,
+        reason,
+        started_at_ms: room.started_at_ms,
+        ended_at_ms: unix_time_ms(),
+    })
+}
+
 fn clean_player_name(name: &str) -> Result<String, &'static str> {
     let name = name.trim();
     let length = name.chars().count();
@@ -969,6 +1108,7 @@ fn player_snapshot(player: Option<&PlayerSlot>) -> PlayerSnapshot {
     PlayerSnapshot {
         name: player.map_or_else(String::new, |player| player.name.clone()),
         connected: player.is_some_and(|player| player.connection.is_some()),
+        registered: player.is_some_and(|player| player.user.is_some()),
     }
 }
 
@@ -1005,6 +1145,8 @@ struct PersistedRoom {
     draw_offer: Option<Side>,
     agreed_draw: bool,
     abandoned: Option<Side>,
+    #[serde(default)]
+    started_at_ms: u64,
 }
 
 impl PersistedRoom {
@@ -1029,6 +1171,7 @@ impl PersistedRoom {
             draw_offer: room.game.draw_offer.map(Side::from),
             agreed_draw: room.game.agreed_draw,
             abandoned: room.game.abandoned.map(Side::from),
+            started_at_ms: room.started_at_ms,
         }
     }
 }
@@ -1036,6 +1179,8 @@ impl PersistedRoom {
 #[derive(Serialize, Deserialize)]
 struct PersistedPlayer {
     name: String,
+    #[serde(default)]
+    user: Option<UserId>,
     reconnect_token: String,
 }
 
@@ -1043,6 +1188,7 @@ impl PersistedPlayer {
     fn capture(player: &PlayerSlot) -> PersistedPlayer {
         PersistedPlayer {
             name: player.name.clone(),
+            user: player.user,
             reconnect_token: player.reconnect_token.clone(),
         }
     }
@@ -1050,6 +1196,7 @@ impl PersistedPlayer {
     fn restore(self, disconnected_at: Option<Instant>) -> PlayerSlot {
         PlayerSlot {
             name: self.name,
+            user: self.user,
             reconnect_token: self.reconnect_token,
             connection: None,
             disconnected_at,

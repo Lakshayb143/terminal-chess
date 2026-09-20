@@ -52,6 +52,8 @@ crossterm_winapi = "0.9"
 
 [dev-dependencies]
 chess-server.workspace = true
+rand = "0.10"
+russh = { version = "0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
 
 # Rules and search are hot loops; optimize them even in debug builds so the
 # engine plays at a normal pace and perft tests stay fast.
@@ -63,3 +65,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Password hashing is deliberately expensive; unoptimized it takes seconds,
+# which slows every account test and a debug server.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

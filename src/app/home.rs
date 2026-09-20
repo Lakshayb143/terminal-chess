@@ -16,7 +16,9 @@ use chess_core::board::{Color, Position};
 use chess_core::game::{outcome, outcome_detail, Game};
 use chess_core::movegen::in_check;
 
+use crate::app::account::{account_menu, AccountContext};
 use crate::app::cli::{Mode, OnlineIntent, Options, StartChoice};
+use crate::app::prompt::ask_guest_name;
 use crate::app::saves::{color_named, restore_game};
 use crate::app::screen::Screen;
 
@@ -30,6 +32,7 @@ pub(crate) enum Entry {
     Create,
     Join,
     Rejoin,
+    Account,
     Quit,
 }
 
@@ -43,6 +46,7 @@ impl Entry {
             Entry::Create => 'o',
             Entry::Join => 'j',
             Entry::Rejoin => 'r',
+            Entry::Account => 'a',
             Entry::Quit => 'q',
         }
     }
@@ -56,6 +60,7 @@ impl Entry {
             Entry::Create => "Create a private game",
             Entry::Join => "Join with a code",
             Entry::Rejoin => "Rejoin online game",
+            Entry::Account => "Account",
             Entry::Quit => "Quit",
         }
     }
@@ -71,6 +76,24 @@ impl Entry {
             _ => None,
         }
     }
+}
+
+/// What picking a menu entry means: a decision to hand back to the caller,
+/// or a sub-flow that needs ordinary line input the raw-mode page cannot
+/// give it (a guest name, or the account page).
+pub(crate) enum Pick {
+    Choice(Option<StartChoice>),
+    NeedsName(OnlineIntent),
+    Account,
+}
+
+/// The name a game partner sees: the signed-in username, or the guest name
+/// on offer.
+fn player_name(account: &AccountContext) -> String {
+    account
+        .username()
+        .map(str::to_string)
+        .unwrap_or_else(|| account.guest_name.clone())
 }
 
 /// What the page knows about the world outside it, gathered once up front.
@@ -177,6 +200,7 @@ impl Home {
         if info.seat.is_some() {
             entries.push(Entry::Rejoin);
         }
+        entries.push(Entry::Account);
         entries.push(Entry::Quit);
         // An unfinished game is the likeliest reason to have come back.
         let focus = match &info.saved {
@@ -204,16 +228,18 @@ impl Home {
         self.code.is_some()
     }
 
-    /// `Some` once the player has decided: a choice, or `None` to leave.
-    /// `typed` is the input line as it stands, for the invite code.
+    /// `Some` once the player has decided something, or a sub-flow the caller
+    /// must run before the page can continue. `typed` is the input line as
+    /// it stands, for the invite code.
     pub(crate) fn handle(
         &mut self,
         action: Action,
         info: &HomeInfo,
+        account: &AccountContext,
         typed: &str,
-    ) -> Option<Option<StartChoice>> {
+    ) -> Option<Pick> {
         match action {
-            Action::Quit => Some(None),
+            Action::Quit => Some(Pick::Choice(None)),
             Action::Resize | Action::Tick => None,
             Action::Cancel => {
                 self.code = None;
@@ -242,7 +268,7 @@ impl Home {
                     return None;
                 }
                 self.code = None;
-                self.choose(entry, info)
+                self.choose(entry, info, account)
             }
             Action::Prompt => {
                 if self.joining() {
@@ -254,7 +280,9 @@ impl Home {
                 let entry = Entry::numbered(key)
                     .or_else(|| self.entries.iter().copied().find(|e| e.key() == key));
                 match entry {
-                    Some(entry) if self.entries.contains(&entry) => self.choose(entry, info),
+                    Some(entry) if self.entries.contains(&entry) => {
+                        self.choose(entry, info, account)
+                    }
                     _ => {
                         self.complaint = Some(
                             "Press one of the highlighted letters, or use the arrow keys."
@@ -273,47 +301,59 @@ impl Home {
                             Some("Type the invite code your friend sent you.".to_string());
                         None
                     } else {
-                        Some(Some(StartChoice::Online(OnlineIntent::Join(code))))
+                        Some(self.online_pick(OnlineIntent::Join(code), account))
                     }
                 }
-                None => self.choose(self.focused(), info),
+                None => self.choose(self.focused(), info, account),
             },
         }
     }
 
-    fn choose(&mut self, entry: Entry, info: &HomeInfo) -> Option<Option<StartChoice>> {
+    fn choose(&mut self, entry: Entry, info: &HomeInfo, account: &AccountContext) -> Option<Pick> {
         if let Some(index) = self.entries.iter().position(|&e| e == entry) {
             self.focus = index;
         }
         self.complaint = None;
-        let choice = match entry {
-            Entry::White => StartChoice::Mode(Mode::HumanWhite),
-            Entry::Black => StartChoice::Mode(Mode::HumanBlack),
-            Entry::Two => StartChoice::Mode(Mode::TwoPlayer),
+        match entry {
+            Entry::White => Some(Pick::Choice(Some(StartChoice::Mode(Mode::HumanWhite)))),
+            Entry::Black => Some(Pick::Choice(Some(StartChoice::Mode(Mode::HumanBlack)))),
+            Entry::Two => Some(Pick::Choice(Some(StartChoice::Mode(Mode::TwoPlayer)))),
             Entry::Continue => match &info.saved {
-                Some(Ok(_)) => StartChoice::Resume,
+                Some(Ok(_)) => Some(Pick::Choice(Some(StartChoice::Resume))),
                 Some(Err(why)) => {
                     self.complaint = Some(format!("The autosave cannot be restored: {why}"));
-                    return None;
+                    None
                 }
-                None => return None,
+                None => None,
             },
-            Entry::Create => StartChoice::Online(OnlineIntent::Create),
+            Entry::Create => Some(self.online_pick(OnlineIntent::Create, account)),
             Entry::Join => {
                 self.code = Some(String::new());
-                return None;
+                None
             }
             Entry::Rejoin => match &info.seat {
-                Some(Ok(_)) => StartChoice::Online(OnlineIntent::Resume),
+                Some(Ok(_)) => Some(Pick::Choice(Some(StartChoice::Online(
+                    OnlineIntent::Resume,
+                    player_name(account),
+                )))),
                 Some(Err(why)) => {
                     self.complaint = Some(format!("The online seat cannot be read: {why}"));
-                    return None;
+                    None
                 }
-                None => return None,
+                None => None,
             },
-            Entry::Quit => return Some(None),
-        };
-        Some(Some(choice))
+            Entry::Account => Some(Pick::Account),
+            Entry::Quit => Some(Pick::Choice(None)),
+        }
+    }
+
+    /// Signed-in players start online games right away; guests are asked for
+    /// a name first.
+    fn online_pick(&self, intent: OnlineIntent, account: &AccountContext) -> Pick {
+        match account.username() {
+            Some(name) => Pick::Choice(Some(StartChoice::Online(intent, name.to_string()))),
+            None => Pick::NeedsName(intent),
+        }
     }
 
     // -- drawing ------------------------------------------------------------
@@ -323,6 +363,7 @@ impl Home {
         &mut self,
         theme: &Theme,
         info: &HomeInfo,
+        account: &AccountContext,
         pieces: ui::Pieces,
         cols: usize,
         rows: usize,
@@ -347,7 +388,7 @@ impl Home {
         let board_w = metrics.map_or(0, |m| m.board_width() + GAP);
         let menu_w = cols.saturating_sub(board_w + 4).clamp(1, MENU_MAX);
 
-        let (menu, hits) = self.menu(theme, info, menu_w, tall);
+        let (menu, hits) = self.menu(theme, info, account, menu_w, tall);
         let board = match metrics {
             Some(metrics) => self.preview(theme, info, metrics),
             None => Vec::new(),
@@ -410,6 +451,7 @@ impl Home {
         &self,
         theme: &Theme,
         info: &HomeInfo,
+        account: &AccountContext,
         width: usize,
         tall: bool,
     ) -> (Vec<String>, Vec<(usize, usize, usize, Entry)>) {
@@ -430,6 +472,11 @@ impl Home {
             lines.push(format!("  {}", theme.strong(accent, title)));
         }
         lines.push(format!("  {}", theme.dim("Play chess in your terminal")));
+        let who = match account.username() {
+            Some(name) => format!("signed in as {name}"),
+            None => "playing as a guest".to_string(),
+        };
+        lines.push(format!("  {}", theme.dim(&who)));
         lines.push(String::new());
 
         let sections: [(&str, &[Entry]); 3] = [
@@ -438,7 +485,7 @@ impl Home {
                 &[Entry::White, Entry::Black, Entry::Two, Entry::Continue],
             ),
             ("ONLINE", &[Entry::Create, Entry::Join, Entry::Rejoin]),
-            ("", &[Entry::Quit]),
+            ("", &[Entry::Account, Entry::Quit]),
         ];
         for (index, (heading, members)) in sections.iter().enumerate() {
             if index > 0 {
@@ -449,7 +496,7 @@ impl Home {
             }
             for &entry in members.iter().filter(|e| self.entries.contains(e)) {
                 let focused = self.focused() == entry;
-                let (text, row_w) = self.item(theme, info, entry, focused, width);
+                let (text, row_w) = self.item(theme, info, account, entry, focused, width);
                 hits.push((lines.len(), 0, row_w, entry));
                 lines.push(text);
             }
@@ -458,7 +505,7 @@ impl Home {
         lines.push(String::new());
         lines.push(format!("  {}", theme.rule(width.saturating_sub(2))));
         let room = width.saturating_sub(2);
-        for detail in self.detail(theme, info) {
+        for detail in self.detail(theme, info, account) {
             lines.push(format!("  {}", ui::clip_note(&detail, room)));
         }
         if let Some(complaint) = &self.complaint {
@@ -472,6 +519,7 @@ impl Home {
         &self,
         theme: &Theme,
         info: &HomeInfo,
+        account: &AccountContext,
         entry: Entry,
         focused: bool,
         width: usize,
@@ -501,7 +549,7 @@ impl Home {
         } else {
             label
         };
-        let meta = self.meta(info, entry).unwrap_or_default();
+        let meta = self.meta(info, account, entry).unwrap_or_default();
         let line = format!(
             "{} {}  {} {}",
             theme.strong(theme.palette.accent, marker),
@@ -515,7 +563,7 @@ impl Home {
     }
 
     /// A few words to the right of a row, where a row has something to add.
-    fn meta(&self, info: &HomeInfo, entry: Entry) -> Option<String> {
+    fn meta(&self, info: &HomeInfo, account: &AccountContext, entry: Entry) -> Option<String> {
         match entry {
             Entry::Continue => match &info.saved {
                 Some(Ok((game, _))) if outcome(game).is_some() => Some("finished".to_string()),
@@ -528,12 +576,16 @@ impl Home {
                 Some(Err(_)) => Some("unreadable".to_string()),
                 None => None,
             },
+            Entry::Account => Some(match account.username() {
+                Some(_) => "your recent games".to_string(),
+                None => "sign in or sign up".to_string(),
+            }),
             _ => None,
         }
     }
 
     /// Two lines under the menu about the focused row, or the code being typed.
-    fn detail(&self, theme: &Theme, info: &HomeInfo) -> Vec<String> {
+    fn detail(&self, theme: &Theme, info: &HomeInfo, account: &AccountContext) -> Vec<String> {
         let server = |url: &str| theme.dim(&format!("Server {url}"));
         if let Some(code) = &self.code {
             let caret = if theme.ascii { "_" } else { "\u{2581}" };
@@ -593,6 +645,16 @@ impl Home {
                     server(&seat.server_url),
                 ],
                 _ => vec![theme.warn("The last online seat could not be read.")],
+            },
+            Entry::Account => match account.username() {
+                Some(name) => vec![
+                    format!("Signed in as {name}."),
+                    theme.dim("See your recent games or sign out."),
+                ],
+                None => vec![
+                    "Keep your name and games on every computer.".to_string(),
+                    theme.dim("Sign in, or create a free account."),
+                ],
             },
             Entry::Quit => vec![
                 "Back to the shell.".to_string(),
@@ -687,8 +749,15 @@ const TITLE: [&str; 3] = [
 ];
 
 /// Show the home page until the player picks something. Only for a live
-/// colour terminal: it needs raw input and cursor addressing.
-pub(crate) fn run(screen: &Screen, info: &HomeInfo) -> Result<Option<StartChoice>, String> {
+/// colour terminal: it needs raw input and cursor addressing. Signing in,
+/// the account page, and a guest name are all asked with ordinary line
+/// input, the same forms the piped-terminal menu uses, so raw mode is
+/// suspended for as long as one of those is on screen.
+pub(crate) fn run(
+    screen: &mut Screen,
+    info: &HomeInfo,
+    account: &mut AccountContext,
+) -> Result<Option<StartChoice>, String> {
     let mut input = TerminalInput::enter(true)?;
     let mut home = Home::new(info);
     let mut shown: Vec<String> = Vec::new();
@@ -697,6 +766,7 @@ pub(crate) fn run(screen: &Screen, info: &HomeInfo) -> Result<Option<StartChoice
         let frame = home.render(
             &screen.theme,
             info,
+            account,
             screen.pieces,
             cols.max(30),
             rows.max(12),
@@ -705,13 +775,34 @@ pub(crate) fn run(screen: &Screen, info: &HomeInfo) -> Result<Option<StartChoice
 
         let action = input.read_for(Duration::from_secs(1))?;
         let was_menu = !home.joining();
-        let decided = home.handle(action, info, input.buffer());
+        let decided = home.handle(action, info, account, input.buffer());
         // Letters are shortcuts on the menu; only the code field keeps them.
         if was_menu || !home.joining() {
             input.clear_buffer();
         }
-        if let Some(choice) = decided {
-            return Ok(choice);
+        match decided {
+            None => {}
+            Some(Pick::Choice(choice)) => return Ok(choice),
+            Some(Pick::Account) => {
+                input.suspend()?;
+                let mut stdin = io::stdin().lock();
+                let outcome = account_menu(&mut stdin, screen, account);
+                drop(stdin);
+                input.resume()?;
+                shown.clear();
+                outcome?;
+            }
+            Some(Pick::NeedsName(intent)) => {
+                input.suspend()?;
+                let mut stdin = io::stdin().lock();
+                let name = ask_guest_name(&mut stdin, screen, account);
+                drop(stdin);
+                input.resume()?;
+                shown.clear();
+                if let Some(name) = name? {
+                    return Ok(Some(StartChoice::Online(intent, name)));
+                }
+            }
         }
     }
 }
@@ -763,25 +854,38 @@ mod tests {
         Theme::new(true, false, true, ui::THEMES[0].1)
     }
 
-    fn key(home: &mut Home, info: &HomeInfo, typed: &str) -> Option<Option<StartChoice>> {
-        home.handle(Action::Prompt, info, typed)
+    /// Never signed in and never touches a real server: safe for tests.
+    fn guest() -> AccountContext {
+        AccountContext::load(
+            Path::new("/nonexistent/config.json"),
+            "ws://example.test/ws",
+            "Guest".to_string(),
+        )
+    }
+
+    fn key(home: &mut Home, info: &HomeInfo, account: &AccountContext, typed: &str) -> Option<Pick> {
+        home.handle(Action::Prompt, info, account, typed)
     }
 
     #[test]
     fn letters_and_old_numbers_start_games() {
         let info = info(false, false);
+        let account = guest();
         let mut home = Home::new(&info);
         assert!(matches!(
-            key(&mut home, &info, "b"),
-            Some(Some(StartChoice::Mode(Mode::HumanBlack)))
+            key(&mut home, &info, &account, "b"),
+            Some(Pick::Choice(Some(StartChoice::Mode(Mode::HumanBlack))))
         ));
         assert!(matches!(
-            key(&mut home, &info, "3"),
-            Some(Some(StartChoice::Mode(Mode::TwoPlayer)))
+            key(&mut home, &info, &account, "3"),
+            Some(Pick::Choice(Some(StartChoice::Mode(Mode::TwoPlayer))))
         ));
-        assert!(matches!(key(&mut home, &info, "q"), Some(None)));
+        assert!(matches!(
+            key(&mut home, &info, &account, "q"),
+            Some(Pick::Choice(None))
+        ));
         // Continue is not on offer without an autosave.
-        assert!(key(&mut home, &info, "c").is_none());
+        assert!(key(&mut home, &info, &account, "c").is_none());
         assert!(home.complaint.is_some());
     }
 
@@ -795,42 +899,48 @@ mod tests {
     #[test]
     fn arrows_wrap_around_the_menu() {
         let info = info(false, true);
+        let account = guest();
         let mut home = Home::new(&info);
-        home.handle(Action::Focus { reverse: true }, &info, "");
+        home.handle(Action::Focus { reverse: true }, &info, &account, "");
         assert_eq!(home.focused(), Entry::Quit);
-        home.handle(Action::Focus { reverse: true }, &info, "");
+        home.handle(Action::Focus { reverse: true }, &info, &account, "");
+        assert_eq!(home.focused(), Entry::Account);
+        home.handle(Action::Focus { reverse: true }, &info, &account, "");
         assert_eq!(home.focused(), Entry::Rejoin);
-        home.handle(Action::Focus { reverse: false }, &info, "");
-        home.handle(Action::Focus { reverse: false }, &info, "");
+        home.handle(Action::Focus { reverse: false }, &info, &account, "");
+        home.handle(Action::Focus { reverse: false }, &info, &account, "");
+        home.handle(Action::Focus { reverse: false }, &info, &account, "");
         assert_eq!(home.focused(), Entry::White);
     }
 
     #[test]
-    fn joining_collects_a_clean_code() {
+    fn joining_as_a_guest_asks_for_a_name() {
         let info = info(false, false);
+        let account = guest();
         let mut home = Home::new(&info);
-        assert!(key(&mut home, &info, "j").is_none());
+        assert!(key(&mut home, &info, &account, "j").is_none());
         assert!(home.joining());
         // Letters are part of the code now, not shortcuts.
-        assert!(key(&mut home, &info, "q").is_none());
+        assert!(key(&mut home, &info, &account, "q").is_none());
         assert!(home
-            .handle(Action::Submit(" ".to_string()), &info, "")
+            .handle(Action::Submit(" ".to_string()), &info, &account, "")
             .is_none());
         assert!(home.complaint.is_some());
-        match home.handle(Action::Submit("ab-12c".to_string()), &info, "") {
-            Some(Some(StartChoice::Online(OnlineIntent::Join(code)))) => {
+        match home.handle(Action::Submit("ab-12c".to_string()), &info, &account, "") {
+            Some(Pick::NeedsName(OnlineIntent::Join(code))) => {
                 assert_eq!(code, "AB12C")
             }
-            _ => panic!("expected a join"),
+            _ => panic!("expected a join to need a guest name"),
         }
     }
 
     #[test]
     fn escape_leaves_the_code_field() {
         let info = info(false, false);
+        let account = guest();
         let mut home = Home::new(&info);
-        key(&mut home, &info, "j");
-        home.handle(Action::Cancel, &info, "");
+        key(&mut home, &info, &account, "j");
+        home.handle(Action::Cancel, &info, &account, "");
         assert!(!home.joining());
         assert_eq!(home.focused(), Entry::Join);
     }
@@ -838,9 +948,10 @@ mod tests {
     #[test]
     fn frames_fit_every_window_and_rows_answer_clicks() {
         let info = info(true, true);
+        let account = guest();
         for (cols, rows) in [(30, 12), (60, 20), (80, 24), (120, 40), (200, 60)] {
             let mut home = Home::new(&info);
-            let frame = home.render(&theme(), &info, ui::Pieces::Glyph, cols, rows);
+            let frame = home.render(&theme(), &info, &account, ui::Pieces::Glyph, cols, rows);
             assert_eq!(frame.len(), rows);
             for line in &frame {
                 assert!(ui::width(line) <= cols, "{cols}x{rows}: {line:?}");
@@ -852,10 +963,14 @@ mod tests {
                     row: hit.row as u16,
                 },
                 &info,
+                &account,
                 "",
             );
             assert!(
-                matches!(chosen, Some(Some(StartChoice::Mode(Mode::TwoPlayer)))),
+                matches!(
+                    chosen,
+                    Some(Pick::Choice(Some(StartChoice::Mode(Mode::TwoPlayer))))
+                ),
                 "{cols}x{rows}"
             );
         }
@@ -864,8 +979,9 @@ mod tests {
     #[test]
     fn a_wide_window_shows_the_preview_board() {
         let info = info(false, false);
+        let account = guest();
         let mut home = Home::new(&info);
-        let frame = home.render(&theme(), &info, ui::Pieces::Glyph, 120, 40);
+        let frame = home.render(&theme(), &info, &account, ui::Pieces::Glyph, 120, 40);
         let text = frame.join("\n");
         assert!(text.contains('\u{265a}') && text.contains('\u{2654}'));
         assert!(text.contains("PLAY") && text.contains("ONLINE"));

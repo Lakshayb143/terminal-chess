@@ -11,12 +11,13 @@ use chess_core::eval;
 use chess_core::game::{outcome, Game};
 use chess_core::search::Search;
 
+use crate::app::account::AccountContext;
 use crate::app::actions::{
     confirm_new, engine_move, handle_board_click, handle_ui_action, hint, make_move,
     play_promotion, set_depth, set_pieces, set_size, set_sound, set_theme, set_time, split_command,
     undo,
 };
-use crate::app::cli::{Mode, Options, StartChoice};
+use crate::app::cli::{names_a_file, Mode, Options, StartChoice, HOSTED_FILES};
 use crate::app::format::{format_score, white_pov};
 use crate::app::home::{self, HomeInfo};
 use crate::app::online::play_online;
@@ -31,7 +32,7 @@ use crate::app::screen::{Screen, UiAction};
 
 pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), String> {
     if options.online.is_some() {
-        return play_online(options, loaded);
+        return play_online(options, loaded.path, loaded.preferences);
     }
     let config_path = loaded.path;
     let session_path = storage::default_session_path(&config_path);
@@ -70,16 +71,21 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
     let (mut game, mut mode) = match restored.take() {
         Some((game, mode)) => (game, mode),
         None => {
+            let mut account = AccountContext::load(
+                &config_path,
+                &options.server_url,
+                options.online_name.clone(),
+            );
             let choice = match options.mode {
                 Some(mode) => StartChoice::Mode(mode),
                 None => {
                     let picked = if screen.theme.live && screen.theme.color {
                         let seat_path = storage::default_online_session_path(&config_path);
                         let info = HomeInfo::load(&session_path, &seat_path, &options, &screen);
-                        home::run(&screen, &info)?
+                        home::run(&mut screen, &info, &mut account)?
                     } else {
                         let mut stdin = io::stdin().lock();
-                        ask_mode(&mut stdin, &mut screen, session_path.exists())?
+                        ask_mode(&mut stdin, &mut screen, session_path.exists(), &mut account)?
                     };
                     match picked {
                         Some(choice) => choice,
@@ -88,6 +94,14 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
                 }
             };
             match choice {
+                StartChoice::Online(intent, name) => {
+                    // The online game sets up its own screen.
+                    drop(_fullscreen);
+                    let mut options = options;
+                    options.online = Some(intent);
+                    options.online_name = name;
+                    return play_online(options, config_path, last_preferences);
+                }
                 StartChoice::Mode(mode) => (
                     Game::with_clock(
                         start.expect("new games have a starting position"),
@@ -99,20 +113,6 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
                 StartChoice::Resume => {
                     resuming = true;
                     restore_game(storage::load_game(&session_path)?)?
-                }
-                StartChoice::Online(intent) => {
-                    let mut options = options;
-                    options.online = Some(intent);
-                    return play_online(
-                        options,
-                        storage::LoadedPreferences {
-                            preferences: last_preferences,
-                            path: config_path,
-                            first_run,
-                            warning: config_warning,
-                            backup_before_save: backup_config_before_save,
-                        },
-                    );
                 }
             }
         }
@@ -352,6 +352,10 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
             }
         }
         let (word, rest) = split_command(input);
+        if options.hosted && names_a_file(&word, rest) {
+            screen.note(screen.theme.warn(HOSTED_FILES));
+            continue;
+        }
 
         match word.as_str() {
             "quit" | "exit" | "q" => {

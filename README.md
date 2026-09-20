@@ -29,7 +29,13 @@ engine, or against another person over the network.
 
 ## Quick start
 
-You need a recent [Rust toolchain](https://www.rust-lang.org/tools/install).
+Where a server with the SSH gateway is running, there is nothing to install:
+
+```sh
+ssh chess.example.com
+```
+
+To run it yourself, you need a recent [Rust toolchain](https://www.rust-lang.org/tools/install).
 
 ```sh
 git clone https://github.com/Lakshayb143/terminal-chess.git
@@ -136,6 +142,38 @@ Online games support mouse and keyboard moves, server clocks, draw offers,
 resignation, PGN export, sounds, both board orientations, and all rendering
 modes. The status line distinguishes waiting for an opponent, reconnecting,
 and an opponent who is temporarily offline.
+
+## Accounts
+
+Anyone can play online as a guest. An account adds a name nobody else can use
+and keeps every finished online game in your history.
+
+Press `a` on the start menu to sign in or create one: choose a username, then
+type your password twice. The password never appears on screen. This computer
+stays signed in until you sign out from the same page or leave it unused for 90
+days; the sign-in lives beside the config as `account.json`, which, like the
+online seat, should be kept private.
+
+While signed in, online games are played under your username and the account
+page lists your recent results. Guests' names are marked as guests there, so
+nobody can pass as a registered player.
+
+## Playing over SSH
+
+The server can also let people in over plain `ssh`, which every macOS, Linux,
+and Windows 10 or later computer already has. Each visitor gets the full game
+in their own terminal: the local modes, online games with invite codes, and
+the account page.
+
+- No SSH password is asked for. Anyone may play as a guest.
+- Signing in or creating an account from the menu links the SSH key the
+  visitor connected with, so from then on `ssh` signs them in by itself.
+- Everything else matches the installed client, except that sound stays off
+  and commands that read or write files are disabled, since the files would
+  be on the server. Use `pgn` to show a game and copy it from the screen.
+
+Images are as sharp as the visitor's terminal allows: iTerm2 and Kitty show
+real images through SSH; other terminals get the portable block pieces.
 
 ## Board rendering
 
@@ -248,8 +286,9 @@ planned interface work in [UI_ROADMAP.md](UI_ROADMAP.md).
 ## Running the multiplayer server
 
 The repository includes the authoritative WebSocket server used by online
-clients. It has durable active rooms, reconnect tokens, per-connection request
-limits, structured logs, and graceful shutdown.
+clients. It has durable active rooms, reconnect tokens, accounts and game
+history in SQLite, per-connection request limits, structured logs, and graceful
+shutdown.
 
 Run the server locally with:
 
@@ -267,7 +306,12 @@ minutes are discarded. The following environment variables configure it:
 | --- | --- | --- |
 | `CHESS_SERVER_ADDR` | `127.0.0.1:3000` | TCP bind address |
 | `CHESS_SERVER_STATE` | `data/server-state.json` | Durable room state |
+| `CHESS_SERVER_DB` | `data/chess.db` | Accounts and finished games (SQLite); empty for guests only |
 | `CHESS_RATE_LIMIT_PER_10S` | `60` | Requests allowed per connection window |
+| `CHESS_SSH_ADDR` | unset | Address for the SSH gateway, such as `0.0.0.0:2222`; unset turns it off |
+| `CHESS_SSH_HOST_KEY` | `data/ssh_host_ed25519_key` | The gateway's host key, created on first start |
+| `CHESS_CLIENT_BIN` | `chess` beside the server | The terminal client started for each visitor |
+| `CHESS_SSH_MAX_SESSIONS` | `100` | Visitors allowed at once |
 | `CHESS_LOG_FORMAT` | text | Set to `json` for structured logs |
 | `RUST_LOG` | `chess_server=info` | Log filter |
 

@@ -18,11 +18,12 @@ use chess_protocol::{
     TimeControl,
 };
 
+use crate::app::account::AccountContext;
 use crate::app::actions::{
     cycle_pieces, flip_board, open_promotion_menu, set_pieces, set_size, set_sound, set_theme,
     sound_after_move, split_command, toggle_size,
 };
-use crate::app::cli::{Mode, OnlineIntent, Options};
+use crate::app::cli::{names_a_file, Mode, OnlineIntent, Options, HOSTED_FILES};
 use crate::app::format::kind_name;
 use crate::app::pages::{export_pgn, history_page, pgn_lines};
 use crate::app::parse::{nearby_moves, promotion_default};
@@ -40,6 +41,8 @@ pub(crate) struct OnlineSession {
     pub(crate) side: Option<Color>,
     pub(crate) player_name: String,
     pub(crate) has_snapshot: bool,
+    /// Signs each new connection in, so the game is played under the account.
+    pub(crate) account: AccountContext,
 }
 
 impl OnlineSession {
@@ -91,9 +94,9 @@ impl OnlineSession {
 
 pub(crate) fn play_online(
     mut options: Options,
-    loaded: storage::LoadedPreferences,
+    config_path: PathBuf,
+    preferences: storage::Preferences,
 ) -> Result<(), String> {
-    let config_path = loaded.path;
     let seat_path = storage::default_online_session_path(&config_path);
     let intent = options
         .online
@@ -109,6 +112,14 @@ pub(crate) fn play_online(
     };
     if let Some(seat) = &restored_seat {
         options.server_url = seat.server_url.clone();
+    }
+    let account = AccountContext::load(
+        &config_path,
+        &options.server_url,
+        options.online_name.clone(),
+    );
+    if let Some(username) = account.username() {
+        options.online_name = username.to_string();
     }
 
     let initial_side = restored_seat
@@ -141,6 +152,7 @@ pub(crate) fn play_online(
         screen.image_protocol = ui::detect_image_protocol();
     }
 
+    let hosted = options.hosted;
     let mut game = Game::with_clock(Position::startpos(), options.clock, options.increment);
     game.clock.pause();
     let client = OnlineClient::connect(options.server_url.clone());
@@ -156,10 +168,11 @@ pub(crate) fn play_online(
         side: initial_side,
         player_name: options.online_name,
         has_snapshot: false,
+        account,
     };
     let mut terminal_input = TerminalInput::enter(screen.theme.live && screen.theme.color)?;
     let limits = Limits::default();
-    let mut last_preferences = loaded.preferences;
+    let mut last_preferences = preferences;
     let mut persistence_error_reported = false;
 
     loop {
@@ -312,6 +325,10 @@ pub(crate) fn play_online(
         }
 
         let (word, rest) = split_command(input);
+        if hosted && names_a_file(&word, rest) {
+            screen.note(screen.theme.warn(HOSTED_FILES));
+            continue;
+        }
         match word.as_str() {
             "quit" | "exit" | "q" => return Ok(()),
             "help" | "h" | "?" => {
@@ -420,6 +437,14 @@ pub(crate) fn handle_transport_event(
                 },
                 screen,
             );
+            // Sent before the game command; the server answers in order, so
+            // the seat is taken under the account.
+            if let Some(token) = session.account.session_token() {
+                let command = ClientCommand::Authenticate {
+                    session_token: token.to_string(),
+                };
+                session.send(command, screen);
+            }
             let command = session
                 .reconnect_command()
                 .unwrap_or_else(|| match &session.intent {
@@ -461,7 +486,21 @@ pub(crate) fn handle_transport_event(
             screen.note(screen.theme.warn(&reason));
         }
         TransportEvent::Message(envelope) => match envelope.event {
-            ServerEvent::Welcome { .. } | ServerEvent::Pong => {}
+            ServerEvent::Welcome { .. }
+            | ServerEvent::Pong
+            | ServerEvent::SignedIn { .. }
+            | ServerEvent::SignedOut
+            | ServerEvent::GameList { .. }
+            | ServerEvent::SshKeyLinked => {}
+            ServerEvent::Error {
+                code: ErrorCode::InvalidSession,
+                ..
+            } => {
+                session.account.forget();
+                screen.note(screen.theme.warn(
+                    "Your sign-in has expired, so this game is played as a guest. Sign in again from the menu.",
+                ));
+            }
             ServerEvent::GameCreated {
                 invite_code,
                 reconnect_token,
