@@ -15,9 +15,9 @@ use crate::app::format::{budget_text, material};
 pub(crate) struct Screen {
     pub(crate) theme: Theme,
     pub(crate) sound: sound::Player,
-    /// A negotiated Kitty/iTerm-family image protocol. The Unicode board is
+    /// A negotiated iTerm, Kitty, or sixel image protocol. The Unicode board is
     /// always rendered underneath as a zero-risk fallback.
-    pub(crate) inline_images: bool,
+    pub(crate) image_protocol: Option<ui::ImageProtocol>,
     pub(crate) flipped: bool,
     /// The terminal as it was when the last frame was drawn. It is measured
     /// again every frame, so resizing the window and pressing return is all it
@@ -76,6 +76,9 @@ pub(crate) struct Screen {
     pub(crate) last_size: Option<(usize, usize)>,
     /// The board image currently covering the Unicode fallback, if any.
     pub(crate) inline_drawn: bool,
+    /// The encoded picture of the board last sent, for sending again when
+    /// text has been written over it.
+    pub(crate) inline_bytes: Option<(InlineBoardKey, Vec<u8>)>,
     pub(crate) last_inline_board: Option<InlineBoardKey>,
     /// The independently edited command row, cached so idle clock polls do
     /// not keep sending the same cursor movement and text.
@@ -253,7 +256,7 @@ impl Screen {
         Screen {
             theme,
             sound,
-            inline_images: false,
+            image_protocol: None,
             flipped: false,
             cols: 80,
             rows: 24,
@@ -284,6 +287,7 @@ impl Screen {
             last_frame: Vec::new(),
             last_size: None,
             inline_drawn: false,
+            inline_bytes: None,
             last_inline_board: None,
             last_prompt: None,
             redraw: true,
@@ -520,7 +524,7 @@ impl Screen {
                 self.page_offset = 0;
             }
         }
-        let wants_inline_board = self.inline_images
+        let wants_inline_board = self.image_protocol.is_some()
             && self.pieces == ui::Pieces::Auto
             && self.page.is_none()
             && self.metrics.art;
@@ -622,28 +626,39 @@ impl Screen {
             top: body_start + 1,
         });
         let image_changed = inline_key != self.last_inline_board;
-        let inline_board = (wants_inline_board && image_changed)
-            .then(|| self.theme.board_image(&self.board_view(game)));
         let next_frame: Vec<String> = frame.iter().map(|line| ui::clip(line, self.cols)).collect();
         let size_changed = self.last_size != Some((self.cols, self.rows));
         let inline_transition = self.inline_drawn != wants_inline_board;
         let full_redraw = self.last_frame.is_empty() || size_changed || inline_transition;
+        let changed_rows = changed_frame_rows(&self.last_frame, &next_frame, full_redraw);
+        // Rewriting a row that crosses the board writes the text board over
+        // the picture. Most terminals keep pictures in the cells they cover,
+        // so the text erases it, and it is drawn again even when the position
+        // has not changed. Even Kitty's own protocol is stored that way by
+        // some terminals that speak it, such as VS Code.
+        let protocol = self.image_protocol.filter(|_| wants_inline_board);
+        let board_top = body_start + 1;
+        let board_rows = board_top..board_top + 8 * self.metrics.cell_h;
+        let board_overwritten =
+            protocol.is_some() && changed_rows.iter().any(|row| board_rows.contains(row));
+        let draw_image = image_changed || full_redraw || board_overwritten;
 
         // Synchronized output lets supporting terminals present text and the
         // replacement board image as one completed frame. Terminals that do
         // not implement mode 2026 safely ignore it. Ordinary frames are row
         // diffs; a full clear is reserved for geometry and image-mode changes.
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
-        if self.inline_drawn
-            && !ui::inline_images_replace_in_place()
-            && (full_redraw || image_changed)
-        {
+        let kitty_drawn =
+            self.inline_drawn && self.image_protocol == Some(ui::ImageProtocol::Kitty);
+        // Kitty placements that float above the text would otherwise pile up
+        // under each redrawn picture.
+        if kitty_drawn && draw_image {
             out.push_str("\x1b_Ga=d,d=A\x1b\\");
         }
         if full_redraw {
             out.push_str("\x1b[2J");
         }
-        for row in changed_frame_rows(&self.last_frame, &next_frame, full_redraw) {
+        for row in changed_rows {
             out.push_str(&format!("\x1b[{};1H{}\x1b[K", row + 1, next_frame[row]));
         }
         // The command line is edited outside the frame cache and therefore
@@ -653,13 +668,38 @@ impl Screen {
         print!("{}", out);
         let _ = io::stdout().flush();
 
-        if let Some(image) = inline_board {
-            ui::draw_inline_image(
-                &image,
-                self.metrics,
-                self.indent.len() + ui::GUTTER,
-                body_start + 1,
-            );
+        match protocol {
+            Some(ui::ImageProtocol::Kitty) if draw_image => {
+                let image = self.theme.board_image(&self.board_view(game));
+                ui::draw_kitty_image(
+                    &image,
+                    self.metrics,
+                    self.indent.len() + ui::GUTTER,
+                    board_top,
+                );
+            }
+            Some(protocol) if draw_image => {
+                let cached = self
+                    .inline_bytes
+                    .as_ref()
+                    .is_some_and(|(key, _)| Some(key) == inline_key.as_ref());
+                if !cached {
+                    let bytes = ui::inline_image_bytes(
+                        protocol,
+                        &self.theme,
+                        &self.board_view(game),
+                        self.metrics,
+                        self.indent.len() + ui::GUTTER,
+                        board_top,
+                    );
+                    self.inline_bytes = inline_key.clone().map(|key| (key, bytes));
+                }
+                if let Some((_, bytes)) = &self.inline_bytes {
+                    let mut stdout = io::stdout();
+                    let _ = stdout.write_all(bytes);
+                }
+            }
+            _ => {}
         }
         print!("\x1b[?25l\x1b[?2026l");
         let _ = io::stdout().flush();

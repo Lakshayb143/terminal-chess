@@ -19,6 +19,7 @@ use crate::app::actions::{
 };
 use crate::app::cli::{names_a_file, Mode, Options, StartChoice, HOSTED_FILES};
 use crate::app::format::{format_score, white_pov};
+use crate::app::home::{self, HomeInfo};
 use crate::app::online::play_online;
 use crate::app::pages::{
     export_pgn, help_lines, history_page, import_pgn, load_saved_game, moves_lines, pgn_lines,
@@ -64,28 +65,34 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
     // in-game Piece control can switch to Auto later without querying the
     // terminal in the middle of raw event input.
     if screen.theme.live && !screen.theme.ascii {
-        screen.inline_images = ui::detect_inline_images();
+        screen.image_protocol = ui::detect_image_protocol();
     }
 
     let (mut game, mut mode) = match restored.take() {
         Some((game, mode)) => (game, mode),
         None => {
-            let mut stdin = io::stdin().lock();
+            let mut account = AccountContext::load(
+                &config_path,
+                &options.server_url,
+                options.online_name.clone(),
+            );
             let choice = match options.mode {
                 Some(mode) => StartChoice::Mode(mode),
                 None => {
-                    let mut account = AccountContext::load(
-                        &config_path,
-                        &options.server_url,
-                        options.online_name.clone(),
-                    );
-                    match ask_mode(&mut stdin, &mut screen, session_path.exists(), &mut account)? {
+                    let picked = if screen.theme.live && screen.theme.color {
+                        let seat_path = storage::default_online_session_path(&config_path);
+                        let info = HomeInfo::load(&session_path, &seat_path, &options, &screen);
+                        home::run(&mut screen, &info, &mut account)?
+                    } else {
+                        let mut stdin = io::stdin().lock();
+                        ask_mode(&mut stdin, &mut screen, session_path.exists(), &mut account)?
+                    };
+                    match picked {
                         Some(choice) => choice,
                         None => return Ok(()),
                     }
                 }
             };
-            drop(stdin);
             match choice {
                 StartChoice::Online(intent, name) => {
                     // The online game sets up its own screen.
@@ -133,6 +140,11 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
             .theme
             .dim("Type a move, click a piece, or press Tab for controls.")]
     };
+    if screen.pieces != ui::Pieces::Glyph && screen.theme.live {
+        if let Some(tip) = ui::terminal_tip(screen.image_protocol) {
+            screen.message.push(screen.theme.dim(tip));
+        }
+    }
     let mut saved_revision = game.revision;
     let mut persistence_error_reported = false;
 

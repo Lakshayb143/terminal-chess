@@ -167,7 +167,7 @@ async fn a_visitor_plays_as_a_guest_until_their_key_is_linked() {
     let servers = start().await;
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
 
-    let screen = visit(&servers, key.clone(), "sign in or create an account").await;
+    let screen = visit(&servers, key.clone(), "sign in or sign up").await;
     assert!(screen.contains("playing as a guest"));
 
     // Link the key the way signing in over SSH does, then visit again.
@@ -185,6 +185,6 @@ async fn a_visitor_plays_as_a_guest_until_their_key_is_linked() {
         .await
         .unwrap();
 
-    let screen = visit(&servers, key, "your account and games").await;
+    let screen = visit(&servers, key, "your recent games").await;
     assert!(screen.contains("signed in as carol"));
 }

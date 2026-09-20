@@ -264,7 +264,7 @@ fn ask_invite_code(
 
 /// The name a guest shows their opponent, or `None` to go back. Signed-in
 /// players always play under their username, so they are not asked.
-fn ask_guest_name(
+pub(crate) fn ask_guest_name(
     stdin: &mut io::StdinLock,
     screen: &mut Screen,
     account: &AccountContext,

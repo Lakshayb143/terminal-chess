@@ -372,40 +372,321 @@ fn ansi256_index(color: Rgb) -> u8 {
     }
 }
 
-/// Probe for a real inline-image protocol. The Kitty query also works through
-/// SSH because the bytes are answered by the terminal emulator on the user's
+/// A way of putting a real picture of the board on the screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageProtocol {
+    /// iTerm2's inline PNGs, which WezTerm, VS Code and others also accept.
+    /// The terminal scales the picture to a size given in cells.
+    Iterm,
+    /// Kitty's graphics protocol: Kitty, Ghostty, Konsole.
+    Kitty,
+    /// DEC sixel: foot, Konsole, xterm, Windows Terminal, recent VTE. Sixels
+    /// are drawn pixel for pixel, so the picture is made at the exact size of
+    /// the cells it covers.
+    Sixel { cell_width: u16, cell_height: u16 },
+}
+
+impl ImageProtocol {
+    pub fn name(self) -> &'static str {
+        match self {
+            ImageProtocol::Iterm => "iTerm images",
+            ImageProtocol::Kitty => "Kitty images",
+            ImageProtocol::Sixel { .. } => "sixel images",
+        }
+    }
+}
+
+/// Probe for a real inline-image protocol. The queries also work through SSH
+/// because the bytes are answered by the terminal emulator on the user's
 /// machine, not by the remote shell. iTerm-family terminals are recognized by
-/// their conventional environment markers before the active probe is needed.
-pub fn detect_inline_images() -> bool {
+/// their conventional environment markers before any query is needed.
+pub fn detect_image_protocol() -> Option<ImageProtocol> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
-        return false;
+        return None;
     }
     if viuer::is_iterm_supported() {
-        return true;
+        return Some(ImageProtocol::Iterm);
     }
-    viuer::get_kitty_support() != viuer::KittySupport::None
+    // VS Code only draws pictures once its `enableImages` setting is on, and
+    // then says so by answering the Kitty query or offering sixels. Its
+    // pictures of every kind live in the text cells, so it is sent iTerm's
+    // PNGs, which the board redraws whenever text lands on them; placing
+    // Kitty images there would leave them erased by the next panel update.
+    let vscode = std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "vscode");
+    if viuer::get_kitty_support() != viuer::KittySupport::None {
+        return Some(if vscode {
+            ImageProtocol::Iterm
+        } else {
+            ImageProtocol::Kitty
+        });
+    }
+    let reply = query_terminal("\x1b[16t\x1b[14t\x1b[?2;1;0S\x1b[c")?;
+    let answers = TerminalAnswers::parse(&reply);
+    if !answers.sixel {
+        return None;
+    }
+    if vscode {
+        return Some(ImageProtocol::Iterm);
+    }
+    let (cols, rows) = terminal_size()?;
+    // Windows Terminal scales every sixel from the VT340's 10 by 20 pixel
+    // cell to its real font, so that size is right there even unanswered.
+    let windows_terminal = std::env::var_os("WT_SESSION").is_some();
+    let (cell_width, cell_height) = answers
+        .cell_size(cols, rows)
+        .or(windows_terminal.then_some((10, 20)))?;
+    Some(ImageProtocol::Sixel {
+        cell_width,
+        cell_height,
+    })
 }
 
-/// iTerm's inline images replace the cells they cover. Kitty placements are
-/// separate objects and must be removed before a new anonymous placement is
-/// drawn in the same rectangle.
-pub fn inline_images_replace_in_place() -> bool {
-    viuer::is_iterm_supported()
+/// Advice for a terminal that could draw the board better than it does with
+/// its current settings, shown once when a game starts.
+pub fn terminal_tip(protocol: Option<ImageProtocol>) -> Option<&'static str> {
+    let vscode = std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "vscode");
+    (vscode && protocol.is_none()).then_some(
+        "Sharper pieces in VS Code: turn on terminal.integrated.enableImages, \
+         or set terminal.integrated.minimumContrastRatio to 1.",
+    )
 }
 
-/// Paint an already composed board into its reserved terminal rectangle. If a
-/// protocol fails, the caller's Unicode board remains visible underneath.
-pub fn draw_inline_image(image: &image::DynamicImage, metrics: Metrics, column: usize, row: usize) {
-    // iTerm receives a compressed PNG, so give it the full-resolution board.
-    // viuer's remote Kitty path sends raw RGBA bytes; cap that copy so an SSH
-    // redraw remains responsive without lowering iTerm's image quality.
-    let kitty_image;
-    let image = if viuer::is_iterm_supported() {
-        image
-    } else {
-        kitty_image = image.resize_exact(512, 512, image::imageops::FilterType::Lanczos3);
-        &kitty_image
+/// What a terminal said about itself in reply to [`detect_image_protocol`]'s
+/// queries. Any of them may go unanswered except the device attributes.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TerminalAnswers {
+    /// Primary device attributes list `4`.
+    sixel: bool,
+    /// `CSI 16 t`: one cell, in pixels, height first.
+    cell: Option<(u32, u32)>,
+    /// `CSI 14 t`: the text area, in pixels, height first.
+    area: Option<(u32, u32)>,
+    /// `XTSMGRAPHICS`: the largest sixel the terminal takes, width first. On
+    /// xterm.js-based terminals this is the whole canvas.
+    geometry: Option<(u32, u32)>,
+}
+
+impl TerminalAnswers {
+    fn parse(reply: &str) -> TerminalAnswers {
+        let mut answers = TerminalAnswers::default();
+        for sequence in reply
+            .split('\x1b')
+            .filter_map(|part| part.strip_prefix('['))
+        {
+            let Some(last) = sequence.chars().last() else {
+                continue;
+            };
+            let body = &sequence[..sequence.len() - last.len_utf8()];
+            let private = body.starts_with('?');
+            let numbers: Vec<u32> = body
+                .trim_start_matches('?')
+                .split(';')
+                .map(|number| number.parse().unwrap_or(0))
+                .collect();
+            let pair = |first: usize| Some((*numbers.get(first)?, *numbers.get(first + 1)?));
+            match (private, last, numbers.first()) {
+                (true, 'c', _) => answers.sixel = numbers.iter().skip(1).any(|&n| n == 4),
+                (false, 't', Some(6)) => answers.cell = pair(1),
+                (false, 't', Some(4)) => answers.area = pair(1),
+                (true, 'S', Some(2)) if numbers.get(1) == Some(&0) => answers.geometry = pair(2),
+                _ => {}
+            }
+        }
+        answers
+    }
+
+    /// Width and height of one cell in pixels, from the most direct answer
+    /// the terminal gave.
+    fn cell_size(&self, cols: usize, rows: usize) -> Option<(u16, u16)> {
+        let (cols, rows) = (cols as u32, rows as u32);
+        let (width, height) = match (self.cell, self.area, self.geometry) {
+            (Some((height, width)), _, _) => (width, height),
+            (None, Some((height, width)), _) => (width / cols, height / rows),
+            (None, None, Some((width, height))) => (width / cols, height / rows),
+            (None, None, None) => return None,
+        };
+        let plausible = |value: u32| (2..=200).contains(&value);
+        (plausible(width) && plausible(height)).then_some((width as u16, height as u16))
+    }
+}
+
+/// Send `queries`, which must end with a primary device attributes request,
+/// and collect the replies. Every terminal answers that request, and answers
+/// in order, so its reply marks the end of everything the terminal will say.
+/// The terminal is switched to raw input for the exchange, with reads that
+/// give up after a tenth of a second, and two seconds in all.
+#[cfg(unix)]
+fn query_terminal(queries: &str) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let stty = |args: &[&str]| {
+        Command::new("stty")
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
     };
+    let saved = String::from_utf8(stty(&["-g"])?.stdout).ok()?;
+    let saved = saved.trim();
+    stty(&["raw", "-echo", "min", "0", "time", "1"])?;
+
+    let mut reply = Vec::new();
+    if let Ok(mut tty) = std::fs::File::open("/dev/tty") {
+        let mut out = io::stdout();
+        let _ = out.write_all(queries.as_bytes());
+        let _ = out.flush();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut buffer = [0u8; 256];
+        while Instant::now() < deadline && !ends_with_device_attributes(&reply) {
+            match tty.read(&mut buffer) {
+                Ok(count) => reply.extend_from_slice(&buffer[..count]),
+                Err(_) => break,
+            }
+        }
+    }
+    stty(&[saved]);
+    ends_with_device_attributes(&reply).then(|| String::from_utf8_lossy(&reply).into_owned())
+}
+
+/// The Windows console form of the exchange above, for cmd and PowerShell in
+/// Windows Terminal. The console hands replies over as typed characters once
+/// virtual terminal input is on, so input is switched to that, unechoed, and
+/// polled until the device attributes arrive or two seconds pass.
+#[cfg(windows)]
+fn query_terminal(queries: &str) -> Option<String> {
+    use crossterm_winapi::{Console, ConsoleMode, Handle, InputRecord};
+    use std::time::{Duration, Instant};
+
+    const PROCESSED_INPUT: u32 = 0x0001;
+    const LINE_INPUT: u32 = 0x0002;
+    const ECHO_INPUT: u32 = 0x0004;
+    const VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+    let handle = Handle::current_in_handle().ok()?;
+    let mode = ConsoleMode::from(handle.clone());
+    let saved = mode.mode().ok()?;
+    mode.set_mode((saved | VIRTUAL_TERMINAL_INPUT) & !(PROCESSED_INPUT | LINE_INPUT | ECHO_INPUT))
+        .ok()?;
+    let console = Console::from(handle);
+
+    let mut reply = String::new();
+    let mut out = io::stdout();
+    let _ = out.write_all(queries.as_bytes());
+    let _ = out.flush();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !ends_with_device_attributes(reply.as_bytes()) {
+        match console.number_of_console_input_events() {
+            Ok(0) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(_) => {
+                let Ok(records) = console.read_console_input() else {
+                    break;
+                };
+                let units: Vec<u16> = records
+                    .into_iter()
+                    .filter_map(|record| match record {
+                        InputRecord::KeyEvent(key) if key.key_down && key.u_char != 0 => {
+                            Some(key.u_char)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                reply.push_str(&String::from_utf16_lossy(&units));
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = mode.set_mode(saved);
+    ends_with_device_attributes(reply.as_bytes()).then_some(reply)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn query_terminal(_queries: &str) -> Option<String> {
+    None
+}
+
+fn ends_with_device_attributes(reply: &[u8]) -> bool {
+    let Some(start) = reply.windows(3).rposition(|window| window == b"\x1b[?") else {
+        return false;
+    };
+    let rest = &reply[start + 3..];
+    rest.last() == Some(&b'c')
+        && rest[..rest.len() - 1]
+            .iter()
+            .all(|b| b.is_ascii_digit() || *b == b';')
+}
+
+/// The bytes that paint an already composed board into its reserved terminal
+/// rectangle, leaving the cursor where it was. They are kept apart from
+/// writing them so a caller can send the same picture again without encoding
+/// it again. Kitty pictures are sent by [`draw_kitty_image`] instead. If the
+/// protocol fails, the Unicode board remains visible underneath.
+pub fn inline_image_bytes(
+    protocol: ImageProtocol,
+    theme: &Theme,
+    view: &BoardView,
+    metrics: Metrics,
+    column: usize,
+    row: usize,
+) -> Vec<u8> {
+    let (cols, rows) = (metrics.cell_w * 8, metrics.cell_h * 8);
+    let mut out = format!("\x1b7\x1b[{};{}H", row + 1, column + 1).into_bytes();
+    match protocol {
+        // iTerm receives a compressed PNG, so give it the full-resolution
+        // board and let the terminal scale it to the cells.
+        ImageProtocol::Iterm => {
+            use base64::Engine as _;
+            let image = theme.board_image(view);
+            let mut png = Vec::new();
+            if image
+                .write_to(&mut io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .is_err()
+            {
+                return Vec::new();
+            }
+            let _ = write!(
+                out,
+                "\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=0:{}\x07",
+                png.len(),
+                cols,
+                rows,
+                base64::engine::general_purpose::STANDARD.encode(&png)
+            );
+        }
+        // A sixel is not scaled by the terminal, so it is drawn exactly as
+        // many pixels as the cells it covers. The squares are flat colours
+        // and the pieces few, so no dithering is needed to shade them.
+        ImageProtocol::Sixel {
+            cell_width,
+            cell_height,
+        } => {
+            let tile_w = metrics.cell_w * cell_width as usize;
+            let tile_h = metrics.cell_h * cell_height as usize;
+            let (width, height) = (tile_w * 8, tile_h * 8);
+            let pixels = theme.board_image_sized(view, tile_w, tile_h).to_rgba8();
+            let options = icy_sixel::EncodeOptions {
+                diffusion: 0.0,
+                ..icy_sixel::EncodeOptions::default()
+            };
+            let Ok(sixel) = icy_sixel::sixel_encode(pixels.as_raw(), width, height, &options)
+            else {
+                return Vec::new();
+            };
+            out.extend_from_slice(sixel.as_bytes());
+        }
+        ImageProtocol::Kitty => return Vec::new(),
+    }
+    out.extend_from_slice(b"\x1b8");
+    out
+}
+
+/// Place the board with the Kitty protocol. viuer's remote path sends raw
+/// RGBA bytes; cap that copy so an SSH redraw remains responsive.
+pub fn draw_kitty_image(image: &image::DynamicImage, metrics: Metrics, column: usize, row: usize) {
+    let image = image.resize_exact(512, 512, image::imageops::FilterType::Lanczos3);
     let config = viuer::Config {
         absolute_offset: true,
         x: column.min(u16::MAX as usize) as u16,
@@ -414,9 +695,10 @@ pub fn draw_inline_image(image: &image::DynamicImage, metrics: Metrics, column: 
         width: Some((metrics.cell_w * 8) as u32),
         height: Some((metrics.cell_h * 8) as u32),
         truecolor: true,
+        use_iterm: false,
         ..viuer::Config::default()
     };
-    let _ = viuer::print(image, &config);
+    let _ = viuer::print(&image, &config);
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +878,7 @@ struct SpriteKey {
     kind: usize,
     width: usize,
     height: usize,
+    hard: bool,
 }
 
 type Sprite = Arc<[u8]>;
@@ -604,13 +887,15 @@ static SPRITES: OnceLock<Mutex<HashMap<SpriteKey, Sprite>>> = OnceLock::new();
 
 /// Rasterize a piece to an exact pixel size. Keeping terminal-cell metrics out
 /// of this boundary prevents callers from accidentally confusing cells with
-/// the two-by-two pixel samples used by the portable renderer.
-fn piece_sprite(piece: Piece, width: usize, height: usize) -> Sprite {
+/// the two-by-two pixel samples used by the portable renderer. `hard`
+/// sprites have only opaque and empty pixels, for the block renderer.
+fn piece_sprite(piece: Piece, width: usize, height: usize, hard: bool) -> Sprite {
     let key = SpriteKey {
         color: piece.color.index(),
         kind: piece.kind.index(),
         width,
         height,
+        hard,
     };
     let sprites = SPRITES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(sprite) = sprites
@@ -627,19 +912,62 @@ fn piece_sprite(piece: Piece, width: usize, height: usize) -> Sprite {
         &resvg::usvg::Options::default(),
     )
     .expect("bundled chess piece SVG must be valid");
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(key.width as u32, key.height as u32)
+    // Rendered straight to size, a sprite this small is mostly antialiased
+    // edge, and each blended edge pixel becomes a grey fringe around the
+    // piece. Rendering larger and deciding each pixel by how much of it the
+    // piece covers gives a hard silhouette in the piece's own colours.
+    let supersample = if hard { 4 } else { 1 };
+    let (big_width, big_height) = (key.width * supersample, key.height * supersample);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(big_width as u32, big_height as u32)
         .expect("chess piece sprite dimensions must be non-zero");
-    let scale_x = key.width as f32 / tree.size().width();
-    let scale_y = key.height as f32 / tree.size().height();
+    let scale_x = big_width as f32 / tree.size().width();
+    let scale_y = big_height as f32 / tree.size().height();
     let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    let sprite: Sprite = Arc::from(pixmap.data());
+    let sprite: Sprite = if hard {
+        Arc::from(harden(pixmap.data(), key.width, key.height, supersample))
+    } else {
+        Arc::from(pixmap.data())
+    };
 
     sprites
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(key, sprite.clone());
     sprite
+}
+
+/// Reduce a premultiplied RGBA render `factor` times the target size to the
+/// target size. A pixel the piece covers at least half of becomes opaque, in
+/// the average colour of the covered part; any other pixel is left empty.
+fn harden(big: &[u8], width: usize, height: usize, factor: usize) -> Vec<u8> {
+    let big_width = width * factor;
+    let mut out = vec![0u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = [0u32; 4];
+            for sy in 0..factor {
+                for sx in 0..factor {
+                    let offset = ((y * factor + sy) * big_width + x * factor + sx) * 4;
+                    for (channel, total) in sum.iter_mut().enumerate() {
+                        *total += big[offset + channel] as u32;
+                    }
+                }
+            }
+            let samples = (factor * factor) as u32;
+            if sum[3] * 2 < samples * 255 {
+                continue;
+            }
+            // Premultiplied sums divided by the alpha sum give the covered
+            // part's own colour, unmixed with whatever lies behind it.
+            let offset = (y * width + x) * 4;
+            for channel in 0..3 {
+                out[offset + channel] = ((sum[channel] * 255 + sum[3] / 2) / sum[3]).min(255) as u8;
+            }
+            out[offset + 3] = 255;
+        }
+    }
+    out
 }
 
 fn ansi256_rgb(index: u8) -> [u8; 3] {
@@ -694,22 +1022,33 @@ fn composite(sprite: &[u8], offset: usize, background: [u8; 3]) -> [u8; 3] {
     ]
 }
 
-fn mean_color(pixels: &[[u8; 3]; 4], mask: u8, foreground: bool) -> [u8; 3] {
-    let mut sum = [0u16; 3];
-    let mut count = 0u16;
-    for (index, pixel) in pixels.iter().enumerate() {
-        if ((mask >> index) & 1 == 1) == foreground {
-            for channel in 0..3 {
-                sum[channel] += pixel[channel] as u16;
-            }
-            count += 1;
-        }
-    }
-    [
-        ((sum[0] + count / 2) / count) as u8,
-        ((sum[1] + count / 2) / count) as u8,
-        ((sum[2] + count / 2) / count) as u8,
-    ]
+/// The sample in one half of a partition that best stands for the rest of
+/// that half. A mean would invent colours that are in neither the piece nor
+/// the square, and those in-between shades read as a grey smear.
+fn medoid_color(pixels: &[[u8; 3]; 4], mask: u8, foreground: bool) -> [u8; 3] {
+    let members: Vec<[u8; 3]> = pixels
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| ((mask >> index) & 1 == 1) == foreground)
+        .map(|(_, pixel)| *pixel)
+        .collect();
+    members
+        .iter()
+        .copied()
+        .min_by_key(|candidate| {
+            members
+                .iter()
+                .map(|pixel| color_distance(*pixel, *candidate))
+                .sum::<u32>()
+        })
+        .expect("every partition half has a member")
+}
+
+fn color_distance(a: [u8; 3], b: [u8; 3]) -> u32 {
+    let red = a[0] as i32 - b[0] as i32;
+    let green = a[1] as i32 - b[1] as i32;
+    let blue = a[2] as i32 - b[2] as i32;
+    (2 * red * red + 4 * green * green + blue * blue) as u32
 }
 
 fn color_error(pixels: &[[u8; 3]; 4], mask: u8, foreground: [u8; 3], background: [u8; 3]) -> u32 {
@@ -722,10 +1061,7 @@ fn color_error(pixels: &[[u8; 3]; 4], mask: u8, foreground: [u8; 3], background:
             } else {
                 background
             };
-            let red = pixel[0] as i32 - sample[0] as i32;
-            let green = pixel[1] as i32 - sample[1] as i32;
-            let blue = pixel[2] as i32 - sample[2] as i32;
-            (2 * red * red + 4 * green * green + blue * blue) as u32
+            color_distance(*pixel, sample)
         })
         .sum()
 }
@@ -735,12 +1071,12 @@ fn color_error(pixels: &[[u8; 3]; 4], mask: u8, foreground: [u8; 3], background:
 /// colours exchanged.
 fn quadrant(pixels: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3], char) {
     const GLYPHS: [char; 8] = [' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛'];
-    let solid = mean_color(&pixels, 0, false);
+    let solid = medoid_color(&pixels, 0, false);
     let mut best = (color_error(&pixels, 0, solid, solid), solid, solid, ' ');
 
     for mask in 1..=7 {
-        let foreground = mean_color(&pixels, mask, true);
-        let background = mean_color(&pixels, mask, false);
+        let foreground = medoid_color(&pixels, mask, true);
+        let background = medoid_color(&pixels, mask, false);
         let error = color_error(&pixels, mask, foreground, background);
         if error < best.0 {
             best = (error, foreground, background, GLYPHS[mask as usize]);
@@ -750,7 +1086,7 @@ fn quadrant(pixels: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3], char) {
 }
 
 fn art_row(piece: Piece, row: usize, metrics: Metrics, background: Rgb, depth: Depth) -> String {
-    let sprite = piece_sprite(piece, metrics.cell_w * 2, metrics.cell_h * 2);
+    let sprite = piece_sprite(piece, metrics.cell_w * 2, metrics.cell_h * 2, true);
     let pixel_width = metrics.cell_w * 2;
     debug_assert_eq!(sprite.len(), pixel_width * metrics.cell_h * 2 * 4);
     let mut output = String::with_capacity(metrics.cell_w * 34);
@@ -1042,10 +1378,22 @@ impl Theme {
         // iTerm receives this as a compressed PNG. Ninety-six pixels per
         // square preserve the SVG curves on large and Retina displays; the
         // raw-data Kitty path is reduced separately when it is transmitted.
-        const TILE: usize = 96;
-        const BOARD: usize = TILE * 8;
+        self.board_image_sized(view, 96, 96)
+    }
 
-        let mut image = image::RgbaImage::new(BOARD as u32, BOARD as u32);
+    /// Compose the board with squares of exactly `tile_w` by `tile_h`
+    /// pixels, for a protocol the terminal does not scale. Drawing the pieces
+    /// at that size is sharper, and much faster, than resizing a picture.
+    pub fn board_image_sized(
+        &self,
+        view: &BoardView,
+        tile_w: usize,
+        tile_h: usize,
+    ) -> image::DynamicImage {
+        let board_w = tile_w * 8;
+        let tile = tile_w.min(tile_h);
+
+        let mut image = image::RgbaImage::new(board_w as u32, (tile_h * 8) as u32);
         let pixels = image.as_mut();
 
         for display_rank in 0..8usize {
@@ -1071,12 +1419,12 @@ impl Theme {
                 let p = &self.palette;
                 // An inline image is 24-bit whatever the text around it is.
                 let background = p.square(light, mark, Depth::True);
-                let origin_x = display_file * TILE;
-                let origin_y = display_rank * TILE;
+                let origin_x = display_file * tile_w;
+                let origin_y = display_rank * tile_h;
 
-                for y in 0..TILE {
-                    for x in 0..TILE {
-                        let offset = ((origin_y + y) * BOARD + origin_x + x) * 4;
+                for y in 0..tile_h {
+                    for x in 0..tile_w {
+                        let offset = ((origin_y + y) * board_w + origin_x + x) * 4;
                         pixels[offset..offset + 3].copy_from_slice(&background);
                         pixels[offset + 3] = 255;
                     }
@@ -1086,26 +1434,25 @@ impl Theme {
                     .map(|choice| choice.piece)
                     .or_else(|| view.pos.at(square));
                 if let Some(piece) = piece {
-                    let sprite = piece_sprite(piece, TILE, TILE);
-                    debug_assert_eq!(sprite.len(), TILE * TILE * 4);
-                    for y in 0..TILE {
-                        for x in 0..TILE {
-                            let source = (y * TILE + x) * 4;
+                    let sprite = piece_sprite(piece, tile_w, tile_h, false);
+                    debug_assert_eq!(sprite.len(), tile_w * tile_h * 4);
+                    for y in 0..tile_h {
+                        for x in 0..tile_w {
+                            let source = (y * tile_w + x) * 4;
                             let color = composite(&sprite, source, background);
-                            let destination = ((origin_y + y) * BOARD + origin_x + x) * 4;
+                            let destination = ((origin_y + y) * board_w + origin_x + x) * 4;
                             pixels[destination..destination + 3].copy_from_slice(&color);
                         }
                     }
                 } else if target && !capture {
                     let marker = p.marker(background);
-                    let radius = (TILE / 10) as isize;
-                    let center = (TILE / 2) as isize;
-                    for y in 0..TILE {
-                        for x in 0..TILE {
-                            let dx = x as isize - center;
-                            let dy = y as isize - center;
+                    let radius = (tile / 10) as isize;
+                    for y in 0..tile_h {
+                        for x in 0..tile_w {
+                            let dx = x as isize - (tile_w / 2) as isize;
+                            let dy = y as isize - (tile_h / 2) as isize;
                             if dx * dx + dy * dy <= radius * radius {
-                                let destination = ((origin_y + y) * BOARD + origin_x + x) * 4;
+                                let destination = ((origin_y + y) * board_w + origin_x + x) * 4;
                                 pixels[destination..destination + 3].copy_from_slice(&marker);
                             }
                         }
@@ -1116,16 +1463,16 @@ impl Theme {
                 // empty destinations keep the conventional center dot above.
                 if capture {
                     let marker = p.marker(background);
-                    let inset = TILE / 18;
-                    let thickness = (TILE / 32).max(2);
-                    for y in inset..TILE - inset {
-                        for x in inset..TILE - inset {
+                    let inset = tile / 18;
+                    let thickness = (tile / 32).max(2);
+                    for y in inset..tile_h - inset {
+                        for x in inset..tile_w - inset {
                             let on_vertical =
-                                x < inset + thickness || x >= TILE - inset - thickness;
+                                x < inset + thickness || x >= tile_w - inset - thickness;
                             let on_horizontal =
-                                y < inset + thickness || y >= TILE - inset - thickness;
+                                y < inset + thickness || y >= tile_h - inset - thickness;
                             if on_vertical || on_horizontal {
-                                let destination = ((origin_y + y) * BOARD + origin_x + x) * 4;
+                                let destination = ((origin_y + y) * board_w + origin_x + x) * 4;
                                 pixels[destination..destination + 3].copy_from_slice(&marker);
                             }
                         }
@@ -1459,5 +1806,50 @@ mod tests {
         assert_eq!(view.mark(d5).1, Some(Mark::Capture));
         assert_eq!(view.mark(board::sq(4, 1)).1, Some(Mark::Last));
         assert_eq!(view.mark(board::sq(0, 0)), (false, None));
+    }
+
+    #[test]
+    fn terminal_answers_find_sixel_and_cell_size() {
+        // foot: cell size answered directly.
+        let foot = TerminalAnswers::parse("\x1b[6;20;10t\x1b[4;480;800t\x1b[?62;4;22c");
+        assert!(foot.sixel);
+        assert_eq!(foot.cell_size(80, 24), Some((10, 20)));
+
+        // xterm.js with images on: no window reports, but the sixel canvas.
+        let vscode = TerminalAnswers::parse("\x1b[?2;0;960;480S\x1b[?62;4;9;22c");
+        assert!(vscode.sixel);
+        assert_eq!(vscode.cell_size(120, 24), Some((8, 20)));
+
+        // Only the text area: divided by the grid.
+        let area = TerminalAnswers::parse("\x1b[4;480;800t\x1b[?62;4c");
+        assert_eq!(area.cell_size(80, 24), Some((10, 20)));
+
+        // VTE without sixel, and a VT100-level reply whose `4` is not sixel.
+        assert!(!TerminalAnswers::parse("\x1b[6;17;8t\x1b[?65;1;9c").sixel);
+        assert!(!TerminalAnswers::parse("\x1b[?4;1c").sixel);
+
+        // Nothing but the device attributes: sixel, but no size to draw at.
+        assert_eq!(
+            TerminalAnswers::parse("\x1b[?62;4c").cell_size(80, 24),
+            None
+        );
+    }
+
+    #[test]
+    fn device_attributes_end_a_reply() {
+        assert!(ends_with_device_attributes(b"\x1b[6;20;10t\x1b[?62;4;22c"));
+        assert!(!ends_with_device_attributes(b"\x1b[6;20;10t"));
+        assert!(!ends_with_device_attributes(b"\x1b[?62;4"));
+        assert!(!ends_with_device_attributes(b""));
+    }
+
+    #[test]
+    fn hard_sprites_have_no_partial_pixels() {
+        let piece = Piece::new(Color::White, board::PieceKind::Knight);
+        let sprite = piece_sprite(piece, 16, 8, true);
+        assert!(sprite
+            .chunks(4)
+            .all(|pixel| pixel[3] == 0 || pixel[3] == 255));
+        assert!(sprite.chunks(4).any(|pixel| pixel[3] == 255));
     }
 }

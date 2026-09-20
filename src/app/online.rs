@@ -149,7 +149,7 @@ pub(crate) fn play_online(
     });
     let _fullscreen = ui::Fullscreen::enter(&screen.theme);
     if screen.theme.live && !screen.theme.ascii {
-        screen.inline_images = ui::detect_inline_images();
+        screen.image_protocol = ui::detect_image_protocol();
     }
 
     let hosted = options.hosted;

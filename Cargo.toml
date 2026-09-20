@@ -30,11 +30,13 @@ name = "chess"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 chess-core.workspace = true
 chess-protocol.workspace = true
 crossterm = "0.29.0"
 futures-util.workspace = true
-image = { version = "0.25.10", default-features = false }
+icy_sixel = { version = "0.7", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 resvg = { version = "0.48.1", default-features = false }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "vorbis"] }
 serde.workspace = true
@@ -44,6 +46,9 @@ tokio.workspace = true
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 viuer = "0.11.0"
+
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi = "0.9"
 
 [dev-dependencies]
 chess-server.workspace = true

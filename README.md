@@ -19,8 +19,8 @@ engine, or against another person over the network.
 - Use SAN (`Nf3`, `exd5`, `O-O`) or coordinate notation (`e2e4`) at any time.
 - Get a responsive layout with player panels, clocks, captured pieces, material
   advantage, move history, and clear game-over states.
-- Render crisp vector-derived pieces through iTerm2 and Kitty image protocols,
-  with true-colour and Unicode fallbacks for other terminals.
+- Render crisp vector-derived pieces through the iTerm2, Kitty, and sixel image
+  protocols, with true-colour and Unicode fallbacks for other terminals.
 - Hear distinct sounds for moves, captures, checks, castling, promotions, and
   game endings.
 - Choose between four board themes and several piece-rendering modes.
@@ -184,7 +184,7 @@ The default `auto` mode selects the best renderer available:
 
 | Command | Rendering mode |
 | --- | --- |
-| `pieces auto` | High-resolution inline images when supported, with a safe fallback |
+| `pieces auto` | High-resolution inline images (iTerm2, Kitty, or sixel) when supported, with a safe fallback |
 | `pieces art` | Portable true-colour artwork made from Unicode block elements |
 | `pieces glyph` | Chess characters supplied by the terminal font |
 
@@ -203,6 +203,24 @@ pieces auto
 
 Image rendering also works when iTerm2 is connected to a Linux machine over
 SSH. If detection fails, confirm that `LC_TERMINAL=iTerm2` reaches the server.
+
+At startup the game asks the terminal which image protocols it supports and how
+large its character cells are. The question and the answer travel through SSH,
+so detection works on a remote machine too.
+
+| Terminal | Large board with `pieces auto` |
+| --- | --- |
+| iTerm2, WezTerm | iTerm2 images |
+| Kitty, Ghostty, Konsole | Kitty images |
+| Windows Terminal 1.22+ (cmd, PowerShell, WSL, SSH), foot, xterm (`-ti vt340`), VTE builds with sixel | Sixel images |
+| VS Code with `terminal.integrated.enableImages` | iTerm2 images |
+| GNOME Terminal, Ptyxis, Alacritty, the classic Windows console, and others | Unicode block art |
+
+Terminals without image support draw the board with block art. VS Code
+recolours text it considers low-contrast, which spoils the art's shading; set
+`terminal.integrated.minimumContrastRatio` to `1`, or turn on
+`terminal.integrated.enableImages` to get the image board instead. The game
+shows this tip when it starts in VS Code without images.
 
 ## Sound
 
