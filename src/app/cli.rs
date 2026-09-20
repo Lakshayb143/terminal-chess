@@ -37,6 +37,8 @@ impl Mode {
 pub(crate) enum StartChoice {
     Mode(Mode),
     Resume,
+    /// Only the home page offers this; the command line has `online`.
+    Online(OnlineIntent),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -5,6 +5,7 @@
 pub(crate) mod actions;
 pub(crate) mod cli;
 pub(crate) mod format;
+pub(crate) mod home;
 pub(crate) mod local;
 pub(crate) mod online;
 pub(crate) mod pages;

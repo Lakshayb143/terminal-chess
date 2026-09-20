@@ -18,6 +18,7 @@ use crate::app::actions::{
 };
 use crate::app::cli::{Mode, Options, StartChoice};
 use crate::app::format::{format_score, white_pov};
+use crate::app::home::{self, HomeInfo};
 use crate::app::online::play_online;
 use crate::app::pages::{
     export_pgn, help_lines, history_page, import_pgn, load_saved_game, moves_lines, pgn_lines,
@@ -69,15 +70,23 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
     let (mut game, mut mode) = match restored.take() {
         Some((game, mode)) => (game, mode),
         None => {
-            let mut stdin = io::stdin().lock();
             let choice = match options.mode {
                 Some(mode) => StartChoice::Mode(mode),
-                None => match ask_mode(&mut stdin, &mut screen, session_path.exists())? {
-                    Some(choice) => choice,
-                    None => return Ok(()),
-                },
+                None => {
+                    let picked = if screen.theme.live && screen.theme.color {
+                        let seat_path = storage::default_online_session_path(&config_path);
+                        let info = HomeInfo::load(&session_path, &seat_path, &options, &screen);
+                        home::run(&screen, &info)?
+                    } else {
+                        let mut stdin = io::stdin().lock();
+                        ask_mode(&mut stdin, &mut screen, session_path.exists())?
+                    };
+                    match picked {
+                        Some(choice) => choice,
+                        None => return Ok(()),
+                    }
+                }
             };
-            drop(stdin);
             match choice {
                 StartChoice::Mode(mode) => (
                     Game::with_clock(
@@ -90,6 +99,20 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
                 StartChoice::Resume => {
                     resuming = true;
                     restore_game(storage::load_game(&session_path)?)?
+                }
+                StartChoice::Online(intent) => {
+                    let mut options = options;
+                    options.online = Some(intent);
+                    return play_online(
+                        options,
+                        storage::LoadedPreferences {
+                            preferences: last_preferences,
+                            path: config_path,
+                            first_run,
+                            warning: config_warning,
+                            backup_before_save: backup_config_before_save,
+                        },
+                    );
                 }
             }
         }
