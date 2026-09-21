@@ -15,12 +15,13 @@
 //!
 //! No SSH password is ever asked for: the chess account is the only account.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -60,6 +61,9 @@ pub struct GatewayConfig {
     pub server_url: String,
     /// Visitors allowed at once; later arrivals are asked to come back.
     pub max_sessions: usize,
+    /// Games one address may have open at once, so a single visitor cannot
+    /// take every seat.
+    pub max_per_address: usize,
 }
 
 /// Accept SSH visitors on `listener` until `shutdown` resolves.
@@ -89,6 +93,7 @@ pub async fn serve_ssh(
     let mut gateway = Gateway {
         shared: Arc::new(Shared {
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
+            addresses: Arc::default(),
             config,
             accounts,
         }),
@@ -143,6 +148,47 @@ struct Shared {
     config: GatewayConfig,
     accounts: Option<Accounts>,
     sessions: Arc<Semaphore>,
+    addresses: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+/// One of the games an address has open, given back when the game ends.
+struct AddressSlot {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    address: IpAddr,
+}
+
+impl AddressSlot {
+    /// `None` when `address` already has `limit` games open.
+    fn take(
+        counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+        address: IpAddr,
+        limit: usize,
+    ) -> Option<AddressSlot> {
+        // An IPv4 visitor reached through an IPv6 socket is the same visitor.
+        let address = address.to_canonical();
+        let mut open = counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = open.entry(address).or_insert(0);
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(AddressSlot {
+            counts: Arc::clone(counts),
+            address,
+        })
+    }
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let mut open = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = open.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.address);
+            }
+        }
+    }
 }
 
 struct Gateway {
@@ -194,6 +240,7 @@ struct Running {
     /// Holds the visitor's configuration and saves; deleted on drop.
     _home: tempfile::TempDir,
     _permit: OwnedSemaphorePermit,
+    _address: Option<AddressSlot>,
     session_token: Option<String>,
     link_ticket: Option<String>,
 }
@@ -387,6 +434,25 @@ impl Visitor {
     /// Start the chess client for this visitor and connect its terminal to
     /// the SSH channel.
     async fn start(&mut self, channel: ChannelId, handle: Handle) -> Result<Running, String> {
+        let limit = self.shared.config.max_per_address;
+        let address = match self.peer {
+            Some(peer) => Some(
+                AddressSlot::take(&self.shared.addresses, peer.ip(), limit).ok_or_else(|| {
+                    info!(peer = ?self.peer, "ssh visitor has too many games open");
+                    if limit == 1 {
+                        "You already have a game open from this address. \
+                         Close it, then connect again."
+                            .to_string()
+                    } else {
+                        format!(
+                            "You already have {limit} games open from this address. \
+                             Close one, then connect again."
+                        )
+                    }
+                })?,
+            ),
+            None => None,
+        };
         let permit = Arc::clone(&self.shared.sessions)
             .try_acquire_owned()
             .map_err(|_| {
@@ -467,6 +533,7 @@ impl Visitor {
             killer,
             _home: home,
             _permit: permit,
+            _address: address,
             session_token,
             link_ticket,
         })
@@ -604,6 +671,25 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0);
         }
+    }
+
+    #[test]
+    fn each_address_gets_a_few_games_and_gets_them_back() {
+        let counts = Arc::default();
+        let home: IpAddr = "203.0.113.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let other: IpAddr = "198.51.100.1".parse().unwrap();
+
+        let first = AddressSlot::take(&counts, home, 2).unwrap();
+        // The same visitor, seen through an IPv6 socket.
+        let second = AddressSlot::take(&counts, mapped, 2).unwrap();
+        assert!(AddressSlot::take(&counts, home, 2).is_none());
+        assert!(AddressSlot::take(&counts, other, 2).is_some());
+
+        drop(first);
+        let third = AddressSlot::take(&counts, home, 2).unwrap();
+        drop((second, third));
+        assert!(counts.lock().unwrap().is_empty());
     }
 
     #[test]

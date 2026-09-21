@@ -12,7 +12,7 @@ use chess_server::store::Store;
 use chess_server::{serve_with, Config};
 use russh::client;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::ChannelMsg;
+use russh::{Channel, ChannelMsg};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -37,7 +37,9 @@ struct Servers {
     _directory: tempfile::TempDir,
 }
 
-async fn start() -> Servers {
+/// `per_address` is how many games one address may have open; every test
+/// visitor comes from 127.0.0.1.
+async fn start(per_address: usize) -> Servers {
     let directory = tempfile::tempdir().unwrap();
     let accounts = Accounts::new(Store::open(&directory.path().join("chess.db")).unwrap());
     let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -66,6 +68,7 @@ async fn start() -> Servers {
         client_program: env!("CARGO_BIN_EXE_chess").into(),
         server_url: format!("ws://{websocket_address}/ws"),
         max_sessions: 4,
+        max_per_address: per_address,
     };
     tokio::spawn(serve_ssh(ssh, gateway, Some(accounts.clone()), stopped));
     Servers {
@@ -76,9 +79,12 @@ async fn start() -> Servers {
     }
 }
 
-/// Connect with `key`, open a terminal, and return everything the game shows
-/// until `expected` appears; then leave through the menu.
-async fn visit(servers: &Servers, key: PrivateKey, expected: &str) -> String {
+/// Connect with `key` and open a terminal. The session has to be kept for as
+/// long as the channel is in use.
+async fn open_shell(
+    servers: &Servers,
+    key: PrivateKey,
+) -> (client::Handle<TrustAnyHost>, Channel<client::Msg>) {
     let config = Arc::new(client::Config::default());
     let mut session = client::connect(config, servers.ssh_address, TrustAnyHost)
         .await
@@ -88,13 +94,17 @@ async fn visit(servers: &Servers, key: PrivateKey, expected: &str) -> String {
         .await
         .unwrap();
     assert!(authenticated.success(), "any key is welcome");
-    let mut channel = session.channel_open_session().await.unwrap();
+    let channel = session.channel_open_session().await.unwrap();
     channel
         .request_pty(true, "xterm-256color", 100, 40, 0, 0, &[])
         .await
         .unwrap();
     channel.request_shell(true).await.unwrap();
+    (session, channel)
+}
 
+/// Everything shown on `channel` until `expected` appears.
+async fn read_until(channel: &mut Channel<client::Msg>, expected: &str) -> String {
     let mut screen = String::new();
     let seen = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(message) = channel.wait().await {
@@ -126,6 +136,14 @@ async fn visit(servers: &Servers, key: PrivateKey, expected: &str) -> String {
         "expected {expected:?} on screen, saw:\n{}",
         strip_escapes(&screen)
     );
+    strip_escapes(&screen)
+}
+
+/// Connect with `key`, open a terminal, and return everything the game shows
+/// until `expected` appears; then leave through the menu.
+async fn visit(servers: &Servers, key: PrivateKey, expected: &str) -> String {
+    let (_session, mut channel) = open_shell(servers, key).await;
+    let screen = read_until(&mut channel, expected).await;
 
     channel.data_bytes(&b"q\r"[..]).await.unwrap();
     let exit = tokio::time::timeout(Duration::from_secs(10), async {
@@ -138,7 +156,7 @@ async fn visit(servers: &Servers, key: PrivateKey, expected: &str) -> String {
     })
     .await;
     assert_eq!(exit, Ok(Some(0)), "leaving the menu ends the visit");
-    strip_escapes(&screen)
+    screen
 }
 
 fn strip_escapes(text: &str) -> String {
@@ -164,7 +182,7 @@ fn strip_escapes(text: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_visitor_plays_as_a_guest_until_their_key_is_linked() {
-    let servers = start().await;
+    let servers = start(3).await;
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
 
     let screen = visit(&servers, key.clone(), "sign in or sign up").await;
@@ -187,4 +205,17 @@ async fn a_visitor_plays_as_a_guest_until_their_key_is_linked() {
 
     let screen = visit(&servers, key, "your recent games").await;
     assert!(screen.contains("signed in as carol"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_address_cannot_take_every_seat() {
+    let servers = start(1).await;
+    let key = || PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+
+    let (_first_session, mut first) = open_shell(&servers, key()).await;
+    read_until(&mut first, "sign in or sign up").await;
+
+    let (_second_session, mut second) = open_shell(&servers, key()).await;
+    let screen = read_until(&mut second, "then connect again").await;
+    assert!(screen.contains("already have a game open from this address"));
 }

@@ -130,6 +130,11 @@ fn gateway_config(websocket_address: SocketAddr) -> Result<GatewayConfig, String
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&value| value > 0)
             .unwrap_or(100),
+        max_per_address: env::var("CHESS_SSH_MAX_PER_IP")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(3),
     })
 }
 
