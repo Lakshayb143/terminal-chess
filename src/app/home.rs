@@ -543,7 +543,12 @@ impl Home {
                 lines.push(String::new());
             }
             if !heading.is_empty() {
-                lines.push(format!("  {}", theme.strong(theme.palette.label, heading)));
+                let mut line = format!("  {}", theme.strong(theme.palette.label, heading));
+                if *heading == "ONLINE" {
+                    line.push_str("  ");
+                    line.push_str(&self.lobby_badge(theme));
+                }
+                lines.push(ui::clip(&line, width));
             }
             for &entry in members.iter().filter(|e| self.entries.contains(e)) {
                 let focused = self.focused() == entry;
@@ -600,13 +605,20 @@ impl Home {
         } else {
             label
         };
-        let meta = self.meta(info, account, entry).unwrap_or_default();
+        let meta = match (entry, self.lobby) {
+            // Someone ready to play at once is worth more than a grey aside.
+            (Entry::Random, LobbyView::Known(lobby)) if lobby.seeking > 0 => theme.strong(
+                theme.palette.good,
+                &format!("{} waiting now", lobby.seeking),
+            ),
+            _ => theme.dim(&self.meta(info, account, entry).unwrap_or_default()),
+        };
         let line = format!(
             "{} {}  {} {}",
             theme.strong(theme.palette.accent, marker),
             key,
             label,
-            theme.dim(&meta)
+            meta
         );
         let line = ui::clip(line.trim_end(), width);
         let row_w = ui::width(&line);
@@ -631,16 +643,25 @@ impl Home {
                 Some(_) => "your recent games".to_string(),
                 None => "sign in or sign up".to_string(),
             }),
-            Entry::Random => match self.lobby {
-                LobbyView::Known(lobby) if lobby.seeking > 0 => {
-                    Some(format!("{} waiting now", lobby.seeking))
-                }
-                LobbyView::Known(lobby) if lobby.online <= 1 => Some("only you online".to_string()),
-                LobbyView::Known(lobby) => Some(format!("{} online", lobby.online)),
-                LobbyView::Checking => None,
-                LobbyView::Unavailable => Some("server offline".to_string()),
-            },
             _ => None,
+        }
+    }
+
+    /// Who is online, on a block of colour beside the ONLINE heading so it
+    /// is seen whichever row has the focus: green with company, the warning
+    /// colour alone, grey while the server is unknown or away.
+    fn lobby_badge(&self, theme: &Theme) -> String {
+        let dot = if theme.ascii { "*" } else { "\u{25cf}" };
+        match self.lobby {
+            LobbyView::Known(lobby) if lobby.online <= 1 => {
+                theme.badge(theme.palette.warn, &format!("{dot} only you online"))
+            }
+            LobbyView::Known(lobby) => theme.badge(
+                theme.palette.good,
+                &format!("{dot} {} online", lobby.online),
+            ),
+            LobbyView::Checking => theme.dim("checking who is online…"),
+            LobbyView::Unavailable => theme.badge(theme.palette.label, "server offline"),
         }
     }
 
@@ -1187,6 +1208,18 @@ mod tests {
         });
         assert!(others.contains("3 online"));
         assert!(others.contains("2 others online: play whoever looks next."));
+
+        // The count needs no focus: it shows while another row is chosen.
+        let mut elsewhere = Home::new(&info);
+        assert_eq!(elsewhere.focused(), Entry::White);
+        elsewhere.lobby = LobbyView::Known(Lobby {
+            online: 1,
+            seeking: 0,
+        });
+        let page = elsewhere
+            .render(&theme(), &info, &account, ui::Pieces::Glyph, 120, 40)
+            .join("\n");
+        assert!(page.contains("only you online"), "{page}");
 
         // The longest explanation still fits the smallest window.
         home.lobby = LobbyView::Known(Lobby {

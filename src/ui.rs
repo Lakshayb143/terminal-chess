@@ -1222,6 +1222,21 @@ impl Theme {
         self.sgr(&format!("1;7;{}", self.depth.fg(color)), text)
     }
 
+    /// Dark bold letters on a solid block of `color`, for news that should be
+    /// seen without being looked for. Brackets stand in for the block when
+    /// colour is off.
+    pub fn badge(&self, color: Rgb, text: &str) -> String {
+        if !self.color {
+            return format!("[{text}]");
+        }
+        let codes = format!(
+            "1;{};{}",
+            self.depth.fg(hex(0x1b1d21)),
+            self.depth.bg(color)
+        );
+        self.sgr(&codes, &format!(" {text} "))
+    }
+
     // -- screen -------------------------------------------------------------
 
     /// Wipe the screen for the next frame. A no-op unless we own the terminal.
