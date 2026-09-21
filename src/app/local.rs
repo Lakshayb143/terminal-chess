@@ -498,11 +498,11 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
                 continue;
             }
             "time" => {
-                set_time(&mut limits, &mut screen, rest);
+                set_time(&mut limits, &mut screen, rest, options.hosted);
                 continue;
             }
             "depth" => {
-                set_depth(&mut limits, &mut screen, rest);
+                set_depth(&mut limits, &mut screen, rest, options.hosted);
                 continue;
             }
             "undo" | "u" | "back" | "takeback" => {

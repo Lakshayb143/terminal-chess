@@ -10,9 +10,10 @@ use chess_core::san::parse_move;
 use chess_core::search::Limits;
 
 use crate::app::actions::{
-    cycle_pieces, flip_board, handle_board_click, handle_ui_action, sound_after_move, toggle_size,
+    cycle_pieces, flip_board, handle_board_click, handle_ui_action, set_depth, set_time,
+    sound_after_move, toggle_size,
 };
-use crate::app::cli::{Mode, OnlineIntent, Options};
+use crate::app::cli::{Mode, OnlineIntent, Options, HOSTED_MOVETIME};
 use crate::app::online::{online_board_click, online_preferences, unix_time_ms};
 use crate::app::pages::import_pgn;
 use crate::app::saves::{restore_game, saved_game};
@@ -673,4 +674,31 @@ fn online_session_does_not_overwrite_local_identity_clock_or_orientation() {
     assert!(!saved.flipped);
     assert_eq!(saved.clock_minutes, 15.0);
     assert_eq!(saved.increment_seconds, 10.0);
+}
+
+#[test]
+fn a_hosted_engine_never_thinks_for_long() {
+    let mut screen = screen();
+    // Keep notes on screen rather than printed, so they can be read back.
+    screen.theme.live = true;
+    let mut limits = Limits::default();
+
+    set_time(&mut limits, &mut screen, "99999", true);
+    assert_eq!(limits.movetime, Some(HOSTED_MOVETIME));
+    assert!(screen.message[0].contains("the most it gets over SSH"));
+    set_time(&mut limits, &mut screen, "2", true);
+    assert_eq!(limits.movetime, Some(Duration::from_secs(2)));
+
+    // A depth is still searched for at most the hosted limit.
+    set_depth(&mut limits, &mut screen, "64", true);
+    assert_eq!(limits.depth, 64);
+    assert_eq!(limits.movetime, Some(HOSTED_MOVETIME));
+    assert!(screen.message[0].contains("at most 5s a move over SSH"));
+    set_depth(&mut limits, &mut screen, "30", false);
+    assert_eq!(limits.movetime, None);
+
+    // Too big to be a duration is refused, not a crash.
+    set_time(&mut limits, &mut screen, "1e300", false);
+    assert_eq!(limits.movetime, None);
+    assert!(screen.message[0].contains("not a number of seconds"));
 }

@@ -84,6 +84,22 @@ pub(crate) struct Options {
 pub(crate) const HOSTED_FILES: &str =
     "Files are off when playing over SSH. Type `pgn` to show the game, then copy it from the screen.";
 
+/// The longest a hosted engine thinks about one move. Every SSH visitor's
+/// search runs on the server's cores, and one with no time limit would keep
+/// a core busy for as long as the visitor liked.
+pub(crate) const HOSTED_MOVETIME: Duration = Duration::from_secs(5);
+
+/// Keep a hosted engine within [`HOSTED_MOVETIME`]. Returns whether that
+/// changed what was asked for.
+pub(crate) fn cap_hosted(limits: &mut Limits) -> bool {
+    let budget = limits
+        .movetime
+        .map_or(HOSTED_MOVETIME, |budget| budget.min(HOSTED_MOVETIME));
+    let changed = limits.movetime != Some(budget);
+    limits.movetime = Some(budget);
+    changed
+}
+
 /// Whether `word` with argument `rest` reads or writes a file of the
 /// player's choosing, which a hosted game must not do.
 pub(crate) fn names_a_file(word: &str, rest: &str) -> bool {
@@ -232,7 +248,10 @@ impl Options {
                     if !(secs.is_finite() && secs > 0.0) {
                         return Err(format!("--time must be positive, got '{}'", text));
                     }
-                    options.limits.movetime = Some(Duration::from_secs_f64(secs));
+                    options.limits.movetime = Some(
+                        Duration::try_from_secs_f64(secs)
+                            .map_err(|_| format!("--time {} is too long", text))?,
+                    );
                     timed = true;
                 }
                 "-d" | "--depth" => {
@@ -310,6 +329,9 @@ impl Options {
             .filter(|character| !character.is_control())
             .take(32)
             .collect();
+        if options.hosted {
+            cap_hosted(&mut options.limits);
+        }
         if options.hosted && options.load.is_some() {
             return Err(HOSTED_FILES.to_string());
         }

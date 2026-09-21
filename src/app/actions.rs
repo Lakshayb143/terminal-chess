@@ -14,7 +14,7 @@ use chess_core::san::{parse_move, to_san, ParseError};
 use chess_core::search::{Limits, Search, SearchResult};
 use chess_core::{board, search};
 
-use crate::app::cli::Mode;
+use crate::app::cli::{cap_hosted, Mode};
 use crate::app::format::{budget_text, format_score, kind_name, node_count, pv_text, white_pov};
 use crate::app::parse::{nearby_moves, promotion_default, under_specified};
 use crate::app::prompt::read_line;
@@ -577,7 +577,8 @@ pub(crate) fn undo(game: &mut Game, mode: Mode, screen: &mut Screen) {
     screen.redraw = true;
 }
 
-pub(crate) fn set_time(limits: &mut Limits, screen: &mut Screen, rest: &str) {
+/// `hosted` keeps the engine within [`cap_hosted`]'s limit, and says so.
+pub(crate) fn set_time(limits: &mut Limits, screen: &mut Screen, rest: &str, hosted: bool) {
     if rest.is_empty() {
         screen.note(
             screen
@@ -586,16 +587,27 @@ pub(crate) fn set_time(limits: &mut Limits, screen: &mut Screen, rest: &str) {
         );
         return;
     }
-    match rest.parse::<f64>() {
-        Ok(secs) if secs.is_finite() && secs > 0.0 => {
-            limits.movetime = Some(Duration::from_secs_f64(secs));
-            screen.note(
-                screen
-                    .theme
-                    .good(&format!("The engine now gets {}.", budget_text(limits))),
-            );
+    // A number too big to be a duration is as useless as one that is not a
+    // number at all.
+    let budget = rest
+        .parse::<f64>()
+        .ok()
+        .filter(|secs| *secs > 0.0)
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok());
+    match budget {
+        Some(budget) => {
+            limits.movetime = Some(budget);
+            let note = if hosted && cap_hosted(limits) {
+                format!(
+                    "The engine now gets {}, the most it gets over SSH.",
+                    budget_text(limits)
+                )
+            } else {
+                format!("The engine now gets {}.", budget_text(limits))
+            };
+            screen.note(screen.theme.good(&note));
         }
-        _ => screen.note(
+        None => screen.note(
             screen
                 .theme
                 .warn(&format!("`{}` is not a number of seconds.", rest)),
@@ -603,7 +615,8 @@ pub(crate) fn set_time(limits: &mut Limits, screen: &mut Screen, rest: &str) {
     }
 }
 
-pub(crate) fn set_depth(limits: &mut Limits, screen: &mut Screen, rest: &str) {
+/// `hosted` keeps the engine within [`cap_hosted`]'s limit, and says so.
+pub(crate) fn set_depth(limits: &mut Limits, screen: &mut Screen, rest: &str, hosted: bool) {
     if rest.is_empty() {
         screen.note(
             screen
@@ -617,11 +630,17 @@ pub(crate) fn set_depth(limits: &mut Limits, screen: &mut Screen, rest: &str) {
             limits.depth = depth;
             // A depth asked for by name is a depth to reach, not to give up on.
             limits.movetime = None;
-            screen.note(
-                screen
-                    .theme
-                    .good(&format!("The engine now searches to depth {}.", depth)),
-            );
+            let note = if hosted {
+                cap_hosted(limits);
+                format!(
+                    "The engine now searches to depth {}, for at most {} over SSH.",
+                    depth,
+                    budget_text(limits)
+                )
+            } else {
+                format!("The engine now searches to depth {}.", depth)
+            };
+            screen.note(screen.theme.good(&note));
         }
         _ => screen.note(screen.theme.warn(&format!(
             "Depth must be a number from 1 to {}.",
