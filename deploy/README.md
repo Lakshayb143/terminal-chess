@@ -102,6 +102,15 @@ for clock time elapsed while it was offline.
   `docker compose up -d` to apply it.
 - Keep the WebSocket port unexposed; Caddy publishes it with TLS. The SSH
   gateway is the only port the chess server publishes itself.
-- Each SSH visitor runs one `chess` process, a few megabytes of memory.
-  `CHESS_SSH_MAX_SESSIONS` caps how many run at once; later arrivals are asked
-  to try again in a few minutes.
+- Each SSH visitor runs one `chess` process, about 25 MB while playing the
+  engine. `CHESS_SSH_MAX_SESSIONS` caps how many run at once, and
+  `CHESS_SSH_MAX_PER_IP` how many one address may have open; later arrivals
+  are asked to try again.
+- The chess server is held to `CHESS_CPUS` and `CHESS_MEMORY`, so it can share
+  a host with other work. Keep `CHESS_SSH_MAX_SESSIONS` times 25 MB within the
+  memory. Over SSH the engine thinks for at most 5 seconds a move, whatever
+  `time` or `depth` a visitor asks for.
+- Docker passes visitors' real addresses to the gateway over IPv4 only. Unless
+  Docker's IPv6 support is set up, publish an `A` record for the hostname and
+  no `AAAA`, or every IPv6 visitor shares one address and one per-address
+  limit.

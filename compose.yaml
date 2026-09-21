@@ -9,7 +9,8 @@ services:
       CHESS_SERVER_DB: /var/lib/terminal-chess/chess.db
       CHESS_SSH_ADDR: 0.0.0.0:2222
       CHESS_SSH_HOST_KEY: /var/lib/terminal-chess/ssh_host_ed25519_key
-      CHESS_SSH_MAX_SESSIONS: ${CHESS_SSH_MAX_SESSIONS:-100}
+      CHESS_SSH_MAX_SESSIONS: ${CHESS_SSH_MAX_SESSIONS:-60}
+      CHESS_SSH_MAX_PER_IP: ${CHESS_SSH_MAX_PER_IP:-3}
       CHESS_RATE_LIMIT_PER_10S: ${CHESS_RATE_LIMIT_PER_10S:-60}
       CHESS_LOG_FORMAT: json
       RUST_LOG: ${RUST_LOG:-chess_server=info}
@@ -21,6 +22,12 @@ services:
       - "${SSH_PORT:-22}:2222"
     volumes:
       - chess-data:/var/lib/terminal-chess
+    # Every SSH visitor's game and engine run in here, so a busy evening
+    # cannot starve whatever else the host runs. A visitor playing the engine
+    # takes about 25 MB; keep CHESS_SSH_MAX_SESSIONS within the memory.
+    cpus: ${CHESS_CPUS:-2}
+    mem_limit: ${CHESS_MEMORY:-2g}
+    pids_limit: 1024
 
   caddy:
     image: caddy:2.10-alpine
@@ -37,6 +44,8 @@ services:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    cpus: 0.5
+    mem_limit: 256m
 
 volumes:
   chess-data:
