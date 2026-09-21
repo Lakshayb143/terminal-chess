@@ -168,6 +168,7 @@ pub(crate) fn ask_mode(
             block.push(format!("  {}   resume saved game", theme.bold("4")));
         }
         block.push(String::new());
+        block.push(format!("  {}   play a random opponent", theme.bold("p")));
         block.push(format!("  {}   play a friend online", theme.bold("o")));
         block.push(format!("  {}   join a friend's game", theme.bold("j")));
         block.push(if account.username().is_some() {
@@ -195,6 +196,11 @@ pub(crate) fn ask_mode(
             "2" | "b" | "black" => return Ok(Some(StartChoice::Mode(Mode::HumanBlack))),
             "3" | "t" | "two" => return Ok(Some(StartChoice::Mode(Mode::TwoPlayer))),
             "4" | "r" | "resume" if can_resume => return Ok(Some(StartChoice::Resume)),
+            "p" | "random" | "find" => {
+                if let Some(name) = ask_guest_name(stdin, screen, account)? {
+                    return Ok(Some(StartChoice::Online(OnlineIntent::Find, name)));
+                }
+            }
             "o" | "online" | "create" => {
                 if let Some(name) = ask_guest_name(stdin, screen, account)? {
                     return Ok(Some(StartChoice::Online(OnlineIntent::Create, name)));
@@ -211,9 +217,9 @@ pub(crate) fn ask_mode(
             "q" | "quit" | "exit" => return Ok(None),
             _ => {
                 complaint = screen.theme.warn(if can_resume {
-                    "  Choose 1, 2, 3, 4, o, j or a."
+                    "  Choose 1, 2, 3, 4, p, o, j or a."
                 } else {
-                    "  Choose 1, 2, 3, o, j or a."
+                    "  Choose 1, 2, 3, p, o, j or a."
                 })
             }
         }

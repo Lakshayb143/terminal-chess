@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use chess::client::{OnlineClient, TransportEvent};
 use chess_protocol::{
-    ClientCommand, ErrorCode, FinishReason, GameResult, GameSnapshot, GameStatus, ServerEvent,
-    TimeControl,
+    ClientCommand, ErrorCode, FinishReason, GameResult, GameSnapshot, GameStatus, Lobby,
+    ServerEvent, TimeControl,
 };
 use tokio::sync::oneshot;
 
@@ -313,4 +313,64 @@ fn two_clients_finish_a_game_over_websockets() {
     let saved = std::fs::read_to_string(&state).expect("state is flushed on shutdown");
     assert!(saved.contains(&game_id));
     assert!(saved.contains("d8h4"));
+}
+
+#[test]
+fn strangers_find_each_other_while_the_lobby_watches() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server::start(&directory.path().join("state.json"));
+    let lobby = |client: &OnlineClient, wanted: fn(&Lobby) -> bool| {
+        expect(client, |event| match event {
+            ServerEvent::Lobby { lobby } if wanted(&lobby) => Some(lobby),
+            _ => None,
+        })
+    };
+    let find = |client: &OnlineClient, name: &str| {
+        client
+            .send(ClientCommand::FindGame {
+                player_name: name.to_string(),
+                time_control: TimeControl {
+                    initial_ms: 600_000,
+                    increment_ms: 5_000,
+                },
+            })
+            .unwrap();
+    };
+    let joined = |client: &OnlineClient| {
+        expect(client, |event| match event {
+            ServerEvent::GameJoined { side, game, .. } => Some((side.unwrap(), game)),
+            _ => None,
+        })
+    };
+
+    let watcher = OnlineClient::connect(server.url());
+    watcher.send(ClientCommand::WatchLobby).unwrap();
+    assert_eq!(
+        lobby(&watcher, |_| true),
+        Lobby {
+            online: 1,
+            seeking: 0
+        }
+    );
+
+    let ann = OnlineClient::connect(server.url());
+    find(&ann, "Ann");
+    assert_eq!(lobby(&ann, |_| true).seeking, 1, "Ann waits");
+    assert_eq!(lobby(&watcher, |lobby| lobby.seeking == 1).online, 2);
+
+    let ben = OnlineClient::connect(server.url());
+    find(&ben, "Ben");
+    let (ann_side, ann_game) = joined(&ann);
+    let (ben_side, ben_game) = joined(&ben);
+    assert_ne!(ann_side, ben_side);
+    assert_eq!(ann_game.game_id, ben_game.game_id);
+    let mut names = [ann_game.white.name, ann_game.black.name];
+    names.sort();
+    assert_eq!(names, ["Ann", "Ben"]);
+    assert_eq!(lobby(&watcher, |lobby| lobby.seeking == 0).online, 3);
+
+    drop(ann);
+    drop(ben);
+    lobby(&watcher, |lobby| lobby.online == 1);
+    server.stop();
 }

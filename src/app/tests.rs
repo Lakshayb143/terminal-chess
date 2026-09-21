@@ -8,13 +8,14 @@ use chess_core::board::{self, Color, Piece, PieceKind, Position};
 use chess_core::game::{outcome, Game, GameClock, Outcome};
 use chess_core::san::parse_move;
 use chess_core::search::Limits;
+use chess_protocol::Lobby;
 
 use crate::app::actions::{
     cycle_pieces, flip_board, handle_board_click, handle_ui_action, set_depth, set_time,
     sound_after_move, toggle_size,
 };
 use crate::app::cli::{Mode, OnlineIntent, Options, HOSTED_MOVETIME};
-use crate::app::online::{online_board_click, online_preferences, unix_time_ms};
+use crate::app::online::{online_board_click, online_preferences, show_lobby, unix_time_ms};
 use crate::app::pages::import_pgn;
 use crate::app::saves::{restore_game, saved_game};
 use crate::app::screen::{
@@ -613,6 +614,8 @@ fn online_game_over_status_outranks_invite_and_disconnect_states() {
         reconnect_deadline_ms: Some(unix_time_ms() + 30_000),
         move_pending: false,
         failure_help: None,
+        seeking: false,
+        lobby: None,
     });
 
     let status = screen.state_line(&game);
@@ -620,6 +623,48 @@ fn online_game_over_status_outranks_invite_and_disconnect_states() {
     assert!(status.contains("export PGN or quit"));
     assert!(!status.contains("INVITE"));
     assert!(!status.contains("OPPONENT OFFLINE"));
+}
+
+#[test]
+fn a_player_looking_for_a_stranger_is_told_when_they_are_alone() {
+    let game = Game::new(Position::startpos());
+    let mut screen = screen();
+    screen.theme.live = true;
+    screen.online = Some(OnlineDisplay {
+        connection: ConnectionDisplay::Connected,
+        invite_code: None,
+        your_side: None,
+        white_connected: false,
+        black_connected: false,
+        reconnect_deadline_ms: None,
+        move_pending: true,
+        failure_help: None,
+        seeking: true,
+        lobby: None,
+    });
+    let alone = Lobby {
+        online: 1,
+        seeking: 1,
+    };
+
+    show_lobby(alone, &mut screen);
+    assert!(screen.message[0].contains("No one else is online right now."));
+    assert!(screen.state_line(&game).contains("no one else online"));
+
+    // Said once, not again with every update that changes nothing.
+    screen.message.clear();
+    show_lobby(alone, &mut screen);
+    assert!(screen.message.is_empty());
+
+    show_lobby(
+        Lobby {
+            online: 3,
+            seeking: 1,
+        },
+        &mut screen,
+    );
+    assert!(screen.message[0].contains("2 others online now."));
+    assert!(screen.state_line(&game).contains("2 others online"));
 }
 
 #[test]
@@ -636,6 +681,8 @@ fn online_draw_offer_has_accept_and_decline_controls() {
         reconnect_deadline_ms: None,
         move_pending: false,
         failure_help: None,
+        seeking: false,
+        lobby: None,
     });
 
     let buttons = screen.game_buttons(&game, Mode::TwoPlayer);

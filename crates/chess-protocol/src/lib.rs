@@ -6,10 +6,11 @@ use chess_core::board::Color;
 use chess_core::game::Outcome;
 use serde::{Deserialize, Serialize};
 
-/// The version this build speaks. Version 3 added accounts and game history.
-pub const PROTOCOL_VERSION: u16 = 3;
-/// The oldest version a server still accepts. Version 3 only added commands
-/// and optional fields, so version 2 guests keep working unchanged.
+/// The version this build speaks. Version 3 added accounts and game history;
+/// version 4 added the lobby and pairing with a random opponent.
+pub const PROTOCOL_VERSION: u16 = 4;
+/// The oldest version a server still accepts. Versions 3 and 4 only added
+/// commands and optional fields, so version 2 guests keep working unchanged.
 pub const MIN_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +89,16 @@ pub enum ClientCommand {
     LinkSshKey {
         ticket: String,
     },
+    /// Keep this connection told who is around, with a `Lobby` event now and
+    /// whenever the numbers change.
+    WatchLobby,
+    /// Play whoever next asks for the same time control. Answered with
+    /// `Lobby` while waiting, and `GameJoined`, on a side drawn at random,
+    /// once paired.
+    FindGame {
+        player_name: String,
+        time_control: TimeControl,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +136,9 @@ pub enum ServerEvent {
     GameJoined {
         reconnect_token: String,
         game: GameSnapshot,
+        /// The seat taken. Sent from version 4; a code always seats Black.
+        #[serde(default)]
+        side: Option<Side>,
     },
     GameUpdated {
         game: GameSnapshot,
@@ -157,6 +171,19 @@ pub enum ServerEvent {
         games: Vec<GameRecord>,
     },
     SshKeyLinked,
+    Lobby {
+        lobby: Lobby,
+    },
+}
+
+/// Who is around, for a player deciding whether to wait for a stranger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lobby {
+    /// Everyone watching the lobby, looking for a game, or seated in one,
+    /// the receiver included.
+    pub online: u32,
+    /// How many of them are waiting to be paired.
+    pub seeking: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +441,38 @@ mod tests {
     }
 
     #[test]
+    fn version_3_join_replies_without_a_side_still_parse() {
+        let joined = ServerEvent::GameJoined {
+            reconnect_token: "token".to_string(),
+            game: sample_snapshot(),
+            side: Some(Side::White),
+        };
+        let mut json = serde_json::to_value(&joined).unwrap();
+        json.as_object_mut().unwrap().remove("side");
+        let ServerEvent::GameJoined { side, .. } = serde_json::from_value(json).unwrap() else {
+            panic!("expected a join reply");
+        };
+        assert_eq!(side, None);
+    }
+
+    #[test]
+    fn lobby_events_carry_both_counts() {
+        let json = serde_json::json!({
+            "type": "lobby",
+            "lobby": {"online": 3, "seeking": 1},
+        });
+        assert_eq!(
+            serde_json::from_value::<ServerEvent>(json).unwrap(),
+            ServerEvent::Lobby {
+                lobby: Lobby {
+                    online: 3,
+                    seeking: 1
+                }
+            }
+        );
+    }
+
+    #[test]
     fn account_commands_use_snake_case_tags() {
         let json = serde_json::to_value(ClientCommand::LogIn {
             username: "magnus".to_string(),
@@ -497,7 +556,23 @@ mod tests {
 
     #[test]
     fn finished_snapshot_round_trips() {
-        let snapshot = GameSnapshot {
+        let message = ServerEnvelope::new(
+            9,
+            None,
+            ServerEvent::GameUpdated {
+                game: sample_snapshot(),
+            },
+        );
+
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ServerEnvelope>(&json).unwrap(),
+            message
+        );
+    }
+
+    fn sample_snapshot() -> GameSnapshot {
+        GameSnapshot {
             game_id: "game-1".to_string(),
             revision: 42,
             fen: "8/8/8/8/8/8/8/8 w - - 0 1".to_string(),
@@ -529,13 +604,6 @@ mod tests {
                 result: GameResult::WhiteWins,
                 reason: FinishReason::Checkmate,
             },
-        };
-        let message = ServerEnvelope::new(9, None, ServerEvent::GameUpdated { game: snapshot });
-
-        let json = serde_json::to_string(&message).unwrap();
-        assert_eq!(
-            serde_json::from_str::<ServerEnvelope>(&json).unwrap(),
-            message
-        );
+        }
     }
 }

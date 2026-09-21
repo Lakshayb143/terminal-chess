@@ -1,7 +1,7 @@
 //! Authoritative, transport-independent state for online matches between
 //! guests and signed-in players.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use chess_core::board::{Color, Position};
 use chess_core::game::{outcome, Game};
 use chess_core::san::parse_move;
 use chess_protocol::{
-    ClientCommand, ClientEnvelope, ClockSnapshot, ErrorCode, GameSnapshot, GameStatus,
+    ClientCommand, ClientEnvelope, ClockSnapshot, ErrorCode, GameSnapshot, GameStatus, Lobby,
     MoveRejection, PlayerSnapshot, ServerEnvelope, ServerEvent, Side, TimeControl,
     MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
@@ -60,6 +60,27 @@ struct PlayerSlot {
     reconnect_token: String,
     connection: Option<ConnectionId>,
     disconnected_at: Option<Instant>,
+}
+
+impl PlayerSlot {
+    /// A new seat for `connection`, with a fresh reconnect token.
+    fn taken_by(name: String, user: Option<UserId>, connection: ConnectionId) -> PlayerSlot {
+        PlayerSlot {
+            name,
+            user,
+            reconnect_token: Uuid::new_v4().to_string(),
+            connection: Some(connection),
+            disconnected_at: None,
+        }
+    }
+}
+
+/// A player waiting to be paired with whoever asks for the same clock next.
+struct Seek {
+    connection: ConnectionId,
+    name: String,
+    user: Option<UserId>,
+    time_control: TimeControl,
 }
 
 struct Room {
@@ -131,6 +152,12 @@ pub struct Hub {
     invites: HashMap<String, String>,
     memberships: HashMap<ConnectionId, Membership>,
     identities: HashMap<ConnectionId, Identity>,
+    /// Connections told whenever the lobby's numbers change.
+    watchers: HashSet<ConnectionId>,
+    /// Players waiting for an opponent, longest waiting first.
+    seeks: Vec<Seek>,
+    /// The lobby's numbers as its watchers last heard them.
+    announced: Lobby,
     /// Games that ended since the last [`Hub::take_finished_games`].
     finished_games: Vec<FinishedGame>,
     next_connection_id: ConnectionId,
@@ -151,6 +178,9 @@ impl Hub {
             invites: HashMap::new(),
             memberships: HashMap::new(),
             identities: HashMap::new(),
+            watchers: HashSet::new(),
+            seeks: Vec::new(),
+            announced: Lobby::default(),
             finished_games: Vec::new(),
             next_connection_id: 1,
             next_event_id: 1,
@@ -317,12 +347,19 @@ impl Hub {
         let request_id = request.request_id;
         if !matches!(
             request.command,
-            ClientCommand::Hello { .. } | ClientCommand::Ping
+            ClientCommand::Hello { .. } | ClientCommand::Ping | ClientCommand::WatchLobby
         ) && !is_account_command(&request.command)
         {
             self.dirty = true;
         }
-        match request.command {
+        // These are answered with the lobby's numbers, so the news that
+        // follows need not repeat them.
+        let answered = matches!(
+            request.command,
+            ClientCommand::WatchLobby | ClientCommand::FindGame { .. }
+        )
+        .then_some(connection);
+        let mut deliveries = match request.command {
             ClientCommand::Hello { .. } => vec![self.delivery(
                 connection,
                 Some(request_id),
@@ -357,6 +394,15 @@ impl Hub {
             ClientCommand::Ping => {
                 vec![self.delivery(connection, Some(request_id), ServerEvent::Pong)]
             }
+            ClientCommand::WatchLobby => {
+                self.watchers.insert(connection);
+                let lobby = self.lobby();
+                vec![self.delivery(connection, Some(request_id), ServerEvent::Lobby { lobby })]
+            }
+            ClientCommand::FindGame {
+                player_name,
+                time_control,
+            } => self.find_game(connection, request_id, player_name, time_control),
             ClientCommand::Register { .. }
             | ClientCommand::LogIn { .. }
             | ClientCommand::Authenticate { .. }
@@ -368,7 +414,9 @@ impl Hub {
                 ErrorCode::AccountsUnavailable,
                 "this server does not have accounts enabled",
             ),
-        }
+        };
+        deliveries.extend(self.lobby_news(answered));
+        deliveries
     }
 
     /// A reply to one request, numbered in this hub's event sequence. The
@@ -411,6 +459,15 @@ impl Hub {
 
     pub fn disconnect(&mut self, connection: ConnectionId) -> Vec<Delivery> {
         self.identities.remove(&connection);
+        self.watchers.remove(&connection);
+        self.seeks.retain(|seek| seek.connection != connection);
+        let mut deliveries = self.leave_room(connection);
+        deliveries.extend(self.lobby_news(None));
+        deliveries
+    }
+
+    /// Hold `connection`'s seat, if it has one, and tell its opponent.
+    fn leave_room(&mut self, connection: ConnectionId) -> Vec<Delivery> {
         let Some(membership) = self.memberships.remove(&connection) else {
             return Vec::new();
         };
@@ -497,7 +554,43 @@ impl Hub {
                 ));
             }
         }
+        deliveries.extend(self.lobby_news(None));
         deliveries
+    }
+
+    /// Who is around: every connection watching the lobby, looking for a
+    /// game, or seated in one, each counted once.
+    pub fn lobby(&self) -> Lobby {
+        let mut present = self.watchers.clone();
+        present.extend(self.seeks.iter().map(|seek| seek.connection));
+        present.extend(self.memberships.keys());
+        Lobby {
+            online: u32::try_from(present.len()).unwrap_or(u32::MAX),
+            seeking: u32::try_from(self.seeks.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Tell the lobby's watchers, and everyone waiting in it, that its
+    /// numbers changed. `answered` has just been told.
+    fn lobby_news(&mut self, answered: Option<ConnectionId>) -> Vec<Delivery> {
+        let lobby = self.lobby();
+        if lobby == self.announced {
+            return Vec::new();
+        }
+        self.announced = lobby;
+        let mut audience: Vec<ConnectionId> = self
+            .watchers
+            .iter()
+            .copied()
+            .chain(self.seeks.iter().map(|seek| seek.connection))
+            .filter(|&target| Some(target) != answered)
+            .collect();
+        audience.sort_unstable();
+        audience.dedup();
+        audience
+            .into_iter()
+            .map(|target| self.delivery(target, None, ServerEvent::Lobby { lobby }))
+            .collect()
     }
 
     fn evict_expired(&mut self, now: Instant) {
@@ -546,50 +639,21 @@ impl Hub {
                 )
             }
         };
-        if time_control.initial_ms > MAX_INITIAL_MS || time_control.increment_ms > MAX_INCREMENT_MS
-        {
+        if !supported_time_control(&time_control) {
             return self.direct_error(
                 connection,
                 Some(request_id),
                 ErrorCode::InvalidRequest,
-                "time control is outside the supported range",
+                UNSUPPORTED_TIME_CONTROL,
             );
         }
 
-        let game_id = Uuid::new_v4().to_string();
-        let invite_code = self.unique_invite_code();
-        let reconnect_token = Uuid::new_v4().to_string();
-        let mut game = Game::with_clock(
-            Position::startpos(),
-            time_control.initial(),
-            time_control.increment(),
-        );
-        game.clock.pause();
-        let room = Room {
-            game_id: game_id.clone(),
-            invite_code: invite_code.clone(),
-            game,
-            white: PlayerSlot {
-                name: player_name,
-                user,
-                reconnect_token: reconnect_token.clone(),
-                connection: Some(connection),
-                disconnected_at: None,
-            },
-            black: None,
-            started_at_ms: 0,
-            finished_at: None,
-        };
-        self.invites.insert(invite_code.clone(), game_id.clone());
-        self.memberships.insert(
-            connection,
-            Membership {
-                game_id: game_id.clone(),
-                side: Color::White,
-            },
-        );
-        self.rooms.insert(game_id.clone(), room);
-        let game = snapshot(self.rooms.get_mut(&game_id).expect("new room exists"));
+        let white = PlayerSlot::taken_by(player_name, user, connection);
+        let reconnect_token = white.reconnect_token.clone();
+        let game_id = self.open_room(&time_control, white, None);
+        let room = self.rooms.get_mut(&game_id).expect("new room exists");
+        let invite_code = room.invite_code.clone();
+        let game = snapshot(room);
 
         vec![self.delivery(
             connection,
@@ -600,6 +664,148 @@ impl Hub {
                 game,
             },
         )]
+    }
+
+    /// Seat `white` in a new room, and `black` too when the game can start
+    /// at once, which starts White's clock.
+    fn open_room(
+        &mut self,
+        time_control: &TimeControl,
+        white: PlayerSlot,
+        black: Option<PlayerSlot>,
+    ) -> String {
+        let game_id = Uuid::new_v4().to_string();
+        let invite_code = self.unique_invite_code();
+        let mut game = Game::with_clock(
+            Position::startpos(),
+            time_control.initial(),
+            time_control.increment(),
+        );
+        game.clock.pause();
+        let mut started_at_ms = 0;
+        if black.is_some() {
+            game.clock.resume(Color::White);
+            started_at_ms = unix_time_ms();
+        }
+        for (side, player) in [(Color::White, Some(&white)), (Color::Black, black.as_ref())] {
+            if let Some(connection) = player.and_then(|player| player.connection) {
+                self.memberships.insert(
+                    connection,
+                    Membership {
+                        game_id: game_id.clone(),
+                        side,
+                    },
+                );
+            }
+        }
+        self.invites.insert(invite_code.clone(), game_id.clone());
+        self.rooms.insert(
+            game_id.clone(),
+            Room {
+                game_id: game_id.clone(),
+                invite_code,
+                game,
+                white,
+                black,
+                started_at_ms,
+                finished_at: None,
+            },
+        );
+        game_id
+    }
+
+    /// Pair `connection` with the player who has waited longest for the same
+    /// clock, or have it wait for the next one. Colours are drawn at random,
+    /// and an account is never paired with itself.
+    fn find_game(
+        &mut self,
+        connection: ConnectionId,
+        request_id: u64,
+        player_name: String,
+        time_control: TimeControl,
+    ) -> Vec<Delivery> {
+        if self.memberships.contains_key(&connection) {
+            return self.direct_error(
+                connection,
+                Some(request_id),
+                ErrorCode::InvalidRequest,
+                "leave the current game before looking for another one",
+            );
+        }
+        if self.seeks.iter().any(|seek| seek.connection == connection) {
+            let lobby = self.lobby();
+            return vec![self.delivery(connection, Some(request_id), ServerEvent::Lobby { lobby })];
+        }
+        let (player_name, user) = match self.seat_name(connection, &player_name) {
+            Ok(seat) => seat,
+            Err(message) => {
+                return self.direct_error(
+                    connection,
+                    Some(request_id),
+                    ErrorCode::InvalidRequest,
+                    message,
+                )
+            }
+        };
+        if !supported_time_control(&time_control) {
+            return self.direct_error(
+                connection,
+                Some(request_id),
+                ErrorCode::InvalidRequest,
+                UNSUPPORTED_TIME_CONTROL,
+            );
+        }
+
+        let partner = self.seeks.iter().position(|seek| {
+            seek.time_control == time_control && (user.is_none() || seek.user != user)
+        });
+        let Some(partner) = partner else {
+            self.seeks.push(Seek {
+                connection,
+                name: player_name,
+                user,
+                time_control,
+            });
+            let lobby = self.lobby();
+            return vec![self.delivery(connection, Some(request_id), ServerEvent::Lobby { lobby })];
+        };
+        let partner = self.seeks.remove(partner);
+        let mine = PlayerSlot::taken_by(player_name, user, connection);
+        let theirs = PlayerSlot::taken_by(partner.name, partner.user, partner.connection);
+        let (white, black) = if rand::random::<bool>() {
+            (mine, theirs)
+        } else {
+            (theirs, mine)
+        };
+        let seats = [
+            (
+                Color::White,
+                white.reconnect_token.clone(),
+                white.connection,
+            ),
+            (
+                Color::Black,
+                black.reconnect_token.clone(),
+                black.connection,
+            ),
+        ];
+        let game_id = self.open_room(&time_control, white, Some(black));
+        let game = snapshot(self.rooms.get_mut(&game_id).expect("new room exists"));
+
+        let mut deliveries = Vec::new();
+        for (side, reconnect_token, target) in seats {
+            let Some(target) = target else { continue };
+            deliveries.push(self.delivery(
+                target,
+                (target == connection).then_some(request_id),
+                ServerEvent::GameJoined {
+                    reconnect_token,
+                    game: game.clone(),
+                    side: Some(side.into()),
+                },
+            ));
+        }
+        deliveries
     }
 
     fn join_game(
@@ -637,7 +843,8 @@ impl Hub {
                 "invite code was not found",
             );
         };
-        let reconnect_token = Uuid::new_v4().to_string();
+        let black = PlayerSlot::taken_by(player_name, user, connection);
+        let reconnect_token = black.reconnect_token.clone();
         let (creator, game) = {
             let room = self.rooms.get_mut(&game_id).expect("invite points to room");
             if room.black.is_some() {
@@ -648,13 +855,7 @@ impl Hub {
                     "this game already has two players",
                 );
             }
-            room.black = Some(PlayerSlot {
-                name: player_name,
-                user,
-                reconnect_token: reconnect_token.clone(),
-                connection: Some(connection),
-                disconnected_at: None,
-            });
+            room.black = Some(black);
             room.started_at_ms = unix_time_ms();
             room.game.clock.resume(Color::White);
             room.game.changed();
@@ -676,6 +877,7 @@ impl Hub {
             ServerEvent::GameJoined {
                 reconnect_token,
                 game: game.clone(),
+                side: Some(Side::Black),
             },
         )];
         if let Some(creator) = creator {
@@ -751,6 +953,7 @@ impl Hub {
             ServerEvent::GameJoined {
                 reconnect_token: reconnect_token.to_string(),
                 game,
+                side: Some(side.into()),
             },
         )];
         if let Some(opponent) = opponent {
@@ -1058,6 +1261,12 @@ fn finished_game(room: &Room) -> Option<FinishedGame> {
         started_at_ms: room.started_at_ms,
         ended_at_ms: unix_time_ms(),
     })
+}
+
+const UNSUPPORTED_TIME_CONTROL: &str = "time control is outside the supported range";
+
+fn supported_time_control(time_control: &TimeControl) -> bool {
+    time_control.initial_ms <= MAX_INITIAL_MS && time_control.increment_ms <= MAX_INCREMENT_MS
 }
 
 fn clean_player_name(name: &str) -> Result<String, &'static str> {
@@ -1670,6 +1879,170 @@ mod tests {
         assert_eq!(
             outcome(&room.game),
             Some(Outcome::Abandonment(Color::Black))
+        );
+    }
+
+    fn find(hub: &mut Hub, connection: ConnectionId, minutes: u64) -> Vec<Delivery> {
+        hub.handle(
+            connection,
+            ClientEnvelope::new(
+                20,
+                ClientCommand::FindGame {
+                    player_name: format!("Guest {connection}"),
+                    time_control: TimeControl {
+                        initial_ms: minutes * 60_000,
+                        increment_ms: 5_000,
+                    },
+                },
+            ),
+        )
+    }
+
+    fn lobby_for(deliveries: &[Delivery], target: ConnectionId) -> Option<Lobby> {
+        deliveries
+            .iter()
+            .filter(|delivery| delivery.target == target)
+            .find_map(|delivery| match delivery.message.event {
+                ServerEvent::Lobby { lobby } => Some(lobby),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn strangers_looking_for_a_game_are_paired_on_opposite_sides() {
+        let mut hub = Hub::new();
+        let first = hub.connect();
+        let second = hub.connect();
+
+        let waiting = find(&mut hub, first, 10);
+        assert_eq!(
+            lobby_for(&waiting, first),
+            Some(Lobby {
+                online: 1,
+                seeking: 1
+            })
+        );
+
+        let paired = find(&mut hub, second, 10);
+        let seats: Vec<(ConnectionId, Option<u64>, Side, String)> = paired
+            .iter()
+            .filter_map(|delivery| match &delivery.message.event {
+                ServerEvent::GameJoined { game, side, .. } => Some((
+                    delivery.target,
+                    delivery.message.request_id,
+                    side.expect("a paired player is told their side"),
+                    game.game_id.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seats.len(), 2);
+        assert_eq!(seats[0].3, seats[1].3, "both are in the same game");
+        assert_ne!(seats[0].2, seats[1].2, "one plays each colour");
+        let asked = seats.iter().find(|seat| seat.0 == second).unwrap();
+        assert_eq!(
+            asked.1,
+            Some(20),
+            "the request that paired them is answered"
+        );
+        assert!(hub.seeks.is_empty());
+
+        let (white, _, _, game_id) = seats
+            .iter()
+            .find(|seat| seat.2 == Side::White)
+            .unwrap()
+            .clone();
+        let moved = hub.handle(
+            white,
+            ClientEnvelope::new(
+                21,
+                ClientCommand::PlayMove {
+                    game_id,
+                    expected_ply: 0,
+                    uci: "e2e4".to_string(),
+                },
+            ),
+        );
+        assert!(moved.iter().all(|delivery| matches!(
+            &delivery.message.event,
+            ServerEvent::GameUpdated { game } if game.moves == ["e2e4"]
+        )));
+    }
+
+    #[test]
+    fn watchers_hear_when_someone_starts_and_stops_looking() {
+        let mut hub = Hub::new();
+        let watcher = hub.connect();
+        let seeker = hub.connect();
+
+        let watching = hub.handle(watcher, ClientEnvelope::new(1, ClientCommand::WatchLobby));
+        assert_eq!(
+            lobby_for(&watching, watcher),
+            Some(Lobby {
+                online: 1,
+                seeking: 0
+            })
+        );
+
+        let news = find(&mut hub, seeker, 10);
+        assert_eq!(
+            lobby_for(&news, watcher),
+            Some(Lobby {
+                online: 2,
+                seeking: 1
+            })
+        );
+        assert_eq!(
+            news.iter().filter(|d| d.target == seeker).count(),
+            1,
+            "the seeker is answered once, not told the news again"
+        );
+
+        let news = hub.disconnect(seeker);
+        assert_eq!(
+            lobby_for(&news, watcher),
+            Some(Lobby {
+                online: 1,
+                seeking: 0
+            })
+        );
+        assert!(hub.seeks.is_empty());
+        assert!(
+            hub.tick().is_empty(),
+            "nothing changed, so nothing is announced"
+        );
+    }
+
+    #[test]
+    fn only_the_same_clock_and_another_account_make_a_pair() {
+        let mut hub = Hub::new();
+        let identity = Identity {
+            user: 7,
+            username: "carol".to_string(),
+        };
+        let laptop = hub.connect();
+        let phone = hub.connect();
+        let blitz = hub.connect();
+        let stranger = hub.connect();
+        hub.sign_in(laptop, identity.clone());
+        hub.sign_in(phone, identity);
+
+        find(&mut hub, laptop, 10);
+        let same_account = find(&mut hub, phone, 10);
+        assert_eq!(lobby_for(&same_account, phone).unwrap().seeking, 2);
+        let other_clock = find(&mut hub, blitz, 3);
+        assert_eq!(lobby_for(&other_clock, blitz).unwrap().seeking, 3);
+
+        let paired = find(&mut hub, stranger, 10);
+        let targets: HashSet<ConnectionId> = paired
+            .iter()
+            .filter(|d| matches!(d.message.event, ServerEvent::GameJoined { .. }))
+            .map(|d| d.target)
+            .collect();
+        assert_eq!(
+            targets,
+            HashSet::from([laptop, stranger]),
+            "the longest waiting account goes first"
         );
     }
 

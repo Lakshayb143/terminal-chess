@@ -8,9 +8,10 @@ use chess_core::board::{self, Color, Move, Piece, PieceKind};
 use chess_core::game::{describe, outcome, outcome_detail, score_tag, Game, Outcome};
 use chess_core::movegen::in_check;
 use chess_core::search::Limits;
+use chess_protocol::Lobby;
 
 use crate::app::cli::{Mode, Options};
-use crate::app::format::{budget_text, material};
+use crate::app::format::{budget_text, material, others_online};
 
 pub(crate) struct Screen {
     pub(crate) theme: Theme,
@@ -104,6 +105,10 @@ pub(crate) struct OnlineDisplay {
     pub(crate) reconnect_deadline_ms: Option<u64>,
     pub(crate) move_pending: bool,
     pub(crate) failure_help: Option<String>,
+    /// Waiting for the server to pair us with a stranger.
+    pub(crate) seeking: bool,
+    /// Who else is around, as the server last said.
+    pub(crate) lobby: Option<Lobby>,
 }
 
 impl OnlineDisplay {
@@ -1667,6 +1672,30 @@ impl Screen {
                     );
                 }
                 ConnectionDisplay::Connected => {}
+            }
+            if online.seeking {
+                let heading = "FINDING AN OPPONENT";
+                let others = online.lobby.map(|lobby| lobby.online.saturating_sub(1));
+                return match others {
+                    Some(0) => format!(
+                        "{}  {}",
+                        theme.strong(theme.palette.warn, heading),
+                        theme.dim("no one else online · q for the menu")
+                    ),
+                    Some(others) => format!(
+                        "{}  {}",
+                        theme.strong(theme.palette.accent, heading),
+                        theme.dim(&format!(
+                            "{} online · q for the menu",
+                            others_online(others)
+                        ))
+                    ),
+                    None => format!(
+                        "{}  {}",
+                        theme.strong(theme.palette.accent, heading),
+                        theme.dim("q for the menu")
+                    ),
+                };
             }
             if online.reconnect_deadline_ms.is_some() {
                 return format!(

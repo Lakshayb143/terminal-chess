@@ -18,6 +18,8 @@ use chess_core::movegen::in_check;
 
 use crate::app::account::{account_menu, AccountContext};
 use crate::app::cli::{Mode, OnlineIntent, Options, StartChoice};
+use crate::app::format::others_online;
+use crate::app::online::{random_clock_text, LobbyView, LobbyWatch};
 use crate::app::prompt::ask_guest_name;
 use crate::app::saves::{color_named, restore_game};
 use crate::app::screen::Screen;
@@ -29,6 +31,7 @@ pub(crate) enum Entry {
     Black,
     Two,
     Continue,
+    Random,
     Create,
     Join,
     Rejoin,
@@ -43,6 +46,7 @@ impl Entry {
             Entry::Black => 'b',
             Entry::Two => 't',
             Entry::Continue => 'c',
+            Entry::Random => 'p',
             Entry::Create => 'o',
             Entry::Join => 'j',
             Entry::Rejoin => 'r',
@@ -57,6 +61,7 @@ impl Entry {
             Entry::Black => "Play Black",
             Entry::Two => "Two players",
             Entry::Continue => "Continue saved game",
+            Entry::Random => "Play a random opponent",
             Entry::Create => "Create a private game",
             Entry::Join => "Join with a code",
             Entry::Rejoin => "Rejoin online game",
@@ -204,6 +209,8 @@ pub(crate) struct Home {
     /// For each row of the last frame, the byte where the text right of the
     /// board begins, or 0 when the row does not cross the board.
     splits: Vec<usize>,
+    /// Who is online, for anyone thinking of playing a stranger.
+    pub(crate) lobby: LobbyView,
 }
 
 impl Home {
@@ -212,7 +219,7 @@ impl Home {
         if info.saved.is_some() {
             entries.push(Entry::Continue);
         }
-        entries.extend([Entry::Create, Entry::Join]);
+        entries.extend([Entry::Random, Entry::Create, Entry::Join]);
         if info.seat.is_some() {
             entries.push(Entry::Rejoin);
         }
@@ -235,6 +242,7 @@ impl Home {
             board_cache: None,
             placed: None,
             splits: Vec::new(),
+            lobby: LobbyView::Checking,
         }
     }
 
@@ -344,6 +352,7 @@ impl Home {
                 }
                 None => None,
             },
+            Entry::Random => Some(self.online_pick(OnlineIntent::Find, account)),
             Entry::Create => Some(self.online_pick(OnlineIntent::Create, account)),
             Entry::Join => {
                 self.code = Some(String::new());
@@ -523,7 +532,10 @@ impl Home {
                 "PLAY",
                 &[Entry::White, Entry::Black, Entry::Two, Entry::Continue],
             ),
-            ("ONLINE", &[Entry::Create, Entry::Join, Entry::Rejoin]),
+            (
+                "ONLINE",
+                &[Entry::Random, Entry::Create, Entry::Join, Entry::Rejoin],
+            ),
             ("", &[Entry::Account, Entry::Quit]),
         ];
         for (index, (heading, members)) in sections.iter().enumerate() {
@@ -619,6 +631,15 @@ impl Home {
                 Some(_) => "your recent games".to_string(),
                 None => "sign in or sign up".to_string(),
             }),
+            Entry::Random => match self.lobby {
+                LobbyView::Known(lobby) if lobby.seeking > 0 => {
+                    Some(format!("{} waiting now", lobby.seeking))
+                }
+                LobbyView::Known(lobby) if lobby.online <= 1 => Some("only you online".to_string()),
+                LobbyView::Known(lobby) => Some(format!("{} online", lobby.online)),
+                LobbyView::Checking => None,
+                LobbyView::Unavailable => Some("server offline".to_string()),
+            },
             _ => None,
         }
     }
@@ -670,6 +691,7 @@ impl Home {
                 }
                 _ => vec![theme.warn("The autosaved game could not be read.")],
             },
+            Entry::Random => self.random_detail(theme),
             Entry::Create => vec![
                 "Start a private game as White and get an invite code.".to_string(),
                 server(&info.server_url),
@@ -698,6 +720,47 @@ impl Home {
             Entry::Quit => vec![
                 "Back to the shell.".to_string(),
                 theme.dim("Preferences and unfinished games are saved as you play."),
+            ],
+        }
+    }
+
+    /// What playing a stranger would be like right now. Being the only one
+    /// online is said plainly, with the choices that need no stranger.
+    fn random_detail(&self, theme: &Theme) -> Vec<String> {
+        let terms = theme.dim(&format!(
+            "{} clock · colours drawn at random",
+            random_clock_text()
+        ));
+        match self.lobby {
+            LobbyView::Known(lobby) if lobby.seeking > 0 => {
+                let who = match lobby.seeking {
+                    1 => "Someone is".to_string(),
+                    waiting => format!("{waiting} people are"),
+                };
+                vec![
+                    theme.good(&format!("{who} waiting: you start at once.")),
+                    terms,
+                ]
+            }
+            LobbyView::Known(lobby) if lobby.online <= 1 => vec![
+                theme.warn("No one else is online right now."),
+                theme.dim("Wait for someone, or play Two players or a"),
+                theme.dim("private game with a friend instead."),
+            ],
+            LobbyView::Known(lobby) => vec![
+                format!(
+                    "{} online: play whoever looks next.",
+                    others_online(lobby.online - 1)
+                ),
+                terms,
+            ],
+            LobbyView::Checking => vec![
+                "Play whoever else is looking for a game.".to_string(),
+                theme.dim("Checking who is online…"),
+            ],
+            LobbyView::Unavailable => vec![
+                "Play whoever else is looking for a game.".to_string(),
+                theme.warn("The game server cannot be reached."),
             ],
         }
     }
@@ -910,6 +973,7 @@ pub(crate) fn run(
 ) -> Result<Option<StartChoice>, String> {
     let mut input = TerminalInput::enter(true)?;
     let mut home = Home::new(info);
+    let mut lobby = LobbyWatch::start(&info.server_url);
     let mut shown: Vec<String> = Vec::new();
     let mut picture = Picture {
         protocol: screen.image_protocol,
@@ -918,6 +982,7 @@ pub(crate) fn run(
     };
     let pieces = preview_pieces(screen.pieces, screen.image_protocol);
     loop {
+        home.lobby = lobby.poll();
         let (cols, rows) = ui::terminal_size().unwrap_or((80, 24));
         let frame = home.render(
             &screen.theme,
@@ -1015,6 +1080,7 @@ fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chess_protocol::Lobby;
 
     fn info(saved: bool, seat: bool) -> HomeInfo {
         HomeInfo {
@@ -1079,6 +1145,59 @@ mod tests {
         // Continue is not on offer without an autosave.
         assert!(key(&mut home, &info, &account, "c").is_none());
         assert!(home.complaint.is_some());
+    }
+
+    #[test]
+    fn the_random_opponent_row_says_who_is_online() {
+        let info = info(false, false);
+        let account = guest();
+        let mut home = Home::new(&info);
+        assert!(matches!(
+            key(&mut home, &info, &account, "p"),
+            Some(Pick::NeedsName(OnlineIntent::Find))
+        ));
+        assert_eq!(home.focused(), Entry::Random);
+        let mut shown = |lobby: Lobby| {
+            home.lobby = LobbyView::Known(lobby);
+            home.render(&theme(), &info, &account, ui::Pieces::Glyph, 120, 40)
+                .join("\n")
+        };
+
+        let alone = shown(Lobby {
+            online: 1,
+            seeking: 0,
+        });
+        assert!(alone.contains("only you online"));
+        assert!(alone.contains("No one else is online right now."));
+        assert!(
+            alone.contains("private game with a friend instead."),
+            "{alone}"
+        );
+
+        let someone_waits = shown(Lobby {
+            online: 4,
+            seeking: 1,
+        });
+        assert!(someone_waits.contains("1 waiting now"));
+        assert!(someone_waits.contains("Someone is waiting: you start at once."));
+
+        let others = shown(Lobby {
+            online: 3,
+            seeking: 0,
+        });
+        assert!(others.contains("3 online"));
+        assert!(others.contains("2 others online: play whoever looks next."));
+
+        // The longest explanation still fits the smallest window.
+        home.lobby = LobbyView::Known(Lobby {
+            online: 1,
+            seeking: 0,
+        });
+        for (cols, rows) in [(30, 12), (60, 20), (80, 24)] {
+            let frame = home.render(&theme(), &info, &account, ui::Pieces::Glyph, cols, rows);
+            assert_eq!(frame.len(), rows);
+            assert!(frame.iter().all(|line| ui::width(line) <= cols));
+        }
     }
 
     #[test]

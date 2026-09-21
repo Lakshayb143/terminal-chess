@@ -20,7 +20,7 @@ use crate::app::actions::{
 use crate::app::cli::{names_a_file, Mode, Options, StartChoice, HOSTED_FILES};
 use crate::app::format::{format_score, white_pov};
 use crate::app::home::{self, HomeInfo};
-use crate::app::online::play_online;
+use crate::app::online::{play_online, Ended};
 use crate::app::pages::{
     export_pgn, help_lines, history_page, import_pgn, load_saved_game, moves_lines, pgn_lines,
     set_player_name, setup_lines, show_piece_moves,
@@ -32,7 +32,7 @@ use crate::app::screen::{Screen, UiAction};
 
 pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Result<(), String> {
     if options.online.is_some() {
-        return play_online(options, loaded.path, loaded.preferences);
+        return play_online(options, loaded.path, loaded.preferences).map(|_| ());
     }
     let config_path = loaded.path;
     let session_path = storage::default_session_path(&config_path);
@@ -60,7 +60,7 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
     let mut screen = Screen::from_options(&options, options.player_names.clone());
     // Held for as long as the game lasts. Whatever was on the terminal before
     // comes back when this is dropped, however the program ends.
-    let _fullscreen = ui::Fullscreen::enter(&screen.theme);
+    let mut _fullscreen = Some(ui::Fullscreen::enter(&screen.theme));
     // Probe once up front even when another piece style was requested. The
     // in-game Piece control can switch to Auto later without querying the
     // terminal in the middle of raw event input.
@@ -76,43 +76,53 @@ pub(crate) fn play(options: Options, loaded: storage::LoadedPreferences) -> Resu
                 &options.server_url,
                 options.online_name.clone(),
             );
-            let choice = match options.mode {
-                Some(mode) => StartChoice::Mode(mode),
-                None => {
-                    let picked = if screen.theme.live && screen.theme.color {
-                        let seat_path = storage::default_online_session_path(&config_path);
-                        let info = HomeInfo::load(&session_path, &seat_path, &options, &screen);
-                        home::run(&mut screen, &info, &mut account)?
-                    } else {
-                        let mut stdin = io::stdin().lock();
-                        ask_mode(&mut stdin, &mut screen, session_path.exists(), &mut account)?
-                    };
-                    match picked {
-                        Some(choice) => choice,
-                        None => return Ok(()),
+            // Giving up on finding a stranger online comes back here.
+            loop {
+                let choice = match options.mode {
+                    Some(mode) => StartChoice::Mode(mode),
+                    None => {
+                        let picked = if screen.theme.live && screen.theme.color {
+                            let seat_path = storage::default_online_session_path(&config_path);
+                            let info = HomeInfo::load(&session_path, &seat_path, &options, &screen);
+                            home::run(&mut screen, &info, &mut account)?
+                        } else {
+                            let mut stdin = io::stdin().lock();
+                            ask_mode(&mut stdin, &mut screen, session_path.exists(), &mut account)?
+                        };
+                        match picked {
+                            Some(choice) => choice,
+                            None => return Ok(()),
+                        }
                     }
-                }
-            };
-            match choice {
-                StartChoice::Online(intent, name) => {
-                    // The online game sets up its own screen.
-                    drop(_fullscreen);
-                    let mut options = options;
-                    options.online = Some(intent);
-                    options.online_name = name;
-                    return play_online(options, config_path, last_preferences);
-                }
-                StartChoice::Mode(mode) => (
-                    Game::with_clock(
-                        start.expect("new games have a starting position"),
-                        options.clock,
-                        options.increment,
-                    ),
-                    mode,
-                ),
-                StartChoice::Resume => {
-                    resuming = true;
-                    restore_game(storage::load_game(&session_path)?)?
+                };
+                match choice {
+                    StartChoice::Online(intent, name) => {
+                        // The online game sets up its own screen.
+                        _fullscreen = None;
+                        let mut online = options.clone();
+                        online.online = Some(intent);
+                        online.online_name = name;
+                        let ended =
+                            play_online(online, config_path.clone(), last_preferences.clone())?;
+                        if ended == Ended::Done {
+                            return Ok(());
+                        }
+                        _fullscreen = Some(ui::Fullscreen::enter(&screen.theme));
+                    }
+                    StartChoice::Mode(mode) => {
+                        break (
+                            Game::with_clock(
+                                start.expect("new games have a starting position"),
+                                options.clock,
+                                options.increment,
+                            ),
+                            mode,
+                        )
+                    }
+                    StartChoice::Resume => {
+                        resuming = true;
+                        break restore_game(storage::load_game(&session_path)?)?;
+                    }
                 }
             }
         }

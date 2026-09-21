@@ -30,6 +30,14 @@ pub(crate) fn material(pos: &Position, color: Color) -> i32 {
         .sum()
 }
 
+/// Everyone else a lobby count covers: "1 other" or "3 others".
+pub(crate) fn others_online(others: u32) -> String {
+    match others {
+        1 => "1 other".to_string(),
+        others => format!("{others} others"),
+    }
+}
+
 /// How long the engine gets, in the words used by the flags that set it.
 pub(crate) fn budget_text(limits: &Limits) -> String {
     match limits.movetime {

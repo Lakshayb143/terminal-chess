@@ -511,5 +511,7 @@ fn command_name(command: &ClientCommand) -> &'static str {
         ClientCommand::LogOut => "log_out",
         ClientCommand::ListGames { .. } => "list_games",
         ClientCommand::LinkSshKey { .. } => "link_ssh_key",
+        ClientCommand::WatchLobby => "watch_lobby",
+        ClientCommand::FindGame { .. } => "find_game",
     }
 }

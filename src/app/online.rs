@@ -14,8 +14,8 @@ use chess_core::movegen::generate_legal;
 use chess_core::san::{parse_move, ParseError};
 use chess_core::search::Limits;
 use chess_protocol::{
-    ClientCommand, ErrorCode, FinishReason, GameSnapshot, GameStatus, MoveRejection, ServerEvent,
-    TimeControl,
+    ClientCommand, ErrorCode, FinishReason, GameSnapshot, GameStatus, Lobby, MoveRejection,
+    ServerEvent, TimeControl,
 };
 
 use crate::app::account::AccountContext;
@@ -24,7 +24,7 @@ use crate::app::actions::{
     sound_after_move, split_command, toggle_size,
 };
 use crate::app::cli::{names_a_file, Mode, OnlineIntent, Options, HOSTED_FILES};
-use crate::app::format::kind_name;
+use crate::app::format::{kind_name, others_online};
 use crate::app::pages::{export_pgn, history_page, pgn_lines};
 use crate::app::parse::{nearby_moves, promotion_default};
 use crate::app::prompt::read_line;
@@ -45,7 +45,42 @@ pub(crate) struct OnlineSession {
     pub(crate) account: AccountContext,
 }
 
+/// The clock of every game with a stranger, so that anyone looking for one
+/// can be paired with anyone else looking.
+pub(crate) const RANDOM_CLOCK: TimeControl = TimeControl {
+    initial_ms: 10 * 60 * 1_000,
+    increment_ms: 5 * 1_000,
+};
+
+/// [`RANDOM_CLOCK`] as players write it: minutes, then the increment.
+pub(crate) fn random_clock_text() -> String {
+    format!(
+        "{}+{}",
+        RANDOM_CLOCK.initial_ms / 60_000,
+        RANDOM_CLOCK.increment_ms / 1_000
+    )
+}
+
+/// How an online session ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Ended {
+    Done,
+    /// The player stopped looking for a stranger before one turned up and
+    /// wants the menu again.
+    Menu,
+}
+
 impl OnlineSession {
+    /// Giving up on finding a stranger goes back to the menu; leaving a game
+    /// ends the program, as it always has.
+    fn leaving(&self) -> Ended {
+        if self.intent == OnlineIntent::Find && self.game_id.is_none() {
+            Ended::Menu
+        } else {
+            Ended::Done
+        }
+    }
+
     pub(crate) fn send(&self, command: ClientCommand, screen: &mut Screen) -> bool {
         match self.client.send(command) {
             Ok(()) => true,
@@ -92,11 +127,58 @@ impl OnlineSession {
     }
 }
 
+/// What the home page knows about who is online.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LobbyView {
+    Checking,
+    Known(Lobby),
+    /// The server cannot be reached, or is too old to say.
+    Unavailable,
+}
+
+/// A connection held open while the home page is up, so that the page can
+/// say who is online, and so that the player counts as online meanwhile.
+pub(crate) struct LobbyWatch {
+    client: OnlineClient,
+    view: LobbyView,
+}
+
+impl LobbyWatch {
+    pub(crate) fn start(server_url: &str) -> LobbyWatch {
+        LobbyWatch {
+            client: OnlineClient::connect(server_url.to_string()),
+            view: LobbyView::Checking,
+        }
+    }
+
+    /// The latest numbers, after reading whatever the server has sent.
+    pub(crate) fn poll(&mut self) -> LobbyView {
+        while let Some(event) = self.client.try_recv() {
+            match event {
+                // Each new connection has to ask again.
+                TransportEvent::Connected => {
+                    let _ = self.client.send(ClientCommand::WatchLobby);
+                }
+                TransportEvent::Message(envelope) => match envelope.event {
+                    ServerEvent::Lobby { lobby } => self.view = LobbyView::Known(lobby),
+                    ServerEvent::Error { .. } => self.view = LobbyView::Unavailable,
+                    _ => {}
+                },
+                TransportEvent::Disconnected { .. } | TransportEvent::Stopped(_) => {
+                    self.view = LobbyView::Unavailable;
+                }
+                TransportEvent::Connecting { .. } => {}
+            }
+        }
+        self.view
+    }
+}
+
 pub(crate) fn play_online(
     mut options: Options,
     config_path: PathBuf,
     preferences: storage::Preferences,
-) -> Result<(), String> {
+) -> Result<Ended, String> {
     let seat_path = storage::default_online_session_path(&config_path);
     let intent = options
         .online
@@ -128,15 +210,28 @@ pub(crate) fn play_online(
         .or(match intent {
             OnlineIntent::Create => Some(Color::White),
             OnlineIntent::Join(_) => Some(Color::Black),
-            OnlineIntent::Resume => None,
+            OnlineIntent::Resume | OnlineIntent::Find => None,
         });
+    let seeking = intent == OnlineIntent::Find;
     let mut player_names = [String::new(), String::new()];
     if let Some(side) = initial_side {
         player_names[side.index()] = options.online_name.clone();
     }
     let mut screen = Screen::from_options(&options, player_names);
     screen.flipped = options.flipped || initial_side == Some(Color::Black);
-    screen.message = vec![screen.theme.dim("Connecting to the game server…")];
+    screen.message = if seeking {
+        vec![
+            format!(
+                "Looking for an opponent: {}, random colours.",
+                random_clock_text()
+            ),
+            screen
+                .theme
+                .dim("You start when someone else looks for a game."),
+        ]
+    } else {
+        vec![screen.theme.dim("Connecting to the game server…")]
+    };
     screen.online = Some(OnlineDisplay {
         connection: ConnectionDisplay::Connecting,
         invite_code: None,
@@ -146,6 +241,8 @@ pub(crate) fn play_online(
         reconnect_deadline_ms: None,
         move_pending: true,
         failure_help: None,
+        seeking,
+        lobby: None,
     });
     let _fullscreen = ui::Fullscreen::enter(&screen.theme);
     if screen.theme.live && !screen.theme.ascii {
@@ -153,7 +250,12 @@ pub(crate) fn play_online(
     }
 
     let hosted = options.hosted;
-    let mut game = Game::with_clock(Position::startpos(), options.clock, options.increment);
+    let (clock, increment) = if seeking {
+        (RANDOM_CLOCK.initial(), RANDOM_CLOCK.increment())
+    } else {
+        (options.clock, options.increment)
+    };
+    let mut game = Game::with_clock(Position::startpos(), clock, increment);
     game.clock.pause();
     let client = OnlineClient::connect(options.server_url.clone());
     let mut session = OnlineSession {
@@ -219,7 +321,7 @@ pub(crate) fn play_online(
             InputAction::Submit(line) => {
                 if line.is_empty() && screen.focused != UiAction::MoveInput {
                     if handle_online_action(screen.focused, &game, &session, &mut screen) {
-                        return Ok(());
+                        return Ok(session.leaving());
                     }
                     continue;
                 }
@@ -279,7 +381,7 @@ pub(crate) fn play_online(
                 if let Some(action) = screen.action_at(column, row) {
                     screen.focus(action);
                     if handle_online_action(action, &game, &session, &mut screen) {
-                        return Ok(());
+                        return Ok(session.leaving());
                     }
                     continue;
                 }
@@ -294,7 +396,7 @@ pub(crate) fn play_online(
                 }
                 continue;
             }
-            InputAction::Quit => return Ok(()),
+            InputAction::Quit => return Ok(Ended::Done),
         };
 
         let input = line.trim();
@@ -330,7 +432,7 @@ pub(crate) fn play_online(
             continue;
         }
         match word.as_str() {
-            "quit" | "exit" | "q" => return Ok(()),
+            "quit" | "exit" | "q" => return Ok(session.leaving()),
             "help" | "h" | "?" => {
                 screen.open("ONLINE GAME", online_help_lines(&screen.theme));
                 continue;
@@ -456,6 +558,10 @@ pub(crate) fn handle_transport_event(
                         invite_code: code.clone(),
                         player_name: session.player_name.clone(),
                     },
+                    OnlineIntent::Find => ClientCommand::FindGame {
+                        player_name: session.player_name.clone(),
+                        time_control: RANDOM_CLOCK,
+                    },
                     OnlineIntent::Resume => unreachable!("resume has reconnect credentials"),
                 });
             session.send(command, screen);
@@ -492,6 +598,7 @@ pub(crate) fn handle_transport_event(
             | ServerEvent::SignedOut
             | ServerEvent::GameList { .. }
             | ServerEvent::SshKeyLinked => {}
+            ServerEvent::Lobby { lobby } => show_lobby(lobby, screen),
             ServerEvent::Error {
                 code: ErrorCode::InvalidSession,
                 ..
@@ -519,18 +626,35 @@ pub(crate) fn handle_transport_event(
             ServerEvent::GameJoined {
                 reconnect_token,
                 game: snapshot,
+                side,
             } => {
                 session.game_id = Some(snapshot.game_id.clone());
                 session.reconnect_token = Some(reconnect_token);
-                if session.side.is_none() {
-                    session.side = Some(Color::Black);
-                }
+                // Servers before version 4 do not say, and a code seats Black.
+                session.side = side
+                    .map(Color::from)
+                    .or(session.side)
+                    .or(Some(Color::Black));
+                let paired = screen.online.as_ref().is_some_and(|online| online.seeking);
                 if let Some(online) = &mut screen.online {
                     online.your_side = session.side;
+                    online.seeking = false;
+                }
+                if paired {
+                    screen.flipped = session.side == Some(Color::Black);
                 }
                 session.save_seat()?;
                 apply_online_snapshot(snapshot, session, game, screen, true)?;
-                screen.note(screen.theme.good("Connected to the game."));
+                match (paired, session.side) {
+                    (true, Some(side)) => {
+                        let opponent = &screen.player_names[side.flip().index()];
+                        screen.show(vec![screen.theme.good(&format!(
+                            "Paired with {opponent}. You play {}.",
+                            side.name()
+                        ))]);
+                    }
+                    _ => screen.note(screen.theme.good("Connected to the game.")),
+                }
             }
             ServerEvent::GameUpdated { game: snapshot } => {
                 apply_online_snapshot(snapshot, session, game, screen, false)?;
@@ -621,6 +745,37 @@ pub(crate) fn handle_transport_event(
         },
     }
     Ok(())
+}
+
+/// Keep the lobby's numbers for the status line, and say so plainly the first
+/// time a player looking for a stranger turns out to be alone.
+pub(crate) fn show_lobby(lobby: Lobby, screen: &mut Screen) {
+    let Some(online) = &mut screen.online else {
+        return;
+    };
+    let others = |lobby: Option<Lobby>| lobby.map(|lobby| lobby.online.saturating_sub(1));
+    let was = others(online.lobby);
+    online.lobby = Some(lobby);
+    let seeking = online.seeking;
+    let now = others(Some(lobby));
+    if seeking && now == Some(0) && was != Some(0) {
+        screen.show(vec![
+            screen.theme.warn("No one else is online right now."),
+            screen
+                .theme
+                .dim("Wait here, or press q to go back and play"),
+            screen
+                .theme
+                .dim("two players or a private game with a friend."),
+        ]);
+    } else if seeking && was == Some(0) && now.is_some_and(|others| others > 0) {
+        let others = now.unwrap_or_default();
+        screen.show(vec![screen.theme.good(&format!(
+            "{} online now. The next to look plays you.",
+            others_online(others)
+        ))]);
+    }
+    screen.redraw = true;
 }
 
 pub(crate) fn apply_online_snapshot(
@@ -853,7 +1008,9 @@ pub(crate) fn online_draw_available(screen: &Screen, game: &Game, side: Option<C
 }
 
 pub(crate) fn explain_online_wait(game: &Game, screen: &mut Screen) {
-    let message = if outcome(game).is_some() {
+    let message = if screen.online.as_ref().is_some_and(|online| online.seeking) {
+        "No opponent yet. You start when someone else looks."
+    } else if outcome(game).is_some() {
         "The game is over. Export the PGN or quit when you are ready."
     } else if screen
         .online

@@ -46,8 +46,11 @@ pub(crate) enum OnlineIntent {
     Create,
     Join(String),
     Resume,
+    /// Play whoever else is looking for a game.
+    Find,
 }
 
+#[derive(Clone)]
 pub(crate) struct Options {
     /// `None` until the opening menu asks which side to take.
     pub(crate) mode: Option<Mode>,
@@ -115,6 +118,7 @@ chess - play chess in your terminal
 
 USAGE:
     chess [OPTIONS]
+    chess online find [OPTIONS]
     chess online create [OPTIONS]
     chess online join <CODE> [OPTIONS]
     chess online resume [OPTIONS]
@@ -135,6 +139,7 @@ GAME:
         --load <FILE>    open a saved Terminal Chess game
 
 ONLINE:
+        online find      play whoever else is looking for a game
         online create    create a private game and show its invite code
         online join CODE join a private game as Black
         online resume    reconnect to the last active online game
@@ -302,9 +307,10 @@ impl Options {
                         "create" => OnlineIntent::Create,
                         "join" => OnlineIntent::Join(value("online join")?.to_ascii_uppercase()),
                         "resume" => OnlineIntent::Resume,
+                        "find" => OnlineIntent::Find,
                         _ => {
                             return Err(format!(
-                                "online wants create, join <CODE>, or resume, not '{action}'"
+                                "online wants find, create, join <CODE>, or resume, not '{action}'"
                             ))
                         }
                     });
