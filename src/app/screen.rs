@@ -653,7 +653,7 @@ impl Screen {
         // Kitty placements that float above the text would otherwise pile up
         // under each redrawn picture.
         if kitty_drawn && draw_image {
-            out.push_str("\x1b_Ga=d,d=A\x1b\\");
+            out.push_str(ui::KITTY_DELETE_ALL);
         }
         if full_redraw {
             out.push_str("\x1b[2J");

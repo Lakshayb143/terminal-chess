@@ -179,6 +179,18 @@ struct PreviewKey {
     palette: ui::Palette,
 }
 
+/// Where the preview board landed on the last frame, for laying a picture of
+/// it over the text squares.
+#[derive(Clone, Copy, PartialEq)]
+struct Placed {
+    key: PreviewKey,
+    /// The top-left square, in zero-based cells.
+    column: usize,
+    row: usize,
+    /// The first column right of the board, where the rest of a row starts.
+    beside: usize,
+}
+
 pub(crate) struct Home {
     entries: Vec<Entry>,
     focus: usize,
@@ -188,6 +200,10 @@ pub(crate) struct Home {
     start: Game,
     hits: Vec<Hit>,
     board_cache: Option<(PreviewKey, Vec<String>)>,
+    placed: Option<Placed>,
+    /// For each row of the last frame, the byte where the text right of the
+    /// board begins, or 0 when the row does not cross the board.
+    splits: Vec<usize>,
 }
 
 impl Home {
@@ -217,6 +233,8 @@ impl Home {
             start: Game::new(Position::startpos()),
             hits: Vec::new(),
             board_cache: None,
+            placed: None,
+            splits: Vec::new(),
         }
     }
 
@@ -375,7 +393,13 @@ impl Home {
         // Room between the bar at the top and the key hints at the bottom.
         let space = rows.saturating_sub(4);
         let tall = space >= 24;
-        let metrics = [3, 2, 1].into_iter().find_map(|cell_h| {
+        // A figurine is one character, lost in the middle of a big square.
+        let sizes: &[usize] = if pieces == ui::Pieces::Glyph || theme.ascii {
+            &[2, 1]
+        } else {
+            &[3, 2, 1]
+        };
+        let metrics = sizes.iter().find_map(|&cell_h| {
             let metrics = Metrics {
                 cell_w: if cell_h == 1 { 3 } else { 2 * cell_h },
                 cell_h,
@@ -413,11 +437,14 @@ impl Home {
             &format!("v{}", env!("CARGO_PKG_VERSION")),
             cols,
         );
+        self.splits = vec![0; rows];
         let body = rows.saturating_sub(1).saturating_sub(top).min(block_h);
         for (row, slot) in frame.iter_mut().enumerate().skip(top).take(body) {
             let mut line = " ".repeat(left);
+            let mut split = None;
             if let Some(board_line) = row.checked_sub(board_top).and_then(|i| board.get(i)) {
                 line.push_str(board_line);
+                split = Some(line.len());
                 line.push_str(&" ".repeat(GAP));
             } else {
                 line.push_str(&" ".repeat(board_w));
@@ -426,10 +453,22 @@ impl Home {
                 line.push_str(menu_line);
             }
             *slot = ui::clip(line.trim_end(), cols);
+            // Only while clipping left the board part of the row as it was.
+            self.splits[row] = split
+                .filter(|&at| slot.get(..at) == line.get(..at))
+                .unwrap_or(0);
         }
         if rows > 2 {
             frame[rows - 1] = self.footer(theme, info, cols);
         }
+        self.placed = metrics
+            .zip(self.board_cache.as_ref())
+            .map(|(metrics, (key, _))| Placed {
+                key: *key,
+                column: left + ui::GUTTER,
+                row: board_top + 1,
+                beside: left + metrics.board_width(),
+            });
 
         self.hits = hits
             .into_iter()
@@ -666,6 +705,26 @@ impl Home {
     /// The board the focused choice would open on: the saved position for
     /// Continue, the start position from the player's side otherwise.
     fn preview(&mut self, theme: &Theme, info: &HomeInfo, metrics: Metrics) -> Vec<String> {
+        let (game, saved, flipped) = self.previewed(info);
+        let key = PreviewKey {
+            saved,
+            flipped,
+            metrics,
+            palette: theme.palette,
+        };
+        if let Some((cached, lines)) = &self.board_cache {
+            if *cached == key {
+                return lines.clone();
+            }
+        }
+        let lines = theme.board_lines(&preview_view(game, flipped), metrics);
+        self.board_cache = Some((key, lines.clone()));
+        lines
+    }
+
+    /// The game the preview shows, whether it is the autosave, and whether
+    /// Black is at the bottom.
+    fn previewed<'a>(&'a self, info: &'a HomeInfo) -> (&'a Game, bool, bool) {
         let saved = match (self.focused(), &info.saved) {
             (Entry::Continue, Some(Ok((game, mode)))) => Some((game, *mode)),
             _ => None,
@@ -679,33 +738,8 @@ impl Home {
             ),
             _ => false,
         };
-        let key = PreviewKey {
-            saved: saved.is_some(),
-            flipped,
-            metrics,
-            palette: theme.palette,
-        };
-        if let Some((cached, lines)) = &self.board_cache {
-            if *cached == key {
-                return lines.clone();
-            }
-        }
         let game = saved.map_or(&self.start, |(game, _)| game);
-        let pos = &game.pos;
-        let view = BoardView {
-            pos,
-            flipped,
-            last: game.last_move(),
-            check: in_check(pos, pos.side).then(|| pos.king[pos.side.index()]),
-            selected: None,
-            targets: &[],
-            captures: &[],
-            invalid: None,
-            promotions: &[],
-        };
-        let lines = theme.board_lines(&view, metrics);
-        self.board_cache = Some((key, lines.clone()));
-        lines
+        (game, saved.is_some(), flipped)
     }
 
     fn footer(&self, theme: &Theme, info: &HomeInfo, cols: usize) -> String {
@@ -730,6 +764,122 @@ impl Home {
         } else {
             theme.dim(&ui::clip(&hints, cols))
         }
+    }
+}
+
+/// The preview as the board is drawn: no selection, no hints.
+fn preview_view(game: &Game, flipped: bool) -> BoardView<'_> {
+    let pos = &game.pos;
+    BoardView {
+        pos,
+        flipped,
+        last: game.last_move(),
+        check: in_check(pos, pos.side).then(|| pos.king[pos.side.index()]),
+        selected: None,
+        targets: &[],
+        captures: &[],
+        invalid: None,
+        promotions: &[],
+    }
+}
+
+/// Drawn pieces only where the terminal can show them as a picture. The
+/// block-art fallback is too coarse at preview size to tell a queen from a
+/// king, so `auto` shows figurines instead; asking for art by name still
+/// gets art.
+fn preview_pieces(pieces: ui::Pieces, protocol: Option<ui::ImageProtocol>) -> ui::Pieces {
+    match (pieces, protocol) {
+        (ui::Pieces::Auto, None) => ui::Pieces::Glyph,
+        _ => pieces,
+    }
+}
+
+/// A picture of the preview board laid over its text squares, the same one
+/// the game draws, for terminals that can show one. The text board stays
+/// underneath as the fallback.
+struct Picture {
+    protocol: Option<ui::ImageProtocol>,
+    /// The board the picture on screen shows, if one is there.
+    drawn: Option<Placed>,
+    /// The encoded picture, for sending again after a clear without
+    /// encoding it again.
+    bytes: Option<(Placed, Vec<u8>)>,
+}
+
+impl Picture {
+    /// What the picture should show on this frame: only drawn pieces, and
+    /// only when the player left the piece style on auto, as in the game.
+    fn wanted(&self, home: &Home, pieces: ui::Pieces) -> Option<Placed> {
+        let placed = home.placed?;
+        (self.protocol.is_some() && pieces == ui::Pieces::Auto && placed.key.metrics.art)
+            .then_some(placed)
+    }
+
+    fn kitty(&self) -> bool {
+        self.protocol == Some(ui::ImageProtocol::Kitty)
+    }
+
+    /// Escapes to send before a frame's rows. A Kitty picture floats above
+    /// the text, so one that is about to change or go has to be taken down.
+    fn before(&mut self, wanted: Option<Placed>, cleared: bool) -> &'static str {
+        if self.kitty() && self.drawn.is_some() && (cleared || wanted != self.drawn) {
+            self.drawn = None;
+            ui::KITTY_DELETE_ALL
+        } else {
+            ""
+        }
+    }
+
+    /// Draw the picture after the frame's rows, if it is not already there.
+    /// A clear takes a picture in the text cells with it.
+    fn draw(
+        &mut self,
+        wanted: Option<Placed>,
+        cleared: bool,
+        theme: &Theme,
+        home: &Home,
+        info: &HomeInfo,
+    ) {
+        let (Some(protocol), Some(placed)) = (self.protocol, wanted) else {
+            self.drawn = None;
+            return;
+        };
+        if self.drawn == Some(placed) && !cleared {
+            return;
+        }
+        let (game, _, flipped) = home.previewed(info);
+        let view = preview_view(game, flipped);
+        let metrics = placed.key.metrics;
+        if protocol == ui::ImageProtocol::Kitty {
+            let image = theme.board_image(&view);
+            ui::draw_kitty_image(&image, metrics, placed.column, placed.row);
+        } else {
+            if !self.bytes.as_ref().is_some_and(|(key, _)| *key == placed) {
+                let bytes = ui::inline_image_bytes(
+                    protocol,
+                    theme,
+                    &view,
+                    metrics,
+                    placed.column,
+                    placed.row,
+                );
+                self.bytes = Some((placed, bytes));
+            }
+            if let Some((_, bytes)) = &self.bytes {
+                let _ = io::stdout().write_all(bytes);
+            }
+        }
+        self.drawn = Some(placed);
+    }
+
+    /// Take the picture down before something else uses the window. A clear
+    /// is enough for the other protocols.
+    fn remove(&mut self) {
+        if self.kitty() && self.drawn.is_some() {
+            print!("{}", ui::KITTY_DELETE_ALL);
+            let _ = io::stdout().flush();
+        }
+        self.drawn = None;
     }
 }
 
@@ -761,17 +911,34 @@ pub(crate) fn run(
     let mut input = TerminalInput::enter(true)?;
     let mut home = Home::new(info);
     let mut shown: Vec<String> = Vec::new();
+    let mut picture = Picture {
+        protocol: screen.image_protocol,
+        drawn: None,
+        bytes: None,
+    };
+    let pieces = preview_pieces(screen.pieces, screen.image_protocol);
     loop {
         let (cols, rows) = ui::terminal_size().unwrap_or((80, 24));
         let frame = home.render(
             &screen.theme,
             info,
             account,
-            screen.pieces,
+            pieces,
             cols.max(30),
             rows.max(12),
         );
-        paint(&frame, &mut shown);
+        let wanted = picture.wanted(&home, pieces);
+        let cleared = frame.len() != shown.len();
+        // One synchronized update: the rows, then the picture over them.
+        let mut out = String::from("\x1b[?2026h\x1b[?25l");
+        out.push_str(picture.before(wanted, cleared));
+        let beside = home.placed.map_or(0, |placed| placed.beside);
+        paint(&frame, &home.splits, beside, &mut shown, &mut out);
+        print!("{out}");
+        let _ = io::stdout().flush();
+        picture.draw(wanted, cleared, &screen.theme, &home, info);
+        print!("\x1b[?2026l");
+        let _ = io::stdout().flush();
 
         let action = input.read_for(Duration::from_secs(1))?;
         let was_menu = !home.joining();
@@ -779,6 +946,9 @@ pub(crate) fn run(
         // Letters are shortcuts on the menu; only the code field keeps them.
         if was_menu || !home.joining() {
             input.clear_buffer();
+        }
+        if decided.is_some() {
+            picture.remove();
         }
         match decided {
             None => {}
@@ -807,21 +977,38 @@ pub(crate) fn run(
     }
 }
 
-/// Rewrite only the rows that changed, as one synchronized update.
-fn paint(frame: &[String], shown: &mut Vec<String>) {
+/// Add the escapes that rewrite only the rows that changed. Where a row's
+/// board part is as it was, only the text beside it is rewritten, from
+/// column `beside`, so moving through the menu leaves a picture of the board
+/// alone.
+fn paint(
+    frame: &[String],
+    splits: &[usize],
+    beside: usize,
+    shown: &mut Vec<String>,
+    out: &mut String,
+) {
     let resized = frame.len() != shown.len();
-    let mut out = String::from("\x1b[?2026h\x1b[?25l");
     if resized {
         out.push_str("\x1b[2J");
     }
     for (row, line) in frame.iter().enumerate() {
-        if resized || shown.get(row) != Some(line) {
+        let before = shown.get(row);
+        if !resized && before == Some(line) {
+            continue;
+        }
+        let at = splits.get(row).copied().unwrap_or(0);
+        if !resized && at > 0 && before.and_then(|b| b.get(..at)) == line.get(..at) {
+            out.push_str(&format!(
+                "\x1b[{};{}H\x1b[0m{}\x1b[K",
+                row + 1,
+                beside + 1,
+                &line[at..]
+            ));
+        } else {
             out.push_str(&format!("\x1b[{};1H{}\x1b[K", row + 1, line));
         }
     }
-    out.push_str("\x1b[?2026l");
-    print!("{out}");
-    let _ = io::stdout().flush();
     *shown = frame.to_vec();
 }
 
@@ -863,7 +1050,12 @@ mod tests {
         )
     }
 
-    fn key(home: &mut Home, info: &HomeInfo, account: &AccountContext, typed: &str) -> Option<Pick> {
+    fn key(
+        home: &mut Home,
+        info: &HomeInfo,
+        account: &AccountContext,
+        typed: &str,
+    ) -> Option<Pick> {
         home.handle(Action::Prompt, info, account, typed)
     }
 
@@ -985,5 +1177,86 @@ mod tests {
         let text = frame.join("\n");
         assert!(text.contains('\u{265a}') && text.contains('\u{2654}'));
         assert!(text.contains("PLAY") && text.contains("ONLINE"));
+    }
+
+    #[test]
+    fn moving_through_the_menu_leaves_the_board_alone() {
+        let info = info(false, false);
+        let account = guest();
+        let mut home = Home::new(&info);
+        let mut shown = Vec::new();
+        let first = home.render(&theme(), &info, &account, ui::Pieces::Auto, 120, 40);
+        paint(&first, &home.splits, 0, &mut shown, &mut String::new());
+        let placed = home.placed.expect("a wide window places the board");
+        assert!(placed.key.metrics.art);
+
+        // White to Two players: the preview stays the same board.
+        home.handle(Action::Focus { reverse: false }, &info, &account, "");
+        home.handle(Action::Focus { reverse: false }, &info, &account, "");
+        let second = home.render(&theme(), &info, &account, ui::Pieces::Auto, 120, 40);
+        assert!(home.placed == Some(placed));
+        let mut out = String::new();
+        paint(&second, &home.splits, placed.beside, &mut shown, &mut out);
+        let squares = placed.row..placed.row + 8 * placed.key.metrics.cell_h;
+        let beside = squares
+            .clone()
+            .filter(|row| out.contains(&format!("\x1b[{};{}H", row + 1, placed.beside + 1)))
+            .count();
+        assert!(beside > 0, "the focus moved on rows beside the board");
+        for row in squares {
+            assert!(!out.contains(&format!("\x1b[{};1H", row + 1)), "row {row}");
+        }
+        // Painting beside the board ends up with the same frame on screen.
+        assert_eq!(shown, second);
+
+        // Play Black turns the board round, so the picture has to follow.
+        home.handle(Action::Focus { reverse: true }, &info, &account, "");
+        home.render(&theme(), &info, &account, ui::Pieces::Auto, 120, 40);
+        assert!(home
+            .placed
+            .is_some_and(|now| now.key.flipped && now != placed));
+    }
+
+    #[test]
+    fn without_pictures_the_preview_uses_figurines_on_medium_squares() {
+        let kitty = Some(ui::ImageProtocol::Kitty);
+        assert_eq!(preview_pieces(ui::Pieces::Auto, None), ui::Pieces::Glyph);
+        assert_eq!(preview_pieces(ui::Pieces::Auto, kitty), ui::Pieces::Auto);
+        assert_eq!(preview_pieces(ui::Pieces::Art, None), ui::Pieces::Art);
+
+        let info = info(false, false);
+        let account = guest();
+        let mut home = Home::new(&info);
+        let pieces = preview_pieces(ui::Pieces::Auto, None);
+        home.render(&theme(), &info, &account, pieces, 200, 60);
+        let metrics = home
+            .placed
+            .expect("a big window places the board")
+            .key
+            .metrics;
+        assert!(!metrics.art);
+        assert_eq!((metrics.cell_w, metrics.cell_h), (4, 2));
+    }
+
+    #[test]
+    fn a_kitty_picture_is_taken_down_before_it_changes() {
+        let info = info(false, false);
+        let account = guest();
+        let mut home = Home::new(&info);
+        home.render(&theme(), &info, &account, ui::Pieces::Auto, 120, 40);
+        let mut picture = Picture {
+            protocol: Some(ui::ImageProtocol::Kitty),
+            drawn: None,
+            bytes: None,
+        };
+        let wanted = picture.wanted(&home, ui::Pieces::Auto);
+        assert!(wanted.is_some());
+        assert!(picture.wanted(&home, ui::Pieces::Glyph).is_none());
+        picture.drawn = wanted;
+        assert_eq!(picture.before(wanted, false), "");
+        assert_eq!(picture.before(wanted, true), ui::KITTY_DELETE_ALL);
+        picture.drawn = wanted;
+        assert_eq!(picture.before(None, false), ui::KITTY_DELETE_ALL);
+        assert!(picture.drawn.is_none());
     }
 }

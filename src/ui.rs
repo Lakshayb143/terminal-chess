@@ -683,6 +683,10 @@ pub fn inline_image_bytes(
     out
 }
 
+/// Takes every Kitty picture off the screen. They float above the text, so
+/// rewriting or clearing the rows beneath one leaves it where it was.
+pub const KITTY_DELETE_ALL: &str = "\x1b_Ga=d,d=A\x1b\\";
+
 /// Place the board with the Kitty protocol. viuer's remote path sends raw
 /// RGBA bytes; cap that copy so an SSH redraw remains responsive.
 pub fn draw_kitty_image(image: &image::DynamicImage, metrics: Metrics, column: usize, row: usize) {
