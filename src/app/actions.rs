@@ -503,6 +503,7 @@ pub(crate) fn hint(game: &Game, engine: &mut Search, limits: &Limits, screen: &m
                 .unwrap_or(Duration::from_secs(1))
                 .min(Duration::from_secs(1)),
         ),
+        randomness: 0,
     };
     engine.set_history(game.prior_positions());
     let indent = screen.indent.clone();

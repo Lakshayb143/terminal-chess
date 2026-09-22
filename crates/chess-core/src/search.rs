@@ -1,7 +1,7 @@
 //! Negamax search: alpha-beta with iterative deepening, a transposition table,
 //! a quiescence pass, and the move ordering that makes the pruning pay off.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::board::*;
 use crate::eval::{evaluate, piece_value};
@@ -28,11 +28,17 @@ const HISTORY_MAX: i32 = 200_000;
 /// How far a capture may fall short of alpha before quiescence skips it.
 const DELTA_MARGIN: i32 = 200;
 
-/// What stops the search: whichever of the two runs out first.
-#[derive(Clone, Copy, Debug)]
+/// What stops the search, whichever of depth and time runs out first, and
+/// how carefully the move is then chosen.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Limits {
     pub depth: u32,
     pub movetime: Option<Duration>,
+    /// Plays below full strength: each root move's score gets a random bonus
+    /// of up to this many centipawns before the best is chosen, so a move up
+    /// to this much worse than the best is sometimes played, and nothing
+    /// worse ever is. Zero always plays the best move found.
+    pub randomness: i32,
 }
 
 impl Default for Limits {
@@ -40,6 +46,7 @@ impl Default for Limits {
         Limits {
             depth: MAX_DEPTH,
             movetime: Some(Duration::from_secs(3)),
+            randomness: 0,
         }
     }
 }
@@ -183,6 +190,8 @@ pub struct Search {
     /// back on, so the clock must not cut the search short.
     can_stop: bool,
     age: u8,
+    /// xorshift state for [`Limits::randomness`]; never zero.
+    random: u64,
 }
 
 impl Default for Search {
@@ -204,7 +213,16 @@ impl Search {
             stopped: false,
             can_stop: false,
             age: 0,
+            random: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0x9e37_79b9_7f4a_7c15, |time| time.as_nanos() as u64)
+                | 1,
         }
+    }
+
+    /// Make [`Limits::randomness`] repeatable, for tests and matches.
+    pub fn seed(&mut self, seed: u64) {
+        self.random = seed | 1;
     }
 
     /// Seed the repetition list with the positions the game has already
@@ -291,9 +309,65 @@ impl Search {
             }
         }
 
+        if limits.randomness > 0 && legal.len() > 1 {
+            self.choose_imperfectly(
+                &mut work,
+                &legal,
+                result.depth.max(1),
+                limits.randomness,
+                &mut result,
+            );
+        }
         result.nodes = self.nodes;
         result.elapsed = start.elapsed();
         result
+    }
+
+    /// Score every root move exactly at `depth`, add up to `randomness` to
+    /// each, and play the highest. Iterative deepening only proves the best
+    /// move; the others need true scores for the bonus to mean anything.
+    fn choose_imperfectly(
+        &mut self,
+        pos: &mut Position,
+        legal: &[Move],
+        depth: u32,
+        randomness: i32,
+        result: &mut SearchResult,
+    ) {
+        // The levels that ask for this search a few plies at most, so it
+        // finishes quickly; a deadline would leave some moves unscored.
+        self.deadline = None;
+        self.stopped = false;
+        let mut chosen: Option<(i32, i32, Vec<Move>)> = None;
+        for &mv in legal {
+            let undo = pos.make_move(mv);
+            self.path.push(undo.hash);
+            let score = -self.negamax(pos, depth as i32 - 1, 1, -INFINITY, INFINITY);
+            self.path.pop();
+            pos.unmake_move(undo);
+            let bonus = (self.next_random() % (randomness as u64 + 1)) as i32;
+            if chosen
+                .as_ref()
+                .is_none_or(|(best, _, _)| score + bonus > *best)
+            {
+                let mut line = vec![mv];
+                line.extend_from_slice(&self.pv[1]);
+                chosen = Some((score + bonus, score, line));
+            }
+        }
+        if let Some((_, score, line)) = chosen {
+            result.best = line.first().copied();
+            result.score = score;
+            result.pv = line;
+        }
+    }
+
+    fn next_random(&mut self) -> u64 {
+        // xorshift64*: plenty for choosing between chess moves.
+        self.random ^= self.random >> 12;
+        self.random ^= self.random << 25;
+        self.random ^= self.random >> 27;
+        self.random.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
     // -- the recursion ------------------------------------------------------
