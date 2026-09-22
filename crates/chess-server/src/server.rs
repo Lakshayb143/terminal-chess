@@ -268,6 +268,10 @@ fn answers_account_command(request: &ClientEnvelope) -> bool {
                 | ClientCommand::LogOut
                 | ClientCommand::ListGames { .. }
                 | ClientCommand::LinkSshKey { .. }
+                | ClientCommand::ChangePassword { .. }
+                | ClientCommand::ListSshKeys
+                | ClientCommand::UnlinkSshKey { .. }
+                | ClientCommand::DeleteAccount { .. }
         )
 }
 
@@ -352,6 +356,64 @@ async fn handle_account(
                 .map_err(|error| account_error(connection, error)),
             None => Err(not_signed_in()),
         },
+        ClientCommand::ChangePassword {
+            current_password,
+            new_password,
+        } => match signed_in().await {
+            Some(_) if !account.allow_password_attempt() => Err(too_many_attempts()),
+            Some(identity) => accounts
+                .change_password(
+                    identity.user,
+                    &identity.username,
+                    &current_password,
+                    &new_password,
+                    account.session_token.as_deref(),
+                )
+                .await
+                .map(|()| {
+                    info!(connection, username = %identity.username, "changed password");
+                    ServerEvent::PasswordChanged
+                })
+                .map_err(|error| account_error(connection, error)),
+            None => Err(not_signed_in()),
+        },
+        ClientCommand::ListSshKeys => match signed_in().await {
+            Some(identity) => accounts
+                .ssh_keys(identity.user)
+                .await
+                .map(|keys| ServerEvent::SshKeys { keys })
+                .map_err(|error| account_error(connection, error)),
+            None => Err(not_signed_in()),
+        },
+        ClientCommand::UnlinkSshKey { fingerprint } => match signed_in().await {
+            Some(identity) => match accounts.unlink_ssh_key(identity.user, &fingerprint).await {
+                Ok(()) => {
+                    info!(connection, username = %identity.username, "unlinked an SSH key");
+                    accounts
+                        .ssh_keys(identity.user)
+                        .await
+                        .map(|keys| ServerEvent::SshKeys { keys })
+                        .map_err(|error| account_error(connection, error))
+                }
+                Err(error) => Err(account_error(connection, error)),
+            },
+            None => Err(not_signed_in()),
+        },
+        ClientCommand::DeleteAccount { password } => match signed_in().await {
+            Some(_) if !account.allow_password_attempt() => Err(too_many_attempts()),
+            Some(identity) => match accounts.delete_account(identity.user, &password).await {
+                Ok(()) => {
+                    info!(connection, username = %identity.username, "deleted an account");
+                    // Every connection still signed in to it, and every game
+                    // it is playing, forgets the account.
+                    state.hub.lock().await.forget_user(identity.user);
+                    account.session_token = None;
+                    Ok(ServerEvent::AccountDeleted)
+                }
+                Err(error) => Err(account_error(connection, error)),
+            },
+            None => Err(not_signed_in()),
+        },
         _ => unreachable!("only account commands are routed here"),
     };
     let mut hub = state.hub.lock().await;
@@ -410,7 +472,7 @@ fn too_many_attempts() -> (ErrorCode, String) {
 }
 
 fn not_signed_in() -> (ErrorCode, String) {
-    (ErrorCode::NotSignedIn, "sign in to see this".to_string())
+    (ErrorCode::NotSignedIn, "sign in first".to_string())
 }
 
 /// Disk writes run on their own schedule so a slow disk never delays clocks.
@@ -513,5 +575,11 @@ fn command_name(command: &ClientCommand) -> &'static str {
         ClientCommand::LinkSshKey { .. } => "link_ssh_key",
         ClientCommand::WatchLobby => "watch_lobby",
         ClientCommand::FindGame { .. } => "find_game",
+        ClientCommand::OfferRematch { .. } => "offer_rematch",
+        ClientCommand::DeclineRematch { .. } => "decline_rematch",
+        ClientCommand::ChangePassword { .. } => "change_password",
+        ClientCommand::ListSshKeys => "list_ssh_keys",
+        ClientCommand::UnlinkSshKey { .. } => "unlink_ssh_key",
+        ClientCommand::DeleteAccount { .. } => "delete_account",
     }
 }

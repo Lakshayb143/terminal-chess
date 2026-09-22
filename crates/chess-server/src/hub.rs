@@ -93,6 +93,9 @@ struct Room {
     started_at_ms: u64,
     /// When the server first saw the game finished; drives eviction.
     finished_at: Option<Instant>,
+    /// Who has offered to play again. Offers are not persisted: after a
+    /// restart both players have to come back before either can accept.
+    rematch_offer: Option<Color>,
 }
 
 impl Room {
@@ -254,6 +257,7 @@ impl Hub {
                 black: saved.black.map(|player| player.restore(disconnected_at)),
                 started_at_ms: saved.started_at_ms,
                 finished_at: None,
+                rematch_offer: None,
             };
             hub.invites.insert(saved.invite_code, saved.game_id.clone());
             hub.rooms.insert(saved.game_id, room);
@@ -320,6 +324,26 @@ impl Hub {
 
     pub fn sign_out(&mut self, connection: ConnectionId) {
         self.identities.remove(&connection);
+    }
+
+    /// A deleted account: sign out every connection still signed in to it,
+    /// and play its seats and seeks on as a guest, so nothing is recorded
+    /// against an id the database may give to someone new.
+    pub fn forget_user(&mut self, user: UserId) {
+        self.identities.retain(|_, identity| identity.user != user);
+        for room in self.rooms.values_mut() {
+            for side in [Color::White, Color::Black] {
+                if let Some(player) = room.player_mut(side).filter(|p| p.user == Some(user)) {
+                    player.user = None;
+                    self.dirty = true;
+                }
+            }
+        }
+        for seek in &mut self.seeks {
+            if seek.user == Some(user) {
+                seek.user = None;
+            }
+        }
     }
 
     pub fn identity(&self, connection: ConnectionId) -> Option<&Identity> {
@@ -403,12 +427,22 @@ impl Hub {
                 player_name,
                 time_control,
             } => self.find_game(connection, request_id, player_name, time_control),
+            ClientCommand::OfferRematch { game_id } => {
+                self.offer_rematch(connection, request_id, &game_id)
+            }
+            ClientCommand::DeclineRematch { game_id } => {
+                self.decline_rematch(connection, request_id, &game_id)
+            }
             ClientCommand::Register { .. }
             | ClientCommand::LogIn { .. }
             | ClientCommand::Authenticate { .. }
             | ClientCommand::LogOut
             | ClientCommand::ListGames { .. }
-            | ClientCommand::LinkSshKey { .. } => self.direct_error(
+            | ClientCommand::LinkSshKey { .. }
+            | ClientCommand::ChangePassword { .. }
+            | ClientCommand::ListSshKeys
+            | ClientCommand::UnlinkSshKey { .. }
+            | ClientCommand::DeleteAccount { .. } => self.direct_error(
                 connection,
                 Some(request_id),
                 ErrorCode::AccountsUnavailable,
@@ -473,7 +507,7 @@ impl Hub {
         };
         let now = Instant::now();
         let deadline = unix_time_ms().saturating_add(RECONNECT_GRACE.as_millis() as u64);
-        let (targets, game_id) = {
+        let (targets, game_id, withdrawn) = {
             let Some(room) = self.rooms.get_mut(&membership.game_id) else {
                 return Vec::new();
             };
@@ -483,22 +517,33 @@ impl Hub {
                     player.disconnected_at = Some(now);
                 }
             }
-            (room.targets(), room.game_id.clone())
+            // Nobody can play again with someone who has gone.
+            let withdrawn = room.rematch_offer.take().is_some().then(|| {
+                room.game.changed();
+                snapshot(room)
+            });
+            (room.targets(), room.game_id.clone(), withdrawn)
         };
 
-        targets
-            .into_iter()
-            .map(|target| {
-                self.delivery(
+        let mut deliveries = Vec::new();
+        for target in targets {
+            deliveries.push(self.delivery(
+                target,
+                None,
+                ServerEvent::OpponentDisconnected {
+                    game_id: game_id.clone(),
+                    reconnect_deadline_ms: deadline,
+                },
+            ));
+            if let Some(game) = &withdrawn {
+                deliveries.push(self.delivery(
                     target,
                     None,
-                    ServerEvent::OpponentDisconnected {
-                        game_id: game_id.clone(),
-                        reconnect_deadline_ms: deadline,
-                    },
-                )
-            })
-            .collect()
+                    ServerEvent::GameUpdated { game: game.clone() },
+                ));
+            }
+        }
+        deliveries
     }
 
     /// Advance clocks, enforce the reconnect grace period, and discard rooms
@@ -709,6 +754,7 @@ impl Hub {
                 black,
                 started_at_ms,
                 finished_at: None,
+                rematch_offer: None,
             },
         );
         game_id
@@ -1126,6 +1172,170 @@ impl Hub {
         self.broadcast_update(targets, connection, request_id, game)
     }
 
+    /// Offer the opponent of a finished game another one, or accept their
+    /// offer, which seats both in a new game with the colours swapped.
+    fn offer_rematch(
+        &mut self,
+        connection: ConnectionId,
+        request_id: u64,
+        game_id: &str,
+    ) -> Vec<Delivery> {
+        let side = match self.member_side(connection, game_id) {
+            Ok(side) => side,
+            Err((code, message)) => {
+                return self.direct_error(connection, Some(request_id), code, message)
+            }
+        };
+        let accepted = {
+            let room = self
+                .rooms
+                .get_mut(game_id)
+                .expect("membership points to room");
+            let problem = if room.black.is_none() || outcome(&room.game).is_none() {
+                Some("a rematch can only follow a finished game")
+            } else if room
+                .player(side.flip())
+                .is_none_or(|opponent| opponent.connection.is_none())
+            {
+                Some("your opponent has left")
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                return self.direct_error(
+                    connection,
+                    Some(request_id),
+                    ErrorCode::InvalidRequest,
+                    problem,
+                );
+            }
+            match room.rematch_offer {
+                Some(offered) if offered == side.flip() => true,
+                Some(_) => false,
+                None => {
+                    room.rematch_offer = Some(side);
+                    room.game.changed();
+                    false
+                }
+            }
+        };
+        if accepted {
+            return self.start_rematch(connection, request_id, game_id);
+        }
+        let room = self.rooms.get_mut(game_id).expect("room checked above");
+        let (targets, game) = (room.targets(), snapshot(room));
+        self.broadcast_update(targets, connection, request_id, game)
+    }
+
+    fn decline_rematch(
+        &mut self,
+        connection: ConnectionId,
+        request_id: u64,
+        game_id: &str,
+    ) -> Vec<Delivery> {
+        let side = match self.member_side(connection, game_id) {
+            Ok(side) => side,
+            Err((code, message)) => {
+                return self.direct_error(connection, Some(request_id), code, message)
+            }
+        };
+        let (targets, game) = {
+            let room = self
+                .rooms
+                .get_mut(game_id)
+                .expect("membership points to room");
+            if room.rematch_offer != Some(side.flip()) {
+                return self.direct_error(
+                    connection,
+                    Some(request_id),
+                    ErrorCode::InvalidRequest,
+                    "there is no rematch offer to answer",
+                );
+            }
+            room.rematch_offer = None;
+            room.game.changed();
+            (room.targets(), snapshot(room))
+        };
+        self.broadcast_update(targets, connection, request_id, game)
+    }
+
+    /// Both players asked to play again: move them from the finished game to
+    /// a new one on the same clock, the colours swapped.
+    fn start_rematch(
+        &mut self,
+        connection: ConnectionId,
+        request_id: u64,
+        game_id: &str,
+    ) -> Vec<Delivery> {
+        let now = Instant::now();
+        // Both seats must still have someone in them. The caller checked, but
+        // a release build aborts on a panic, so this is checked, not assumed.
+        let seated = self.rooms.get(game_id).and_then(|room| {
+            let white = room.player(Color::White)?;
+            let black = room.player(Color::Black)?;
+            Some((
+                (white.name.clone(), white.user, white.connection?),
+                (black.name.clone(), black.user, black.connection?),
+                time_control(&room.game),
+            ))
+        });
+        let Some((old_white, old_black, time_control)) = seated else {
+            return self.direct_error(
+                connection,
+                Some(request_id),
+                ErrorCode::InvalidRequest,
+                "your opponent has left",
+            );
+        };
+        if let Some(room) = self.rooms.get_mut(game_id) {
+            room.rematch_offer = None;
+            for side in [Color::White, Color::Black] {
+                if let Some(player) = room.player_mut(side) {
+                    player.connection = None;
+                    player.disconnected_at = Some(now);
+                }
+            }
+        }
+        let slot = |(name, user, connection): (String, Option<UserId>, ConnectionId)| {
+            PlayerSlot::taken_by(name, user, connection)
+        };
+        let (white, black) = (slot(old_black), slot(old_white));
+        for player in [&white, &black] {
+            if let Some(connection) = player.connection {
+                self.memberships.remove(&connection);
+            }
+        }
+        let seats = [
+            (
+                Color::White,
+                white.reconnect_token.clone(),
+                white.connection,
+            ),
+            (
+                Color::Black,
+                black.reconnect_token.clone(),
+                black.connection,
+            ),
+        ];
+        let new_game = self.open_room(&time_control, white, Some(black));
+        let game = snapshot(self.rooms.get_mut(&new_game).expect("new room exists"));
+
+        let mut deliveries = Vec::new();
+        for (side, reconnect_token, target) in seats {
+            let Some(target) = target else { continue };
+            deliveries.push(self.delivery(
+                target,
+                (target == connection).then_some(request_id),
+                ServerEvent::GameJoined {
+                    reconnect_token,
+                    game: game.clone(),
+                    side: Some(side.into()),
+                },
+            ));
+        }
+        deliveries
+    }
+
     /// The name and account a new seat for `connection` is played under: the
     /// username when signed in, otherwise the guest's chosen name.
     fn seat_name(
@@ -1232,6 +1442,10 @@ fn is_account_command(command: &ClientCommand) -> bool {
             | ClientCommand::LogOut
             | ClientCommand::ListGames { .. }
             | ClientCommand::LinkSshKey { .. }
+            | ClientCommand::ChangePassword { .. }
+            | ClientCommand::ListSshKeys
+            | ClientCommand::UnlinkSshKey { .. }
+            | ClientCommand::DeleteAccount { .. }
     )
 }
 
@@ -1310,6 +1524,7 @@ fn snapshot(room: &mut Room) -> GameSnapshot {
         },
         draw_offer: room.game.draw_offer.map(Side::from),
         status,
+        rematch_offer: room.rematch_offer.map(Side::from),
     }
 }
 
@@ -1784,6 +1999,148 @@ mod tests {
                 },
             ),
         );
+    }
+
+    fn rematch(hub: &mut Hub, connection: ConnectionId, game_id: &str) -> Vec<Delivery> {
+        hub.handle(
+            connection,
+            ClientEnvelope::new(
+                11,
+                ClientCommand::OfferRematch {
+                    game_id: game_id.to_string(),
+                },
+            ),
+        )
+    }
+
+    #[test]
+    fn a_rematch_swaps_colours_once_both_players_ask() {
+        let mut hub = Hub::new();
+        let white = hub.connect();
+        let black = hub.connect();
+        let (code, _, game_id) = create(&mut hub, white);
+        join(&mut hub, black, &code);
+
+        // Not before the game is over.
+        let early = rematch(&mut hub, white, &game_id);
+        assert!(matches!(early[0].message.event, ServerEvent::Error { .. }));
+
+        resign(&mut hub, white, &game_id);
+        let offered = rematch(&mut hub, white, &game_id);
+        assert_eq!(offered.len(), 2, "both players see the offer");
+        for delivery in &offered {
+            let ServerEvent::GameUpdated { game } = &delivery.message.event else {
+                panic!("expected the offer in an update");
+            };
+            assert_eq!(game.rematch_offer, Some(Side::White));
+        }
+
+        let accepted = rematch(&mut hub, black, &game_id);
+        assert_eq!(accepted.len(), 2);
+        let mut new_games = Vec::new();
+        for delivery in &accepted {
+            let ServerEvent::GameJoined { game, side, .. } = &delivery.message.event else {
+                panic!("expected both players to join the new game");
+            };
+            // The one who asked first had White, so plays Black now.
+            let expected = if delivery.target == white {
+                Side::Black
+            } else {
+                Side::White
+            };
+            assert_eq!(*side, Some(expected));
+            assert_eq!(game.status, GameStatus::Active);
+            assert_eq!(game.white.name, "Black");
+            assert_eq!(game.time_control.initial_ms, 300_000);
+            new_games.push(game.game_id.clone());
+        }
+        assert_eq!(new_games[0], new_games[1]);
+        assert_ne!(new_games[0], game_id);
+        // The one who accepted gets the answer to their request.
+        assert!(accepted
+            .iter()
+            .any(|d| d.target == black && d.message.request_id == Some(11)));
+
+        // Moves now belong to the new game, starting with the old Black.
+        let moved = hub.handle(
+            black,
+            ClientEnvelope::new(
+                12,
+                ClientCommand::PlayMove {
+                    game_id: new_games[0].clone(),
+                    expected_ply: 0,
+                    uci: "e2e4".to_string(),
+                },
+            ),
+        );
+        assert!(matches!(
+            moved[0].message.event,
+            ServerEvent::GameUpdated { .. }
+        ));
+    }
+
+    #[test]
+    fn a_rematch_offer_can_be_declined_and_goes_when_the_offerer_leaves() {
+        let mut hub = Hub::new();
+        let white = hub.connect();
+        let black = hub.connect();
+        let (code, _, game_id) = create(&mut hub, white);
+        join(&mut hub, black, &code);
+        resign(&mut hub, black, &game_id);
+
+        rematch(&mut hub, black, &game_id);
+        let declined = hub.handle(
+            white,
+            ClientEnvelope::new(
+                13,
+                ClientCommand::DeclineRematch {
+                    game_id: game_id.clone(),
+                },
+            ),
+        );
+        assert_eq!(declined.len(), 2);
+        for delivery in &declined {
+            let ServerEvent::GameUpdated { game } = &delivery.message.event else {
+                panic!("expected an update");
+            };
+            assert_eq!(game.rematch_offer, None);
+        }
+
+        rematch(&mut hub, black, &game_id);
+        let left = hub.disconnect(black);
+        let withdrawn = left.iter().any(|delivery| {
+            delivery.target == white
+                && matches!(&delivery.message.event,
+                    ServerEvent::GameUpdated { game } if game.rematch_offer.is_none())
+        });
+        assert!(withdrawn, "the offer goes with the player who made it");
+        let alone = rematch(&mut hub, white, &game_id);
+        assert!(matches!(alone[0].message.event, ServerEvent::Error { .. }));
+    }
+
+    #[test]
+    fn a_deleted_account_plays_on_as_a_guest() {
+        let mut hub = Hub::new();
+        let white = hub.connect();
+        let black = hub.connect();
+        hub.sign_in(
+            white,
+            Identity {
+                user: 7,
+                username: "anna".to_string(),
+            },
+        );
+        let (code, _, game_id) = create(&mut hub, white);
+        join(&mut hub, black, &code);
+
+        hub.forget_user(7);
+        assert!(hub.identity(white).is_none());
+        resign(&mut hub, black, &game_id);
+        hub.tick();
+        let finished = hub.take_finished_games();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].white.user, None);
+        assert_eq!(finished[0].white.name, "anna");
     }
 
     #[test]

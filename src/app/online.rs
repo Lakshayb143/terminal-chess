@@ -597,7 +597,10 @@ pub(crate) fn handle_transport_event(
             | ServerEvent::SignedIn { .. }
             | ServerEvent::SignedOut
             | ServerEvent::GameList { .. }
-            | ServerEvent::SshKeyLinked => {}
+            | ServerEvent::SshKeyLinked
+            | ServerEvent::PasswordChanged
+            | ServerEvent::SshKeys { .. }
+            | ServerEvent::AccountDeleted => {}
             ServerEvent::Lobby { lobby } => show_lobby(lobby, screen),
             ServerEvent::Error {
                 code: ErrorCode::InvalidSession,

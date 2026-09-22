@@ -175,6 +175,10 @@ impl Store {
         }
     }
 
+    /// The name a deleted account's games are kept under, in the histories of
+    /// the people it played.
+    pub const DELETED_PLAYER: &'static str = "deleted player";
+
     /// The user and their stored password hash, found case-insensitively.
     pub fn user_with_password(&self, username: &str) -> Result<Option<(User, String)>, String> {
         self.connection
@@ -185,6 +189,59 @@ impl Store {
             )
             .optional()
             .map_err(storage_error)
+    }
+
+    pub fn password_hash(&self, user: UserId) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT password_hash FROM users WHERE id = ?1",
+                [user],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)
+    }
+
+    /// Replace the password and sign out every session but `keep`.
+    pub fn set_password(
+        &mut self,
+        user: UserId,
+        password_hash: &str,
+        keep: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let transaction = self.connection.transaction().map_err(storage_error)?;
+        transaction
+            .execute(
+                "UPDATE users SET password_hash = ?2 WHERE id = ?1",
+                params![user, password_hash],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "DELETE FROM sessions WHERE user_id = ?1 AND token_hash IS NOT ?2",
+                params![user, keep],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)
+    }
+
+    /// Delete the account, its sessions and its SSH keys. Its finished games
+    /// stay in its opponents' histories under [`Store::DELETED_PLAYER`].
+    pub fn delete_user(&mut self, user: UserId) -> Result<(), String> {
+        let transaction = self.connection.transaction().map_err(storage_error)?;
+        for side in ["white", "black"] {
+            transaction
+                .execute(
+                    &format!("UPDATE games SET {side}_name = ?2 WHERE {side}_user = ?1"),
+                    params![user, Store::DELETED_PLAYER],
+                )
+                .map_err(storage_error)?;
+        }
+        // Sessions and keys go with the account; games keep a null player.
+        transaction
+            .execute("DELETE FROM users WHERE id = ?1", [user])
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)
     }
 
     pub fn create_session(
@@ -270,6 +327,34 @@ impl Store {
             .map_err(storage_error)
     }
 
+    /// The account's keys as `(fingerprint, added_at_ms)`, oldest first.
+    pub fn ssh_keys_for(&self, user: UserId) -> Result<Vec<(String, u64)>, String> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT fingerprint, added_at_ms FROM ssh_keys WHERE user_id = ?1
+                 ORDER BY added_at_ms, fingerprint",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([user], |row| {
+                Ok((row.get(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(storage_error)?;
+        rows.collect::<Result<_, _>>().map_err(storage_error)
+    }
+
+    /// Returns whether the key was linked to this account.
+    pub fn unlink_ssh_key(&mut self, user: UserId, fingerprint: &str) -> Result<bool, String> {
+        self.connection
+            .execute(
+                "DELETE FROM ssh_keys WHERE user_id = ?1 AND fingerprint = ?2",
+                params![user, fingerprint],
+            )
+            .map(|removed| removed > 0)
+            .map_err(storage_error)
+    }
+
     pub fn user_for_ssh_key(&self, fingerprint: &str) -> Result<Option<User>, String> {
         self.connection
             .query_row(
@@ -284,13 +369,17 @@ impl Store {
     }
 
     /// Store a finished game. Recording the same game twice keeps the first.
+    /// A player whose account was deleted during the game is kept as a guest.
     pub fn record_game(&mut self, game: &FinishedGame) -> Result<(), String> {
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO games (
                     id, white_user, black_user, white_name, black_name, initial_ms,
                     increment_ms, moves, result, reason, started_at_ms, ended_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (
+                    ?1, (SELECT id FROM users WHERE id = ?2), (SELECT id FROM users WHERE id = ?3),
+                    ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                 )",
                 params![
                     game.game_id,
                     game.white.user,
@@ -480,6 +569,74 @@ mod tests {
         assert_eq!(games[1].result, GameResult::BlackWins);
         assert_eq!(games[1].reason, FinishReason::Resignation);
         assert_eq!(store.games_for(anna.id, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_new_password_signs_out_every_other_session() {
+        let mut store = Store::open_in_memory().unwrap();
+        let anna = store.create_user("anna", "old", 0).unwrap().unwrap();
+        let bob = store.create_user("bob", "hash", 0).unwrap().unwrap();
+        store.create_session(anna.id, b"here", 0).unwrap();
+        store.create_session(anna.id, b"laptop", 0).unwrap();
+        store.create_session(bob.id, b"bob's", 0).unwrap();
+        store.set_password(anna.id, "new", Some(b"here")).unwrap();
+        assert_eq!(
+            store.password_hash(anna.id).unwrap().as_deref(),
+            Some("new")
+        );
+        assert!(store.use_session(b"here", 1, 1_000).unwrap().is_some());
+        assert!(store.use_session(b"laptop", 1, 1_000).unwrap().is_none());
+        assert!(store.use_session(b"bob's", 1, 1_000).unwrap().is_some());
+    }
+
+    #[test]
+    fn ssh_keys_are_listed_and_unlinked_per_account() {
+        let mut store = Store::open_in_memory().unwrap();
+        let anna = store.create_user("anna", "hash", 0).unwrap().unwrap();
+        let bob = store.create_user("bob", "hash", 0).unwrap().unwrap();
+        store.link_ssh_key(anna.id, "SHA256:laptop", 2).unwrap();
+        store.link_ssh_key(anna.id, "SHA256:desktop", 1).unwrap();
+        store.link_ssh_key(bob.id, "SHA256:bob", 3).unwrap();
+        assert_eq!(
+            store.ssh_keys_for(anna.id).unwrap(),
+            [
+                ("SHA256:desktop".to_string(), 1),
+                ("SHA256:laptop".to_string(), 2)
+            ]
+        );
+        // Nobody can unlink someone else's key.
+        assert!(!store.unlink_ssh_key(anna.id, "SHA256:bob").unwrap());
+        assert!(store.unlink_ssh_key(anna.id, "SHA256:laptop").unwrap());
+        assert_eq!(store.user_for_ssh_key("SHA256:laptop").unwrap(), None);
+        assert_eq!(store.ssh_keys_for(anna.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_deleted_account_leaves_its_games_nameless_in_others_histories() {
+        let mut store = Store::open_in_memory().unwrap();
+        let anna = store.create_user("anna", "hash", 0).unwrap().unwrap();
+        let bob = store.create_user("bob", "hash", 0).unwrap().unwrap();
+        store.create_session(anna.id, b"token", 0).unwrap();
+        store.link_ssh_key(anna.id, "SHA256:key", 0).unwrap();
+        let mut game = finished("one", Some(anna.id), Some(bob.id), 10_000);
+        game.white.name = "anna".to_string();
+        store.record_game(&game).unwrap();
+
+        store.delete_user(anna.id).unwrap();
+        assert!(store.user_with_password("anna").unwrap().is_none());
+        assert!(store.use_session(b"token", 1, 1_000).unwrap().is_none());
+        assert_eq!(store.user_for_ssh_key("SHA256:key").unwrap(), None);
+        let games = store.games_for(bob.id, 10).unwrap();
+        assert_eq!(games[0].white.name, Store::DELETED_PLAYER);
+        assert!(!games[0].white.registered);
+        // The name is free again.
+        assert!(store.create_user("anna", "hash", 1).unwrap().is_some());
+
+        // A game that ends after its player's account went is still kept.
+        store
+            .record_game(&finished("two", Some(anna.id), Some(bob.id), 20_000))
+            .unwrap();
+        assert_eq!(store.games_for(bob.id, 10).unwrap().len(), 2);
     }
 
     #[test]

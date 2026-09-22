@@ -7,9 +7,11 @@ use chess_core::game::Outcome;
 use serde::{Deserialize, Serialize};
 
 /// The version this build speaks. Version 3 added accounts and game history;
-/// version 4 added the lobby and pairing with a random opponent.
-pub const PROTOCOL_VERSION: u16 = 4;
-/// The oldest version a server still accepts. Versions 3 and 4 only added
+/// version 4 added the lobby and pairing with a random opponent; version 5
+/// added rematches and looking after an account: its password, its SSH keys,
+/// and deleting it.
+pub const PROTOCOL_VERSION: u16 = 5;
+/// The oldest version a server still accepts. Versions 3 to 5 only added
 /// commands and optional fields, so version 2 guests keep working unchanged.
 pub const MIN_PROTOCOL_VERSION: u16 = 2;
 
@@ -99,6 +101,32 @@ pub enum ClientCommand {
         player_name: String,
         time_control: TimeControl,
     },
+    /// Offer the opponent of a finished game another one, colours swapped,
+    /// or accept their offer. Once both have asked, each is answered with
+    /// `GameJoined` for the new game.
+    OfferRematch {
+        game_id: String,
+    },
+    DeclineRematch {
+        game_id: String,
+    },
+    /// Change the signed-in account's password. Every other session of the
+    /// account is signed out; this one stays signed in.
+    ChangePassword {
+        current_password: String,
+        new_password: String,
+    },
+    /// The SSH keys that sign in to the account, answered with `SshKeys`.
+    ListSshKeys,
+    /// Stop a key signing in to the account. Answered with the keys left.
+    UnlinkSshKey {
+        fingerprint: String,
+    },
+    /// Delete the signed-in account, its sessions and its SSH keys. Its
+    /// finished games stay in its opponents' histories without its name.
+    DeleteAccount {
+        password: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +202,20 @@ pub enum ServerEvent {
     Lobby {
         lobby: Lobby,
     },
+    PasswordChanged,
+    SshKeys {
+        keys: Vec<SshKey>,
+    },
+    /// The account is gone, and this connection is signed out.
+    AccountDeleted,
+}
+
+/// An SSH key that signs in to an account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshKey {
+    /// As OpenSSH prints it, for example `SHA256:2A5y9…`.
+    pub fingerprint: String,
+    pub added_at_ms: u64,
 }
 
 /// Who is around, for a player deciding whether to wait for a stranger.
@@ -234,6 +276,9 @@ pub struct GameSnapshot {
     pub clock: ClockSnapshot,
     pub draw_offer: Option<Side>,
     pub status: GameStatus,
+    /// Who has offered a rematch of this finished game. Sent from version 5.
+    #[serde(default)]
+    pub rematch_offer: Option<Side>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +501,38 @@ mod tests {
     }
 
     #[test]
+    fn version_4_snapshots_without_a_rematch_offer_still_parse() {
+        let mut json = serde_json::to_value(sample_snapshot()).unwrap();
+        json.as_object_mut().unwrap().remove("rematch_offer");
+        let snapshot: GameSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snapshot.rematch_offer, None);
+    }
+
+    #[test]
+    fn account_upkeep_commands_use_snake_case_tags() {
+        let json = serde_json::to_value(ClientCommand::ChangePassword {
+            current_password: "old secret".to_string(),
+            new_password: "new secret".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "change_password");
+        let json = serde_json::to_value(ClientCommand::UnlinkSshKey {
+            fingerprint: "SHA256:abc".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "unlink_ssh_key");
+        let json = serde_json::to_value(ServerEvent::SshKeys {
+            keys: vec![SshKey {
+                fingerprint: "SHA256:abc".to_string(),
+                added_at_ms: 7,
+            }],
+        })
+        .unwrap();
+        assert_eq!(json["type"], "ssh_keys");
+        assert_eq!(json["keys"][0]["added_at_ms"], 7);
+    }
+
+    #[test]
     fn lobby_events_carry_both_counts() {
         let json = serde_json::json!({
             "type": "lobby",
@@ -604,6 +681,7 @@ mod tests {
                 result: GameResult::WhiteWins,
                 reason: FinishReason::Checkmate,
             },
+            rematch_offer: Some(Side::Black),
         }
     }
 }

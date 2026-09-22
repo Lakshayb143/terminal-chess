@@ -505,6 +505,10 @@ impl Visitor {
         if let Some(ticket) = &link_ticket {
             command.env("CHESS_SSH_LINK_TICKET", ticket);
         }
+        // So the account page can say which linked key is this visitor's.
+        if let Some(fingerprint) = &self.fingerprint {
+            command.env("CHESS_SSH_KEY_FINGERPRINT", fingerprint);
+        }
 
         let pair = native_pty_system()
             .openpty(self.size)

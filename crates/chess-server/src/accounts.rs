@@ -13,7 +13,7 @@ use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chess_protocol::{Account, ErrorCode, GameRecord};
+use chess_protocol::{Account, ErrorCode, GameRecord, SshKey};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
@@ -52,8 +52,11 @@ pub enum AccountError {
     InvalidPassword(String),
     UsernameTaken,
     InvalidCredentials,
+    /// The password given to confirm a change was not the account's.
+    WrongPassword,
     InvalidSession,
     InvalidTicket,
+    UnknownKey,
     /// The database failed. The detail is logged, not shown to players.
     Storage(String),
 }
@@ -63,9 +66,12 @@ impl AccountError {
         match self {
             AccountError::InvalidUsername(_)
             | AccountError::InvalidPassword(_)
-            | AccountError::InvalidTicket => ErrorCode::InvalidRequest,
+            | AccountError::InvalidTicket
+            | AccountError::UnknownKey => ErrorCode::InvalidRequest,
             AccountError::UsernameTaken => ErrorCode::UsernameTaken,
-            AccountError::InvalidCredentials => ErrorCode::InvalidCredentials,
+            AccountError::InvalidCredentials | AccountError::WrongPassword => {
+                ErrorCode::InvalidCredentials
+            }
             AccountError::InvalidSession => ErrorCode::InvalidSession,
             AccountError::Storage(_) => ErrorCode::Internal,
         }
@@ -77,6 +83,8 @@ impl AccountError {
             AccountError::InvalidUsername(why) | AccountError::InvalidPassword(why) => why.clone(),
             AccountError::UsernameTaken => "that username is taken; try another".to_string(),
             AccountError::InvalidCredentials => "wrong username or password".to_string(),
+            AccountError::WrongPassword => "that is not your password".to_string(),
+            AccountError::UnknownKey => "that key is not linked to your account".to_string(),
             AccountError::InvalidSession => "you have been signed out; sign in again".to_string(),
             AccountError::InvalidTicket => "this SSH key can no longer be linked".to_string(),
             AccountError::Storage(_) => "the server could not reach its database".to_string(),
@@ -213,6 +221,75 @@ impl Accounts {
         };
         self.with_store(move |store| store.link_ssh_key(user, &fingerprint, now_ms()))
             .await
+    }
+
+    /// Check `current`, then replace it with `new`. Every session but `keep`,
+    /// the one asking, is signed out.
+    pub async fn change_password(
+        &self,
+        user: UserId,
+        username: &str,
+        current: &str,
+        new: &str,
+        keep: Option<&str>,
+    ) -> Result<(), AccountError> {
+        self.confirm_password(user, current).await?;
+        validate_password(new, username)?;
+        let hash = self.hash(new.to_string()).await?;
+        let keep = keep.map(token_digest);
+        self.with_store(move |store| store.set_password(user, &hash, keep.as_deref()))
+            .await
+    }
+
+    /// Check `password`, then delete the account for good.
+    pub async fn delete_account(&self, user: UserId, password: &str) -> Result<(), AccountError> {
+        self.confirm_password(user, password).await?;
+        self.with_store(move |store| store.delete_user(user)).await
+    }
+
+    pub async fn ssh_keys(&self, user: UserId) -> Result<Vec<SshKey>, AccountError> {
+        let keys = self
+            .with_store(move |store| store.ssh_keys_for(user))
+            .await?;
+        Ok(keys
+            .into_iter()
+            .map(|(fingerprint, added_at_ms)| SshKey {
+                fingerprint,
+                added_at_ms,
+            })
+            .collect())
+    }
+
+    pub async fn unlink_ssh_key(
+        &self,
+        user: UserId,
+        fingerprint: &str,
+    ) -> Result<(), AccountError> {
+        let fingerprint = fingerprint.to_string();
+        let removed = self
+            .with_store(move |store| store.unlink_ssh_key(user, &fingerprint))
+            .await?;
+        if removed {
+            Ok(())
+        } else {
+            Err(AccountError::UnknownKey)
+        }
+    }
+
+    /// `Err(WrongPassword)` unless `password` is the account's.
+    async fn confirm_password(&self, user: UserId, password: &str) -> Result<(), AccountError> {
+        if password.len() > MAX_PASSWORD_BYTES {
+            return Err(AccountError::WrongPassword);
+        }
+        let hash = self
+            .with_store(move |store| store.password_hash(user))
+            .await?
+            .ok_or(AccountError::InvalidSession)?;
+        if self.verify(password.to_string(), hash).await? {
+            Ok(())
+        } else {
+            Err(AccountError::WrongPassword)
+        }
     }
 
     pub async fn record_games(&self, games: Vec<FinishedGame>) -> Result<(), AccountError> {
@@ -432,6 +509,81 @@ mod tests {
         );
         // Signing out on one computer leaves the others signed in.
         assert!(accounts.authenticate(&second.token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_needs_the_old_one_and_signs_out_elsewhere() {
+        let accounts = accounts();
+        let here = accounts.register("anna", "correct horse").await.unwrap();
+        let elsewhere = accounts.log_in("anna", "correct horse").await.unwrap();
+        let change = |current: &'static str, new: &'static str| {
+            accounts.change_password(here.user.id, "anna", current, new, Some(&here.token))
+        };
+        assert_eq!(
+            change("wrong horse", "battery staple").await,
+            Err(AccountError::WrongPassword)
+        );
+        assert!(matches!(
+            change("correct horse", "short").await,
+            Err(AccountError::InvalidPassword(_))
+        ));
+        change("correct horse", "battery staple").await.unwrap();
+        assert!(accounts.authenticate(&here.token).await.is_ok());
+        assert_eq!(
+            accounts.authenticate(&elsewhere.token).await,
+            Err(AccountError::InvalidSession)
+        );
+        assert_eq!(
+            accounts.log_in("anna", "correct horse").await,
+            Err(AccountError::InvalidCredentials)
+        );
+        assert!(accounts.log_in("anna", "battery staple").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_account_is_deleted_only_with_its_password() {
+        let accounts = accounts();
+        let anna = accounts.register("anna", "correct horse").await.unwrap();
+        assert_eq!(
+            accounts.delete_account(anna.user.id, "wrong horse").await,
+            Err(AccountError::WrongPassword)
+        );
+        accounts
+            .delete_account(anna.user.id, "correct horse")
+            .await
+            .unwrap();
+        assert_eq!(
+            accounts.authenticate(&anna.token).await,
+            Err(AccountError::InvalidSession)
+        );
+        assert_eq!(
+            accounts.log_in("anna", "correct horse").await,
+            Err(AccountError::InvalidCredentials)
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_are_listed_and_unlinked() {
+        let accounts = accounts();
+        let anna = accounts
+            .register("anna", "correct horse")
+            .await
+            .unwrap()
+            .user;
+        let ticket = accounts.issue_link_ticket("SHA256:key");
+        accounts.link_ssh_key(anna.id, &ticket).await.unwrap();
+        let keys = accounts.ssh_keys(anna.id).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].fingerprint, "SHA256:key");
+        accounts
+            .unlink_ssh_key(anna.id, "SHA256:key")
+            .await
+            .unwrap();
+        assert_eq!(
+            accounts.unlink_ssh_key(anna.id, "SHA256:key").await,
+            Err(AccountError::UnknownKey)
+        );
+        assert_eq!(accounts.user_for_ssh_key("SHA256:key").await.unwrap(), None);
     }
 
     #[tokio::test]

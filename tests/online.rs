@@ -374,3 +374,116 @@ fn strangers_find_each_other_while_the_lobby_watches() {
     lobby(&watcher, |lobby| lobby.online == 1);
     server.stop();
 }
+
+#[test]
+fn players_agree_a_rematch_and_start_again_with_colours_swapped() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server::start(&directory.path().join("server-state.json"));
+    let white = OnlineClient::connect(server.url());
+    let black = OnlineClient::connect(server.url());
+    let game = start_game(&white, &black, "Grace");
+    play_fools_mate(&white, &black, &game.game_id);
+
+    white
+        .send(ClientCommand::OfferRematch {
+            game_id: game.game_id.clone(),
+        })
+        .unwrap();
+    for client in [&white, &black] {
+        expect(client, |event| match event {
+            ServerEvent::GameUpdated { game } if game.rematch_offer.is_some() => Some(()),
+            _ => None,
+        });
+    }
+    black
+        .send(ClientCommand::OfferRematch {
+            game_id: game.game_id.clone(),
+        })
+        .unwrap();
+    let joined = |client: &OnlineClient| {
+        expect(client, |event| match event {
+            ServerEvent::GameJoined { game, side, .. } => Some((game, side)),
+            _ => None,
+        })
+    };
+    let (for_white, white_side) = joined(&white);
+    let (for_black, black_side) = joined(&black);
+    assert_eq!(for_white.game_id, for_black.game_id);
+    assert_ne!(for_white.game_id, game.game_id);
+    assert_eq!(white_side, Some(chess_protocol::Side::Black));
+    assert_eq!(black_side, Some(chess_protocol::Side::White));
+    assert_eq!(for_white.status, GameStatus::Active);
+
+    // The player who had Black opens the new game.
+    black
+        .send(ClientCommand::PlayMove {
+            game_id: for_black.game_id.clone(),
+            expected_ply: 0,
+            uci: "e2e4".to_string(),
+        })
+        .unwrap();
+    updated_to_ply(&white, 1);
+    server.stop();
+}
+
+#[test]
+fn an_account_changes_its_password_and_is_deleted_over_the_socket() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server::start(&directory.path().join("server-state.json"));
+    let client = OnlineClient::connect(server.url());
+    client
+        .send(ClientCommand::Register {
+            username: "Hedy".to_string(),
+            password: "frequency hop".to_string(),
+        })
+        .unwrap();
+    expect(&client, |event| match event {
+        ServerEvent::SignedIn { .. } => Some(()),
+        _ => None,
+    });
+
+    client
+        .send(ClientCommand::ChangePassword {
+            current_password: "wrong guess".to_string(),
+            new_password: "spread spectrum".to_string(),
+        })
+        .unwrap();
+    assert_eq!(error_code(&client), ErrorCode::InvalidCredentials);
+    client
+        .send(ClientCommand::ChangePassword {
+            current_password: "frequency hop".to_string(),
+            new_password: "spread spectrum".to_string(),
+        })
+        .unwrap();
+    expect(&client, |event| match event {
+        ServerEvent::PasswordChanged => Some(()),
+        _ => None,
+    });
+    client.send(ClientCommand::ListSshKeys).unwrap();
+    let keys = expect(&client, |event| match event {
+        ServerEvent::SshKeys { keys } => Some(keys),
+        _ => None,
+    });
+    assert!(keys.is_empty());
+
+    client
+        .send(ClientCommand::DeleteAccount {
+            password: "spread spectrum".to_string(),
+        })
+        .unwrap();
+    expect(&client, |event| match event {
+        ServerEvent::AccountDeleted => Some(()),
+        _ => None,
+    });
+    // The connection is signed out, and the name is free again.
+    client.send(ClientCommand::ListSshKeys).unwrap();
+    assert_eq!(error_code(&client), ErrorCode::NotSignedIn);
+    client
+        .send(ClientCommand::LogIn {
+            username: "Hedy".to_string(),
+            password: "spread spectrum".to_string(),
+        })
+        .unwrap();
+    assert_eq!(error_code(&client), ErrorCode::InvalidCredentials);
+    server.stop();
+}
