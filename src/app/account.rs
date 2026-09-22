@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use chess::client::OnlineClient;
 use chess::storage::{self, SavedAccount};
-use chess_protocol::{ClientCommand, ErrorCode, GameRecord, GameResult, ServerEvent};
+use chess_protocol::{ClientCommand, ErrorCode, GameRecord, GameResult, ServerEvent, SshKey};
 
-use crate::app::prompt::{centered_prompt, draw_centered, read_line, read_secret};
+use crate::app::prompt::{centered_prompt, draw_centered, read_field, read_secret};
 use crate::app::screen::Screen;
 
 /// Signing in hashes the password on the server, which takes a moment.
@@ -116,7 +116,15 @@ pub(crate) fn account_menu(
                 theme.dim("  signed in on this computer"),
                 String::new(),
                 format!("  {}   your recent games", theme.bold("1")),
-                format!("  {}   sign out", theme.bold("2")),
+                format!("  {}   change your password", theme.bold("2")),
+                format!("  {}   your SSH keys", theme.bold("3")),
+                format!("  {}   sign out", theme.bold("4")),
+                String::new(),
+                format!(
+                    "  {}   {}",
+                    theme.bold("5"),
+                    theme.warn("delete your account")
+                ),
             ],
             None => vec![
                 theme.strong(theme.palette.accent, "YOUR ACCOUNT"),
@@ -130,13 +138,13 @@ pub(crate) fn account_menu(
             ],
         };
         block.push(String::new());
-        block.push(theme.dim("  Press Enter on its own to go back."));
+        block.push(theme.dim("  Press Esc, or Enter on its own, to go back."));
         if let Some(complaint) = complaint.take() {
             block.push(String::new());
             block.push(complaint);
         }
         let left = draw_centered(screen, &block);
-        let Some(line) = read_line(stdin, &centered_prompt(screen, &left, ""))? else {
+        let Some(line) = read_field(stdin, &centered_prompt(screen, &left, ""))? else {
             return Ok(());
         };
         let choice = line.trim().to_ascii_lowercase();
@@ -145,12 +153,16 @@ pub(crate) fn account_menu(
             (false, "1" | "sign in" | "login") => sign_in(stdin, screen, account)?,
             (false, "2" | "create" | "signup") => create_account(stdin, screen, account)?,
             (true, "1" | "games" | "history") => recent_games(stdin, screen, account)?,
-            (true, "2" | "sign out" | "logout") => sign_out(account),
-            _ => Some(screen.theme.warn("  Choose 1 or 2.")),
+            (true, "2" | "password") => change_password(stdin, screen, account)?,
+            (true, "3" | "keys" | "ssh") => ssh_keys(stdin, screen, account)?,
+            (true, "4" | "sign out" | "logout") => sign_out(account),
+            (true, "5" | "delete") => delete_account(stdin, screen, account)?,
+            (true, _) => Some(screen.theme.warn("  Choose 1 to 5.")),
+            (false, _) => Some(screen.theme.warn("  Choose 1 or 2.")),
         };
         complaint = outcome;
-        if account.username().is_some() && signed_in.is_none() {
-            // Just signed in: straight back to the menu to play.
+        if account.username().is_some() != signed_in.is_some() {
+            // Just signed in, or the account is gone: back to the menu.
             return Ok(());
         }
     }
@@ -167,7 +179,9 @@ fn sign_in(
     loop {
         let intro = vec![
             "  Welcome back.".to_string(),
-            screen.theme.dim("  Press Enter on its own to go back."),
+            screen
+                .theme
+                .dim("  Press Esc, or Enter on its own, to go back."),
         ];
         let mut fields = Fields::new("SIGN IN", intro, complaint.take());
         let Some(username) = fields.ask(stdin, screen, "username")? else {
@@ -209,7 +223,7 @@ fn create_account(
             "  digits, - or _. Your password needs".to_string(),
             "  at least 8 characters.".to_string(),
             String::new(),
-            theme.dim("  Press Enter on its own to go back."),
+            theme.dim("  Press Esc, or Enter on its own, to go back."),
         ];
         let mut fields = Fields::new("CREATE AN ACCOUNT", intro, complaint.take());
         let Some(username) = fields.ask(stdin, screen, "username")? else {
@@ -287,7 +301,7 @@ fn link_ssh_key(client: &OnlineClient, account: &mut AccountContext) -> bool {
 
 fn welcome(username: &str, linked_ssh_key: bool) -> String {
     if linked_ssh_key {
-        format!("Welcome, {username}! Next time, ssh signs you in by itself.")
+        format!("Welcome, {username}! This SSH key now signs you in.")
     } else {
         format!("Welcome, {username}!")
     }
@@ -316,15 +330,290 @@ fn sign_out(account: &mut AccountContext) -> Option<String> {
     None
 }
 
+/// Ask the server something as the signed-in account: sign this connection
+/// in with the saved session, then send `command`. A session the server has
+/// ended signs this computer out too.
+fn as_signed_in(
+    account: &mut AccountContext,
+    command: ClientCommand,
+) -> Result<ServerEvent, String> {
+    let Some(token) = account.session_token().map(str::to_string) else {
+        return Err("You are not signed in.".to_string());
+    };
+    let client = OnlineClient::connect(account.server_url.clone());
+    let answer = client
+        .request(
+            ClientCommand::Authenticate {
+                session_token: token,
+            },
+            REQUEST_TIMEOUT,
+        )
+        .and_then(|answer| match answer {
+            ServerEvent::SignedIn { .. } => client.request(command, REQUEST_TIMEOUT),
+            other => Ok(other),
+        });
+    match answer {
+        Ok(ServerEvent::Error {
+            code: ErrorCode::InvalidSession,
+            message,
+        }) => {
+            account.forget();
+            account.notice = Some(sentence(&message));
+            Err(sentence(&message))
+        }
+        Ok(ServerEvent::Error { message, .. }) => Err(sentence(&message)),
+        Ok(event) => Ok(event),
+        Err(error) => Err(sentence(&error)),
+    }
+}
+
+fn change_password(
+    stdin: &mut io::StdinLock,
+    screen: &mut Screen,
+    account: &mut AccountContext,
+) -> Result<Option<String>, String> {
+    let mut complaint: Option<String> = None;
+    loop {
+        let intro = vec![
+            "  Your new password needs at least".to_string(),
+            "  8 characters. Other computers are".to_string(),
+            "  signed out; this one stays in.".to_string(),
+            String::new(),
+            screen.theme.dim("  Press Esc to go back."),
+        ];
+        let mut fields = Fields::new("CHANGE YOUR PASSWORD", intro, complaint.take());
+        let Some(current) = fields.ask_secret(stdin, screen, "current")? else {
+            return Ok(None);
+        };
+        let Some(new) = fields.ask_secret(stdin, screen, "    new")? else {
+            continue;
+        };
+        if new.chars().count() < MIN_PASSWORD_CHARS {
+            complaint = Some(
+                screen
+                    .theme
+                    .warn("  That password is too short: use at least 8 characters."),
+            );
+            continue;
+        }
+        let Some(again) = fields.ask_secret(stdin, screen, "  again")? else {
+            continue;
+        };
+        if again != new {
+            complaint = Some(
+                screen
+                    .theme
+                    .warn("  The two new passwords were different. Try again."),
+            );
+            continue;
+        }
+        fields.status(screen, "Changing your password…");
+        let command = ClientCommand::ChangePassword {
+            current_password: current,
+            new_password: new,
+        };
+        match as_signed_in(account, command) {
+            Ok(ServerEvent::PasswordChanged) => {
+                return Ok(Some(
+                    screen
+                        .theme
+                        .good("  Password changed. Other computers are signed out."),
+                ))
+            }
+            Ok(other) => {
+                return Ok(Some(screen.theme.warn(&format!(
+                    "  The server answered unexpectedly ({other:?})."
+                ))))
+            }
+            Err(_) if account.username().is_none() => return Ok(None),
+            Err(message) => complaint = Some(screen.theme.warn(&format!("  {message}"))),
+        }
+    }
+}
+
+/// The SSH keys that sign in to the account, and unlinking one.
+fn ssh_keys(
+    stdin: &mut io::StdinLock,
+    screen: &mut Screen,
+    account: &mut AccountContext,
+) -> Result<Option<String>, String> {
+    let this_key = std::env::var("CHESS_SSH_KEY_FINGERPRINT").ok();
+    let mut news: Option<String> = None;
+    let mut answer = as_signed_in(account, ClientCommand::ListSshKeys);
+    loop {
+        let keys = match answer {
+            Ok(ServerEvent::SshKeys { keys }) => keys,
+            Ok(other) => {
+                return Ok(Some(screen.theme.warn(&format!(
+                    "  The server answered unexpectedly ({other:?})."
+                ))))
+            }
+            Err(_) if account.username().is_none() => return Ok(None),
+            Err(message) => return Ok(Some(screen.theme.warn(&format!("  {message}")))),
+        };
+        let theme = &screen.theme;
+        let mut block = vec![
+            theme.strong(theme.palette.accent, "YOUR SSH KEYS"),
+            theme.rule(56),
+            String::new(),
+        ];
+        if keys.is_empty() {
+            block.push("  No SSH keys sign in to this account.".to_string());
+            block.push(theme.dim("  Sign in once over ssh with a key, and"));
+            block.push(theme.dim("  it signs you in from then on."));
+        } else {
+            block.push("  These keys sign in without a password".to_string());
+            block.push("  when you connect with ssh.".to_string());
+            block.push(String::new());
+            for (index, key) in keys.iter().enumerate() {
+                block.push(key_line(theme, index + 1, key, this_key.as_deref()));
+            }
+            block.push(String::new());
+            block.push(theme.dim("  Type a key's number to unlink it."));
+        }
+        if let Some(news) = news.take() {
+            block.push(String::new());
+            block.push(news);
+        }
+        block.push(String::new());
+        block.push(theme.dim("  Press Esc, or Enter on its own, to go back."));
+        let left = draw_centered(screen, &block);
+        let Some(line) = read_field(stdin, &centered_prompt(screen, &left, ""))? else {
+            return Ok(None);
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(None);
+        }
+        let Some(key) = line
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|index| keys.get(index))
+        else {
+            news = Some(screen.theme.warn("  Type the number beside a key."));
+            answer = Ok(ServerEvent::SshKeys { keys });
+            continue;
+        };
+        let fingerprint = key.fingerprint.clone();
+        let confirm = centered_prompt(
+            screen,
+            &left,
+            &screen.theme.warn(&format!(
+                "unlink {}? [y/N]",
+                short_fingerprint(&fingerprint)
+            )),
+        );
+        let sure = read_field(stdin, &confirm)?.is_some_and(|answer| {
+            matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        });
+        if !sure {
+            answer = Ok(ServerEvent::SshKeys { keys });
+            continue;
+        }
+        answer = as_signed_in(account, ClientCommand::UnlinkSshKey { fingerprint });
+        if answer.is_ok() {
+            news = Some(
+                screen
+                    .theme
+                    .good("  Unlinked. That key now joins as a guest until you sign in with it."),
+            );
+        }
+    }
+}
+
+fn key_line(
+    theme: &chess::ui::Theme,
+    number: usize,
+    key: &SshKey,
+    this_key: Option<&str>,
+) -> String {
+    let this = if this_key == Some(key.fingerprint.as_str()) {
+        theme.accent("  this key")
+    } else {
+        String::new()
+    };
+    format!(
+        "  {}   {}  {}{}",
+        theme.bold(&number.to_string()),
+        short_fingerprint(&key.fingerprint),
+        theme.dim(&format!("added {}", short_date(key.added_at_ms))),
+        this
+    )
+}
+
+/// `SHA256:2A5y9edy…vomqqy9g`: enough of both ends to tell keys apart.
+fn short_fingerprint(fingerprint: &str) -> String {
+    let characters: Vec<char> = fingerprint.chars().collect();
+    if characters.len() <= 30 {
+        return fingerprint.to_string();
+    }
+    let head: String = characters[..15].iter().collect();
+    let tail: String = characters[characters.len() - 8..].iter().collect();
+    format!("{head}\u{2026}{tail}")
+}
+
+fn delete_account(
+    stdin: &mut io::StdinLock,
+    screen: &mut Screen,
+    account: &mut AccountContext,
+) -> Result<Option<String>, String> {
+    let Some(username) = account.username().map(str::to_string) else {
+        return Ok(None);
+    };
+    let mut complaint: Option<String> = None;
+    loop {
+        let theme = &screen.theme;
+        let intro = vec![
+            theme.warn("  This cannot be undone."),
+            String::new(),
+            "  Your account, its sign-ins and its SSH".to_string(),
+            "  keys are deleted. Your finished games".to_string(),
+            "  stay in your opponents' histories,".to_string(),
+            "  without your name.".to_string(),
+            String::new(),
+            theme.dim("  Press Esc to keep your account."),
+        ];
+        let mut fields = Fields::new("DELETE YOUR ACCOUNT", intro, complaint.take());
+        let Some(password) = fields.ask_secret(stdin, screen, "password")? else {
+            return Ok(None);
+        };
+        let Some(typed) = fields.ask(stdin, screen, "type your username to confirm")? else {
+            return Ok(None);
+        };
+        if !typed.eq_ignore_ascii_case(&username) {
+            complaint = Some(
+                screen
+                    .theme
+                    .warn(&format!("  That is not {username}. Nothing was deleted.")),
+            );
+            continue;
+        }
+        fields.status(screen, "Deleting your account…");
+        match as_signed_in(account, ClientCommand::DeleteAccount { password }) {
+            Ok(ServerEvent::AccountDeleted) => {
+                account.forget();
+                account.notice =
+                    Some("Your account is deleted. You can still play as a guest.".to_string());
+                return Ok(None);
+            }
+            Ok(other) => {
+                return Ok(Some(screen.theme.warn(&format!(
+                    "  The server answered unexpectedly ({other:?})."
+                ))))
+            }
+            Err(_) if account.username().is_none() => return Ok(None),
+            Err(message) => complaint = Some(screen.theme.warn(&format!("  {message}"))),
+        }
+    }
+}
+
 fn recent_games(
     stdin: &mut io::StdinLock,
     screen: &mut Screen,
     account: &mut AccountContext,
 ) -> Result<Option<String>, String> {
-    let (Some(username), Some(token)) = (
-        account.username().map(str::to_string),
-        account.session_token().map(str::to_string),
-    ) else {
+    let Some(username) = account.username().map(str::to_string) else {
         return Ok(None);
     };
     let block = vec![
@@ -336,44 +625,18 @@ fn recent_games(
         screen.theme.dim("  Fetching your games…"),
     ];
     draw_centered(screen, &block);
-    let client = OnlineClient::connect(account.server_url.clone());
-    let answer = client
-        .request(
-            ClientCommand::Authenticate {
-                session_token: token,
-            },
-            REQUEST_TIMEOUT,
-        )
-        .and_then(|answer| match answer {
-            ServerEvent::SignedIn { .. } => client.request(
-                ClientCommand::ListGames {
-                    limit: HISTORY_LENGTH,
-                },
-                REQUEST_TIMEOUT,
-            ),
-            other => Ok(other),
-        });
-    let games = match answer {
+    let command = ClientCommand::ListGames {
+        limit: HISTORY_LENGTH,
+    };
+    let games = match as_signed_in(account, command) {
         Ok(ServerEvent::GameList { games }) => games,
-        Ok(ServerEvent::Error {
-            code: ErrorCode::InvalidSession,
-            message,
-        }) => {
-            account.forget();
-            account.notice = Some(sentence(&message));
-            return Ok(None);
-        }
-        Ok(ServerEvent::Error { message, .. }) => {
-            return Ok(Some(
-                screen.theme.warn(&format!("  {}", sentence(&message))),
-            ))
-        }
         Ok(other) => {
             return Ok(Some(screen.theme.warn(&format!(
                 "  The server answered unexpectedly ({other:?})."
             ))))
         }
-        Err(error) => return Ok(Some(screen.theme.warn(&format!("  {}", sentence(&error))))),
+        Err(_) if account.username().is_none() => return Ok(None),
+        Err(message) => return Ok(Some(screen.theme.warn(&format!("  {message}")))),
     };
 
     let theme = &screen.theme;
@@ -395,9 +658,9 @@ fn recent_games(
         });
     }
     block.push(String::new());
-    block.push(theme.dim("  Press Enter to go back."));
+    block.push(theme.dim("  Press Enter or Esc to go back."));
     let left = draw_centered(screen, &block);
-    read_line(stdin, &centered_prompt(screen, &left, ""))?;
+    read_field(stdin, &centered_prompt(screen, &left, ""))?;
     Ok(None)
 }
 
@@ -542,7 +805,7 @@ impl Fields {
         label: &str,
     ) -> Result<Option<String>, String> {
         self.draw(screen);
-        let answer = read_line(stdin, &centered_prompt(screen, &self.left, label))?
+        let answer = read_field(stdin, &centered_prompt(screen, &self.left, label))?
             .map(|line| line.trim().to_string())
             .filter(|line| !line.is_empty());
         if let Some(answer) = &answer {
@@ -621,6 +884,13 @@ mod tests {
         assert!(line.text.contains("checkmate"));
         assert!(line.text.contains("2 moves"));
         assert!(line.text.ends_with("10+5"));
+    }
+
+    #[test]
+    fn long_fingerprints_keep_both_ends() {
+        let long = "SHA256:2A5y9edyzUL8rDBgFDZZuyaxpEOGDBYLVUyvomqqy9g";
+        assert_eq!(short_fingerprint(long), "SHA256:2A5y9edy\u{2026}vomqqy9g");
+        assert_eq!(short_fingerprint("SHA256:short"), "SHA256:short");
     }
 
     #[test]

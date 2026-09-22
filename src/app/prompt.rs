@@ -22,6 +22,60 @@ pub(crate) fn read_line(stdin: &mut io::StdinLock, prompt: &str) -> Result<Optio
     }
 }
 
+/// Read a line, as in a form: Escape or Ctrl+C goes back with `Ok(None)`,
+/// which a terminal in cooked mode could never say. Input that is not a
+/// terminal is read as an ordinary line.
+pub(crate) fn read_field(
+    stdin: &mut io::StdinLock,
+    prompt: &str,
+) -> Result<Option<String>, String> {
+    if !io::stdin().is_terminal() {
+        return Ok(
+            read_line(stdin, prompt)?.map(|line| line.trim_end_matches(['\r', '\n']).to_string())
+        );
+    }
+    print!("{}", prompt);
+    io::stdout().flush().map_err(|e| e.to_string())?;
+    let _raw = RawMode::enter()?;
+    let mut text = String::new();
+    loop {
+        let typed = match event::read().map_err(|e| format!("could not read input: {e}"))? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Enter => break,
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('c') if control => return Ok(None),
+                    KeyCode::Char('d') if control && text.is_empty() => return Ok(None),
+                    KeyCode::Char('u') if control => {
+                        print!("{}", "\u{8} \u{8}".repeat(ui::width(&text)));
+                        text.clear();
+                        String::new()
+                    }
+                    KeyCode::Backspace => {
+                        if text.pop().is_some() {
+                            print!("\u{8} \u{8}");
+                        }
+                        String::new()
+                    }
+                    KeyCode::Char(c) if !control => c.to_string(),
+                    _ => String::new(),
+                }
+            }
+            Event::Paste(pasted) => pasted
+                .chars()
+                .take_while(|&c| c != '\r' && c != '\n')
+                .filter(|c| !c.is_control())
+                .collect(),
+            _ => String::new(),
+        };
+        text.push_str(&typed);
+        print!("{typed}");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+    }
+    Ok(Some(text))
+}
+
 /// Read a line without showing it, drawing a dot for each character typed.
 /// `Ok(None)` when the person presses Esc or Ctrl+C to go back. Input that is
 /// not a terminal is read as an ordinary line.
@@ -241,14 +295,14 @@ fn ask_invite_code(
             "  Type the six-character code your".to_string(),
             "  friend sees beside their board.".to_string(),
             String::new(),
-            theme.dim("  Press Enter on its own to go back."),
+            theme.dim("  Press Esc, or Enter on its own, to go back."),
         ];
         if !complaint.is_empty() {
             block.push(String::new());
             block.push(complaint.clone());
         }
         let left = draw_centered(screen, &block);
-        let Some(line) = read_line(stdin, &centered_prompt(screen, &left, "code"))? else {
+        let Some(line) = read_field(stdin, &centered_prompt(screen, &left, "code"))? else {
             return Ok(None);
         };
         let code = line
@@ -285,13 +339,14 @@ pub(crate) fn ask_guest_name(
         theme.rule(32),
         String::new(),
         "  What name should your opponent see?".to_string(),
-        theme.dim(&format!("  Press Enter to use {suggested}.")),
+        theme.dim(&format!("  Press Enter to use {suggested}, or Esc")),
+        theme.dim("  to go back."),
         String::new(),
         theme.dim("  Sign in from the menu (a) to keep"),
         theme.dim("  your games in your history."),
     ];
     let left = draw_centered(screen, &block);
-    let Some(line) = read_line(stdin, &centered_prompt(screen, &left, "name"))? else {
+    let Some(line) = read_field(stdin, &centered_prompt(screen, &left, "name"))? else {
         return Ok(None);
     };
     let name: String = line
