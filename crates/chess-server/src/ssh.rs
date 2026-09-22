@@ -388,6 +388,21 @@ impl russh::server::Handler for Visitor {
         Ok(())
     }
 
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // `sftp`, and `scp` in recent OpenSSH, ask for a file-transfer
+        // subsystem. Left unanswered, they wait forever, so say no at once;
+        // OpenSSH then reports "subsystem request failed" and exits.
+        info!(peer = ?self.peer, subsystem = name, "ssh visitor asked for a subsystem");
+        session.channel_failure(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
     async fn data(
         &mut self,
         _channel: ChannelId,

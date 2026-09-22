@@ -208,6 +208,33 @@ async fn a_visitor_plays_as_a_guest_until_their_key_is_linked() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn file_transfers_are_refused_rather_than_left_hanging() {
+    let servers = start(3).await;
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let config = Arc::new(client::Config::default());
+    let mut session = client::connect(config, servers.ssh_address, TrustAnyHost)
+        .await
+        .unwrap();
+    session
+        .authenticate_publickey("anyone", PrivateKeyWithHashAlg::new(Arc::new(key), None))
+        .await
+        .unwrap();
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel.request_subsystem(true, "sftp").await.unwrap();
+
+    let answer = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = channel.wait().await {
+            if matches!(message, ChannelMsg::Failure) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(answer, Ok(true), "the gateway refuses at once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn one_address_cannot_take_every_seat() {
     let servers = start(1).await;
     let key = || PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();

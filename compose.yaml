@@ -28,6 +28,17 @@ services:
     cpus: ${CHESS_CPUS:-2}
     mem_limit: ${CHESS_MEMORY:-2g}
     pids_limit: 1024
+    # Visitors reach a program running in here, so give it nothing it does
+    # not use: no Linux capabilities, no setuid escalation, and no writable
+    # image. The data volume and /tmp, where each visitor's settings and
+    # autosave live until they leave, are the only writable places.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
 
   caddy:
     image: caddy:2.10-alpine
@@ -46,6 +57,17 @@ services:
       - caddy-config:/config
     cpus: 0.5
     mem_limit: 256m
+    # Caddy's binary carries the one capability it needs, binding 80 and 443;
+    # it cannot start if that capability is dropped too.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
 
 volumes:
   chess-data:
