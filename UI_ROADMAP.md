@@ -61,31 +61,37 @@ Make every page and every terminal render cleanly before adding new surfaces.
       piece, with no grey fringe.
 - [x] Explain the VS Code settings that improve the board when it starts
       without images.
+- [x] Draw the home page preview board as a real picture where the terminal
+      shows images, and as figurines rather than coarse block art elsewhere.
 
-### 2. Keyboard board cursor — next
+### 2. Keyboard board cursor — complete
 
 Let keyboard players move pieces the way mouse players do, instead of typing
 every move. This also works over SSH where mouse reporting is unavailable.
 
-- [ ] Arrow keys and `hjkl` move a highlighted cursor square over the board.
-- [ ] `Enter` picks up a piece and shows its legal moves; `Enter` again drops it.
-- [ ] `Esc` cancels the selection and returns the cursor to rest.
-- [ ] Reuse the existing selected-square, move-dot, and capture markers.
-- [ ] Respect board orientation, so the cursor follows the flipped board.
-- [ ] Fit cursor focus into the existing `Tab` order between the board, the
+- [x] Arrow keys move a cursor square over the board, drawn as bars or
+      brackets rather than a colour. `hjkl` was left out: `h` begins every
+      h-pawn move typed at the prompt.
+- [x] `Enter` picks up a piece and shows its legal moves; `Enter` again drops it.
+- [x] `Esc` cancels the selection and returns the cursor to rest.
+- [x] Reuse the existing selected-square, move-dot, and capture markers.
+- [x] Respect board orientation, so the cursor follows the flipped board.
+- [x] Fit cursor focus into the existing `Tab` order between the board, the
       move box, and the controls.
 
-### 3. Move review — next
+### 3. Move review — complete
 
 Let players look back through the game, during play and after it ends. The
 board cursor from stage 2 provides the keyboard controls.
 
-- [ ] Click a move in the list, or press `←` and `→`, to show that position.
-- [ ] `Home` and `End` jump to the start and the current position.
-- [ ] Show a clear banner such as "Viewing move 14 · End to return".
-- [ ] Block input to the live game while viewing an earlier position.
-- [ ] Keep the last-move and check highlights accurate for the position shown.
-- [ ] Return to the live position automatically when the opponent moves online.
+- [x] Click a move in the list, or press `Page Up` and `Page Down`, to show
+      that position; while looking back, `←` and `→` step too. Outside a
+      review the arrows belong to the board cursor.
+- [x] `Home` and `End` jump to the start and the current position.
+- [x] Show a clear banner such as "Viewing move 14 · End to return".
+- [x] Block input to the live game while viewing an earlier position.
+- [x] Keep the last-move and check highlights accurate for the position shown.
+- [x] Return to the live position automatically when the opponent moves online.
 
 ### 4. Clock pressure — planned
 
@@ -107,15 +113,16 @@ Show who is better at a glance, using scores the engine already produces.
       a rated game.
 - [ ] Hide it cleanly when the terminal is too narrow.
 
-### 6. Game-over summary — planned
+### 6. Game-over summary — complete
 
 Replace the status line with a clear ending and obvious next steps.
 
-- [ ] Show a summary card with the result and its reason.
-- [ ] Include the move count and the time left on each clock.
-- [ ] Offer **Rematch**, **Export PGN**, and **Review** actions.
-- [ ] Connect **Review** to move review from stage 3.
-- [ ] Keep every action reachable from the keyboard.
+- [x] Show a summary card with the result and its reason.
+- [x] Include the move count and the time left on each clock.
+- [x] Offer **Rematch**, **PGN**, **Review** and **Menu** actions. PGN
+      shows the game to copy, which also works over SSH, where files are off.
+- [x] Connect **Review** to move review from stage 3.
+- [x] Keep every action reachable from the keyboard.
 - [ ] Leave room for rating change and report actions (stages 14 and 15).
 
 ### 7. Setup previews — planned
@@ -146,25 +153,26 @@ Small improvements that make the game feel finished.
 Work that must land before the game is shared publicly, even for guest-only
 play. A first-time player should never need `--help`.
 
-### 9. Home screen — planned
+### 9. Home screen — complete
 
-The start menu is currently a typed numbered prompt with three local modes.
-Online play, engine strength, and time controls are only reachable through
-command-line flags. Replace it with a real home screen.
+Live colour terminals open on a home page with a board preview and the
+current settings; piped and dumb terminals keep the typed numbered prompt.
+Every game ends back on it.
 
-- [ ] A navigable menu (mouse, arrow keys, and number shortcuts) with **Play
-      the computer**, **Play a friend here**, **Play online**, **Resume**, and
-      **Settings**.
-- [ ] Named engine levels (for example Beginner, Casual, Club, Strong) instead
+- [x] A navigable menu (mouse, arrow keys, and letter or number shortcuts)
+      with playing the computer as White or Black, two players at one
+      keyboard, continuing a saved game, online play, and the account page.
+- [x] A **Settings** entry on the menu.
+- [x] Named engine levels (Beginner, Casual, Club, Strong) instead
       of raw `--time` and `--depth`.
-- [ ] Time-control presets (Bullet, Blitz, Rapid, Untimed) with a custom
+- [x] Time-control presets (Bullet, Blitz, Rapid, Untimed) with a custom
       option.
-- [ ] **Play online** offers create, join by code, and resume from the menu,
-      without flags.
-- [ ] Side choice includes **Random**.
-- [ ] Consistent `Esc` behaviour: always one step back, never out of the
+- [x] Online play from the menu, without flags: a random opponent, create a
+      private game, join by code, and rejoin.
+- [x] Side choice includes **Random**.
+- [x] Consistent `Esc` behaviour: always one step back, never out of the
       program without confirmation during a game.
-- [ ] Keep the current flags as shortcuts that skip the home screen.
+- [x] Keep the current flags as shortcuts that skip the home screen.
 
 ### 10. First run and learning — planned
 
@@ -180,7 +188,7 @@ Get a new player from launch to a first move in under a minute.
       of one long list.
 - [ ] A command palette (`:` or `Ctrl+P`) that searches every command and
       button by name, so nothing has to be memorised.
-- [ ] Friendly suggestions for mistyped commands ("Did you mean `resign`?").
+- [x] Friendly suggestions for mistyped commands ("Did you mean `resign`?").
 
 ### 11. Accessibility — planned
 
@@ -197,13 +205,13 @@ mouse. `NO_COLOR` and ASCII mode already exist and are the starting point.
 - [ ] A reduced-sound option that keeps only essential cues (your turn, low
       time, game over).
 
-### 12. Presence and attention — planned
+### 12. Presence and attention — started
 
 Online games are played in a terminal that is often behind other windows.
 
-- [ ] Set the terminal title to the game state, for example
+- [x] Set the terminal title to the game state, for example
       "Your move · 3:12 — Terminal Chess".
-- [ ] Use terminal focus events to ring the bell or show a desktop
+- [x] Use terminal focus events to ring the bell or show a desktop
       notification when it becomes your turn while the window is unfocused.
 - [ ] A small connection indicator with latency, and a clear warning when it
       degrades.
@@ -240,18 +248,24 @@ Make sign-in feel safe and simple in a place without a browser.
 
 ## Part D — Matchmaking and community (with ROADMAP stage 6)
 
-### 15. Lobby and seeking — planned
+### 15. Lobby and seeking — started
 
+- [x] One-press seeking from the home page: **Play a random opponent** at
+      10+5.
+- [x] A coloured badge on the home page with how many people are online, red
+      when you are the only one, and a note when someone is already waiting.
 - [ ] A time-control grid (1+0, 3+2, 5+0, 10+0, 15+10, custom) for one-press
       seeking.
-- [ ] A searching state with elapsed time, the pool being searched, and
-      Cancel.
+- [x] A searching state that names the clock, says when nobody else is
+      online, and goes back to the menu with `q`.
+- [ ] Show elapsed time while searching.
 - [ ] A match-found transition showing the opponent's name, rating, and your
       colour before the clock starts.
 - [ ] Rated and unrated shown on every game, before and during play.
 - [ ] Rating on the player panels, provisional ratings marked, and the rating
       change on the game-over card.
-- [ ] Rematch with accept and decline, and a timeout that says what happened.
+- [x] Rematch with accept and decline, withdrawn when either player leaves.
+- [ ] A rematch offer that times out, and says so.
 
 ### 16. Friends and challenges — planned
 
@@ -297,11 +311,15 @@ Qualities that decide whether strangers stay.
       support, mouse support, sound, and config paths.
 - [ ] A bandwidth budget per frame over SSH, measured and kept.
 
-### 20. SSH gateway experience — planned
+### 20. SSH gateway experience — in progress
 
-The final ROADMAP item, and the easiest possible first game: `ssh` and play.
+The easiest possible first game: `ssh` and play. The gateway is live at
+`ssh -p 2222 chess.lakshaybhatia.com`.
 
-- [ ] Identify returning players by SSH key, with a first-visit name prompt.
+- [x] Identify returning account holders by the SSH key they linked. Guests
+      are asked for a name before they play online.
+- [x] Say plainly when the server is full, when one address has too many games
+      open, and when a request to the engine is capped.
 - [ ] Assume the least capable terminal until proven otherwise, and offer the
       terminal check from stage 10.
 - [ ] Keep sound silent and explain why.

@@ -12,13 +12,19 @@ engine, or against another person over the network.
 
 ## Highlights
 
-- Click a piece, inspect its legal moves, and click a destination to move.
-- Play against the built-in engine or another person at the same terminal.
+- Click a piece, inspect its legal moves, and click a destination to move, or
+  do the same with the arrow keys and `Enter`.
+- Play against the built-in engine at four levels, from Beginner to Strong, or
+  another person at the same terminal.
 - Create a private online game, share its six-character code, and play from two
   terminals with server-owned rules and clocks.
+- Play a random opponent: the server pairs you with the next person looking,
+  and the home page shows how many people are online.
 - Use SAN (`Nf3`, `exd5`, `O-O`) or coordinate notation (`e2e4`) at any time.
 - Get a responsive layout with player panels, clocks, captured pieces, material
-  advantage, move history, and clear game-over states.
+  advantage, move history, and a game-over summary with Rematch, Review, and
+  PGN.
+- Step back through any game, during play or after it, and return to it.
 - Render crisp vector-derived pieces through the iTerm2, Kitty, and sixel image
   protocols, with true-colour and Unicode fallbacks for other terminals.
 - Hear distinct sounds for moves, captures, checks, castling, promotions, and
@@ -29,10 +35,10 @@ engine, or against another person over the network.
 
 ## Quick start
 
-Where a server with the SSH gateway is running, there is nothing to install:
+To play on the public server, there is nothing to install:
 
 ```sh
-ssh chess.example.com
+ssh -p 2222 chess.lakshaybhatia.com
 ```
 
 To run it yourself, you need a recent [Rust toolchain](https://www.rust-lang.org/tools/install).
@@ -83,20 +89,62 @@ the rest show where you are in them and scroll with the wheel, the arrow keys
 or `Page Up` and `Page Down`.
 
 Keyboard input remains fully supported. Type anywhere to return focus to the
-move box. Use `Tab` or the arrow keys to move through every visible control,
-`Shift+Tab` to go backwards, and `Enter` to activate the focused button. The
-`Move` button returns the cursor to the move box, so draw, resign, restart, and
-all other game actions remain usable without a mouse.
+move box. The arrow keys move a cursor over the board: `Enter` picks up the
+piece under it and `Enter` again puts it down, exactly as two clicks would.
+`Tab` moves through every visible control, `Shift+Tab` goes backwards, and
+`Enter` activates the focused button, so draw, resign, restart, and all other
+game actions remain usable without a mouse.
+
+`Page Up` steps back through the game one move at a time, and `Page Down`
+steps forward; while you look back, the arrow keys step too. `Home` jumps to
+the starting position and `End` returns to the game. Clicking a move in the
+list shows the position after it. Nothing can be played until you return, and
+in an online game your opponent's move brings you back.
+
+`Esc` always goes one step back: it closes a page, drops a selected piece,
+leaves a review, hides the cursor, and finally moves the focus to `Menu`, from
+which `Enter` goes back to the home page. It never leaves a game on its own.
+Every game ends on the home page, whether through `Menu`, `menu`, or `quit`;
+local games are saved, so **Continue** picks them up. Only `q` on the home
+page, or `Ctrl+C`, ends the program.
+
+When a game ends, the panel shows the result, how it was reached, and the
+number of moves, with **Rematch** (colours swapped), **Review**, **PGN**, and
+**Menu**.
 
 Quiet legal moves use center dots. Captures use a separate highlighted square
 and frame, while an invalid click briefly marks only the rejected square and
 explains how to recover. Promotion choices accept either a click or `Q`, `R`,
 `B`, or `N` from the keyboard.
 
+## Engine levels and clocks
+
+Choose **Settings** (`s`) on the home page to set how the engine plays, the
+clock, the board colours, the pieces, and the sound. The rows that start a game
+against the engine say which level and clock it will use.
+
+| Level | How it plays |
+| --- | --- |
+| Beginner | Looks one move ahead and chooses loosely, so it gives pieces away |
+| Casual | Looks two moves ahead; its mistakes can be punished |
+| Club | Looks four moves ahead and seldom blunders |
+| Strong | Full strength, thinking up to 3 seconds a move |
+
+Each level won all 24 games of a match against the level below it, so each is
+a clear step up. Casual is the default. During a game, `level` shows the level
+and `level club` changes it; `time` and `depth` still set the engine by hand,
+at full strength.
+
+The clock offers Bullet 1+0, Blitz 3+2 and 5+0, Rapid 10+0 and 15+10, and
+Untimed; type your own on the Clock row, such as `7+3`. The same clock is used
+for private online games you create. The engine budgets its own clock, so it
+never loses on time in a short game. **Random side** (`r`) plays the engine as
+White or Black, drawn at random.
+
 ## Local games and files
 
 Terminal Chess automatically saves the current game after moves and game-state
-changes. The next startup offers **Resume saved game**, or you can use:
+changes. The home page then offers **Continue saved game**, or you can use:
 
 ```text
 pause                  stop the clocks and prevent moves
@@ -143,6 +191,35 @@ resignation, PGN export, sounds, both board orientations, and all rendering
 modes. The status line distinguishes waiting for an opponent, reconnecting,
 and an opponent who is temporarily offline.
 
+When the game ends, either player can offer a **Rematch**; once the other
+accepts, both move to a new game on the same clock with the colours swapped.
+Leaving a game in progress for the menu asks first, because the seat is only
+held for 60 seconds.
+
+The terminal window's title says whose move it is, with your clock when it is
+yours, so a game in a background window can still be followed. In terminals
+that report focus, the bell rings when your opponent moves, or a rematch or a
+random opponent turns up, while the window is in the background.
+
+## Playing a random opponent
+
+With no friend at hand, choose **Play a random opponent** on the home page, or
+run:
+
+```sh
+chess online find --name Lakshay --server wss://chess.example.com/ws
+```
+
+The server pairs you with the next person looking for a game. Every such game
+is 10+5 (ten minutes each, five seconds added per move), colours are drawn at
+random, and an account is never paired with itself.
+
+The home page shows a coloured badge beside the ONLINE heading: green with the
+number of people online, red when you are the only one, and grey when the
+server cannot be reached. The random-opponent row says when someone is already
+waiting. If you are alone while searching, the game says so; press `q` to go
+back to the menu and choose another mode.
+
 ## Accounts
 
 Anyone can play online as a guest. An account adds a name nobody else can use
@@ -158,12 +235,21 @@ While signed in, online games are played under your username and the account
 page lists your recent results. Guests' names are marked as guests there, so
 nobody can pass as a registered player.
 
+The account page also lets you:
+
+- change your password, which signs out every other computer;
+- see the SSH keys that sign you in, and unlink any of them;
+- delete the account, after typing your password and your username. Its
+  sign-ins and keys go with it. Your finished games stay in your opponents'
+  histories, shown as played by a deleted player, and the username becomes
+  free again.
+
 ## Playing over SSH
 
 The server can also let people in over plain `ssh`, which every macOS, Linux,
 and Windows 10 or later computer already has. Each visitor gets the full game
-in their own terminal: the local modes, online games with invite codes, and
-the account page.
+in their own terminal: the local modes, random opponents, online games with
+invite codes, and the account page.
 
 - No SSH password is asked for. Anyone may play as a guest.
 - Signing in or creating an account from the menu links the SSH key the
@@ -171,6 +257,12 @@ the account page.
 - Everything else matches the installed client, except that sound stays off
   and commands that read or write files are disabled, since the files would
   be on the server. Use `pgn` to show a game and copy it from the screen.
+- The engine thinks for at most 5 seconds a move, since it runs on the
+  server's processors.
+- One address may have a few games open at once (3 by default), so a single
+  visitor cannot take every seat.
+- The gateway only runs the game: commands, `sftp`, `scp` and port forwarding
+  are refused.
 
 Images are as sharp as the visitor's terminal allows: iTerm2 and Kitty show
 real images through SSH; other terminals get the portable block pieces.
@@ -237,9 +329,11 @@ Terminal Chess uses the system audio player; other platforms use Rodio.
 ```text
 --white              play White against the engine
 --black              play Black against the engine
+--random             play a side drawn at random against the engine
 --two                play with two people at one keyboard
---time <seconds>     engine time per move
---depth <number>     maximum search depth
+--level <name>       beginner, casual, club, or strong
+--time <seconds>     engine time per move, at full strength
+--depth <number>     maximum search depth, at full strength
 --clock <minutes>    starting time for each player (default: 10)
 --increment <secs>   time added after each move
 --no-clock           play without chess clocks
@@ -256,6 +350,7 @@ Terminal Chess uses the system audio player; other platforms use Rodio.
 online create        create a private online game
 online join <code>   join a private online game
 online resume        restore the last online seat
+online find          play whoever else is looking for a game
 --server <ws-url>    online endpoint (or CHESS_SERVER_URL)
 --name <name>        name shown in an online game
 ```
@@ -275,7 +370,9 @@ view wrapped in a desktop shell. A few implementation details:
   frames without repainting the whole screen after every move.
 - SVG piece assets are rasterized in-process and embedded in the release binary.
 - The chess engine uses iterative deepening, alpha-beta search, and a tapered
-  positional evaluation.
+  positional evaluation. The weaker levels search less deeply and add a
+  bounded random bonus to each move's score before choosing, so they make
+  mistakes of a known size rather than random ones.
 - The board uses a compact 0x88 representation with incremental Zobrist hashing.
 - Mouse events, keyboard commands, clocks, audio, and responsive rendering share
   one interactive game loop.
@@ -312,6 +409,7 @@ minutes are discarded. The following environment variables configure it:
 | `CHESS_SSH_HOST_KEY` | `data/ssh_host_ed25519_key` | The gateway's host key, created on first start |
 | `CHESS_CLIENT_BIN` | `chess` beside the server | The terminal client started for each visitor |
 | `CHESS_SSH_MAX_SESSIONS` | `100` | Visitors allowed at once |
+| `CHESS_SSH_MAX_PER_IP` | `3` | Games one address may have open at once |
 | `CHESS_LOG_FORMAT` | text | Set to `json` for structured logs |
 | `RUST_LOG` | `chess_server=info` | Log filter |
 
@@ -336,7 +434,7 @@ the other crates are shared by the client and the server:
 | `chess` (root) | Terminal UI, input, sound, local storage, and the network client |
 | `crates/chess-core` | Rules, notation, evaluation, engine search, and game state; no I/O |
 | `crates/chess-protocol` | Versioned wire messages and their conversions to the game model |
-| `crates/chess-server` | The authoritative room hub and its WebSocket transport |
+| `crates/chess-server` | The authoritative room hub, random-opponent pairing, accounts, and the WebSocket and SSH gateways |
 
 Contributions and issue reports are welcome. UI reports are most useful when
 they include the terminal application, operating system, window dimensions,
