@@ -69,12 +69,13 @@ pub(crate) fn bare_form(text: &str) -> String {
 }
 
 /// Every command and what it does, in the order the help lists them.
-pub(crate) const COMMANDS: [(&str, &str); 27] = [
+pub(crate) const COMMANDS: [(&str, &str); 30] = [
     ("help", "this list"),
     ("board", "redraw the board"),
     ("flip", "turn the board around"),
     ("moves", "list the legal moves"),
     ("history", "the moves so far"),
+    ("review", "look back; End returns"),
     ("pgn", "the game as PGN"),
     ("export", "write a PGN file"),
     ("import", "open a PGN file"),
@@ -86,6 +87,7 @@ pub(crate) const COMMANDS: [(&str, &str); 27] = [
     ("undo", "take back a move"),
     ("pause", "pause or resume"),
     ("draw", "offer or accept a draw"),
+    ("level", "beginner to strong"),
     ("time", "seconds per move"),
     ("depth", "search depth instead"),
     ("theme", "board colours"),
@@ -95,8 +97,9 @@ pub(crate) const COMMANDS: [(&str, &str); 27] = [
     ("name", "set a player name"),
     ("setup", "local files and setup"),
     ("new", "start again"),
+    ("rematch", "again, colours swapped"),
     ("resign", "concede the game"),
-    ("quit", "leave"),
+    ("menu", "back to the menu"),
 ];
 
 /// Every move names the rank it ends on, so a word with no digit in it was
@@ -111,7 +114,10 @@ pub(crate) fn looks_like_command(word: &str) -> bool {
 
 /// The command `word` was probably a misspelling of.
 pub(crate) fn command_guess(word: &str) -> Option<&'static str> {
-    let names = COMMANDS.iter().map(|(name, _)| *name).chain(["exit"]);
+    let names = COMMANDS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(["quit", "exit"]);
     let mut best: Option<(usize, &'static str)> = None;
     for name in names {
         let distance = edit_distance(word, name);

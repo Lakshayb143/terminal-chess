@@ -10,18 +10,22 @@ use chess_core::san::parse_move;
 use chess_core::search::Limits;
 use chess_protocol::Lobby;
 
+use chess::input::Direction;
+
 use crate::app::actions::{
-    cycle_pieces, flip_board, handle_board_click, handle_ui_action, set_depth, set_time,
-    sound_after_move, toggle_size,
+    cycle_pieces, engine_limits, flip_board, handle_board_click, handle_ui_action, set_depth,
+    set_time, sound_after_move, toggle_size, After,
 };
 use crate::app::cli::{Mode, OnlineIntent, Options, HOSTED_MOVETIME};
+use crate::app::local::step_back;
 use crate::app::online::{online_board_click, online_preferences, show_lobby, unix_time_ms};
 use crate::app::pages::import_pgn;
 use crate::app::saves::{restore_game, saved_game};
 use crate::app::screen::{
-    changed_frame_rows, ActionHitbox, BoardHitbox, ConnectionDisplay, OnlineDisplay, Screen,
-    UiAction,
+    changed_frame_rows, history_rows, move_name, ActionHitbox, BoardHitbox, ConnectionDisplay,
+    OnlineDisplay, Screen, UiAction,
 };
+use crate::app::settings::Level;
 
 fn hitbox(flipped: bool) -> BoardHitbox {
     BoardHitbox {
@@ -292,17 +296,15 @@ fn draw_offer_can_be_accepted_after_the_offering_move() {
     let mut screen = screen();
     screen.theme.live = true;
 
-    assert!(!handle_ui_action(
-        UiAction::Draw,
-        &mut game,
-        Mode::TwoPlayer,
-        &mut screen,
-    ));
+    assert_eq!(
+        handle_ui_action(UiAction::Draw, &mut game, &mut Mode::TwoPlayer, &mut screen),
+        After::Stay
+    );
     assert_eq!(game.draw_offer, Some(Color::White));
 
     let movement = parse_move(&game.pos, "e4").ok().unwrap();
     game.play(movement);
-    handle_ui_action(UiAction::Draw, &mut game, Mode::TwoPlayer, &mut screen);
+    handle_ui_action(UiAction::Draw, &mut game, &mut Mode::TwoPlayer, &mut screen);
     assert!(game.agreed_draw);
     assert!(matches!(outcome(&game), Some(Outcome::DrawAgreement)));
 }
@@ -313,11 +315,21 @@ fn destructive_mouse_action_requires_confirmation() {
     let mut screen = screen();
     screen.theme.live = true;
 
-    handle_ui_action(UiAction::Resign, &mut game, Mode::TwoPlayer, &mut screen);
+    handle_ui_action(
+        UiAction::Resign,
+        &mut game,
+        &mut Mode::TwoPlayer,
+        &mut screen,
+    );
     assert_eq!(screen.confirming, Some(UiAction::Resign));
     assert_eq!(game.resigned, None);
 
-    handle_ui_action(UiAction::Resign, &mut game, Mode::TwoPlayer, &mut screen);
+    handle_ui_action(
+        UiAction::Resign,
+        &mut game,
+        &mut Mode::TwoPlayer,
+        &mut screen,
+    );
     assert_eq!(game.resigned, Some(Color::White));
 }
 
@@ -328,7 +340,7 @@ fn compact_buttons_wrap_without_losing_hit_targets() {
     let buttons = screen.render_buttons(&screen.game_buttons(&game, Mode::TwoPlayer), 24);
 
     assert!(buttons.lines.len() >= 2);
-    assert_eq!(buttons.actions.len(), 8); // Undo starts disabled.
+    assert_eq!(buttons.actions.len(), 9); // Undo starts disabled.
     assert!(buttons
         .actions
         .iter()
@@ -616,11 +628,12 @@ fn online_game_over_status_outranks_invite_and_disconnect_states() {
         failure_help: None,
         seeking: false,
         lobby: None,
+        rematch_offer: None,
     });
 
     let status = screen.state_line(&game);
     assert!(status.contains("resigns"));
-    assert!(status.contains("export PGN or quit"));
+    assert!(status.contains("Rematch, Review, PGN or Menu"));
     assert!(!status.contains("INVITE"));
     assert!(!status.contains("OPPONENT OFFLINE"));
 }
@@ -641,6 +654,7 @@ fn a_player_looking_for_a_stranger_is_told_when_they_are_alone() {
         failure_help: None,
         seeking: true,
         lobby: None,
+        rematch_offer: None,
     });
     let alone = Lobby {
         online: 1,
@@ -683,6 +697,7 @@ fn online_draw_offer_has_accept_and_decline_controls() {
         failure_help: None,
         seeking: false,
         lobby: None,
+        rematch_offer: None,
     });
 
     let buttons = screen.game_buttons(&game, Mode::TwoPlayer);
@@ -703,6 +718,7 @@ fn online_session_does_not_overwrite_local_identity_clock_or_orientation() {
         clock_enabled: true,
         clock_minutes: 15.0,
         increment_seconds: 10.0,
+        engine_level: "club".to_string(),
         ..storage::Preferences::default()
     };
     let mut screen = screen();
@@ -721,6 +737,7 @@ fn online_session_does_not_overwrite_local_identity_clock_or_orientation() {
     assert!(!saved.flipped);
     assert_eq!(saved.clock_minutes, 15.0);
     assert_eq!(saved.increment_seconds, 10.0);
+    assert_eq!(saved.engine_level, previous.engine_level);
 }
 
 #[test]
@@ -748,4 +765,246 @@ fn a_hosted_engine_never_thinks_for_long() {
     set_time(&mut limits, &mut screen, "1e300", false);
     assert_eq!(limits.movetime, None);
     assert!(screen.message[0].contains("not a number of seconds"));
+}
+
+fn game_after(moves: &[&str]) -> Game {
+    let mut game = Game::new(Position::startpos());
+    for notation in moves {
+        let movement = parse_move(&game.pos, notation).ok().unwrap();
+        game.play(movement);
+    }
+    game
+}
+
+#[test]
+fn review_steps_through_the_game_and_back_to_it() {
+    let game = game_after(&["e4", "e5", "Nf3", "Nc6"]);
+    let mut screen = screen();
+
+    // Stepping back from the live game starts one move back.
+    screen.step_review(&game, true);
+    let reviewing = screen.reviewing.as_ref().unwrap();
+    assert_eq!(reviewing.ply, 3);
+    assert_eq!(
+        reviewing.pos.at(board::sq(2, 5)),
+        None,
+        "Nc6 not played yet"
+    );
+    assert_eq!(move_name(&game, 3), "2. Nf3");
+    assert_eq!(move_name(&game, 4), "2... Nc6");
+    assert_eq!(move_name(&game, 0), "the start");
+
+    screen.review(&game, 0);
+    screen.step_review(&game, true);
+    assert_eq!(
+        screen.reviewing.as_ref().unwrap().ply,
+        0,
+        "the start is the end"
+    );
+    let view = screen.board_view(&game);
+    assert_eq!(view.last, None);
+    assert!(screen.state_line(&game).contains("VIEWING"));
+
+    // Stepping on past the last move is the live game again.
+    screen.review(&game, 3);
+    screen.step_review(&game, false);
+    assert!(screen.reviewing.is_none());
+    assert!(!screen.end_review(), "nothing left to end");
+}
+
+#[test]
+fn moves_in_the_list_are_clickable_by_side() {
+    let game = game_after(&["e4", "e5", "Nf3"]);
+    let rows = history_rows(&game);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].targets(), vec![(0, 12, 1), (12, 3, 2)]);
+    assert_eq!(rows[1].targets(), vec![(0, 12, 3)]);
+
+    let mut screen = screen();
+    let panel = screen.panel(&game, Mode::TwoPlayer, &Limits::default(), 24, 36);
+    let white = panel
+        .history
+        .iter()
+        .find(|hit| hit.ply == 1)
+        .copied()
+        .expect("the first move can be clicked");
+    screen.history_hits = panel.history;
+    let at = |column: usize| screen.history_at(column as u16, white.row as u16);
+    assert_eq!(at(white.left + 3), Some(1));
+    assert_eq!(at(white.left + 12), Some(2));
+    assert_eq!(at(white.left + 20), None);
+}
+
+#[test]
+fn the_cursor_starts_where_the_eye_is_and_follows_the_board() {
+    let mut game = game_after(&[]);
+    let mut screen = screen();
+    screen.move_cursor(&game, Direction::Up);
+    assert_eq!(screen.cursor, Some(board::sq(4, 1)), "e2 first");
+    screen.move_cursor(&game, Direction::Up);
+    screen.move_cursor(&game, Direction::Up);
+    assert_eq!(screen.cursor, Some(board::sq(4, 3)));
+
+    // Enter on the cursor is a click: pick up, then put down.
+    handle_board_click(&mut game, &mut screen, Some(board::sq(4, 1)), false);
+    assert_eq!(screen.selected, Some(board::sq(4, 1)));
+    let cursor = screen.cursor;
+    handle_board_click(&mut game, &mut screen, cursor, false);
+    assert_eq!(game.sans, ["e4"]);
+
+    // With the board turned round, up the screen is down the ranks.
+    screen.flipped = true;
+    screen.cursor = Some(board::sq(4, 4));
+    screen.move_cursor(&game, Direction::Up);
+    assert_eq!(screen.cursor, Some(board::sq(4, 3)));
+    screen.move_cursor(&game, Direction::Right);
+    assert_eq!(screen.cursor, Some(board::sq(3, 3)));
+    // It stops at the edge: turned round, a1 is the top right corner.
+    screen.cursor = Some(board::sq(0, 0));
+    screen.move_cursor(&game, Direction::Right);
+    screen.move_cursor(&game, Direction::Up);
+    assert_eq!(screen.cursor, Some(board::sq(0, 0)));
+}
+
+#[test]
+fn escape_steps_back_one_thing_at_a_time_and_never_leaves() {
+    let game = game_after(&["e4"]);
+    let mut screen = screen();
+    screen.theme.live = true;
+    screen.cursor = Some(board::sq(4, 3));
+    screen.review(&game, 0);
+    screen.cursor = Some(board::sq(4, 3));
+    screen.selected = Some(board::sq(4, 3));
+
+    step_back(&mut screen);
+    assert!(screen.selected.is_none() && screen.reviewing.is_some());
+    step_back(&mut screen);
+    assert!(screen.reviewing.is_none() && screen.cursor.is_some());
+    step_back(&mut screen);
+    assert!(screen.cursor.is_none());
+    assert_eq!(screen.focused, UiAction::MoveInput);
+    step_back(&mut screen);
+    assert_eq!(
+        screen.focused,
+        UiAction::Menu,
+        "Menu is chosen, not pressed"
+    );
+    step_back(&mut screen);
+    assert_eq!(screen.focused, UiAction::MoveInput);
+}
+
+#[test]
+fn the_engine_spends_its_clock_like_a_player() {
+    let level = Level::Strong.limits();
+    let untimed = game_after(&[]);
+    assert_eq!(engine_limits(&level, &untimed).movetime, level.movetime);
+
+    let rapid = Game::with_clock(
+        Position::startpos(),
+        Some(Duration::from_secs(600)),
+        Duration::ZERO,
+    );
+    // Ten minutes is plenty for its three seconds.
+    assert_eq!(engine_limits(&level, &rapid).movetime, level.movetime);
+
+    let bullet = Game::with_clock(
+        Position::startpos(),
+        Some(Duration::from_secs(60)),
+        Duration::ZERO,
+    );
+    let budget = engine_limits(&level, &bullet).movetime.unwrap();
+    assert!(budget <= Duration::from_secs(2), "{budget:?}");
+    assert!(budget >= Duration::from_millis(50));
+}
+
+#[test]
+fn rematch_buttons_follow_the_offer() {
+    let mut game = game_after(&["f3", "e5", "g4", "Qh4#"]);
+    let mut screen = screen();
+    screen.online = Some(OnlineDisplay {
+        connection: ConnectionDisplay::Connected,
+        invite_code: None,
+        your_side: Some(Color::White),
+        white_connected: true,
+        black_connected: true,
+        reconnect_deadline_ms: None,
+        move_pending: false,
+        failure_help: None,
+        seeking: false,
+        lobby: None,
+        rematch_offer: None,
+    });
+    let labels = |screen: &Screen, game: &Game| -> Vec<(&'static str, bool)> {
+        screen
+            .game_over_buttons(game)
+            .iter()
+            .map(|spec| (spec.label, spec.enabled))
+            .collect()
+    };
+    assert!(labels(&screen, &game).contains(&("Rematch", true)));
+    assert!(labels(&screen, &game).contains(&("Review", true)));
+
+    screen.online.as_mut().unwrap().rematch_offer = Some(Color::Black);
+    let offered = labels(&screen, &game);
+    assert!(offered.contains(&("Accept rematch", true)));
+    assert!(offered.contains(&("Decline", true)));
+    assert!(screen.state_line(&game).contains("asks for a rematch"));
+
+    screen.online.as_mut().unwrap().rematch_offer = Some(Color::White);
+    assert!(labels(&screen, &game).contains(&("Rematch offered", false)));
+
+    // Nobody to play once the opponent has gone.
+    let online = screen.online.as_mut().unwrap();
+    online.rematch_offer = None;
+    online.black_connected = false;
+    assert!(labels(&screen, &game).contains(&("Rematch", false)));
+
+    game.restart();
+    assert!(labels(&screen, &game).contains(&("Review", false)));
+}
+
+#[test]
+fn the_window_title_says_whose_move_it_is() {
+    let game = game_after(&["e4"]);
+    let mut screen = screen();
+    assert_eq!(
+        screen.title_text(&game, Mode::HumanBlack),
+        "Your move \u{2014} chess"
+    );
+    assert_eq!(
+        screen.title_text(&game, Mode::HumanWhite),
+        "Engine's move \u{2014} chess"
+    );
+    assert_eq!(
+        screen.title_text(&game, Mode::TwoPlayer),
+        "Black to move \u{2014} chess"
+    );
+    screen.online = Some(OnlineDisplay {
+        connection: ConnectionDisplay::Connected,
+        invite_code: None,
+        your_side: Some(Color::Black),
+        white_connected: true,
+        black_connected: true,
+        reconnect_deadline_ms: None,
+        move_pending: false,
+        failure_help: None,
+        seeking: false,
+        lobby: None,
+        rematch_offer: None,
+    });
+    let timed = {
+        let mut game = Game::with_clock(
+            Position::startpos(),
+            Some(Duration::from_secs(300)),
+            Duration::ZERO,
+        );
+        let e4 = parse_move(&game.pos, "e4").ok().unwrap();
+        game.play(e4);
+        game
+    };
+    assert!(screen
+        .title_text(&timed, Mode::TwoPlayer)
+        .starts_with("Your move · 5:00"));
+    let mate = game_after(&["f3", "e5", "g4", "Qh4#"]);
+    assert!(screen.title_text(&mate, Mode::TwoPlayer).contains("0-1"));
 }

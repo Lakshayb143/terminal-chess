@@ -27,6 +27,8 @@ pub struct Preferences {
     pub clock_minutes: f64,
     pub increment_seconds: f64,
     pub onboarding_complete: bool,
+    /// beginner, casual, club or strong.
+    pub engine_level: String,
 }
 
 impl Default for Preferences {
@@ -44,6 +46,7 @@ impl Default for Preferences {
             clock_minutes: 10.0,
             increment_seconds: 0.0,
             onboarding_complete: false,
+            engine_level: "casual".to_string(),
         }
     }
 }
@@ -67,6 +70,12 @@ impl Preferences {
         }
         if !self.increment_seconds.is_finite() || self.increment_seconds < 0.0 {
             self.increment_seconds = 0.0;
+        }
+        if !matches!(
+            self.engine_level.as_str(),
+            "beginner" | "casual" | "club" | "strong"
+        ) {
+            self.engine_level = "casual".to_string();
         }
         self
     }
@@ -184,6 +193,15 @@ pub fn save_online_seat(path: &Path, seat: &SavedOnlineSeat) -> Result<(), Strin
     let text = serde_json::to_vec_pretty(seat)
         .map_err(|error| format!("could not encode online session: {error}"))?;
     atomic_write(path, &text)
+}
+
+/// Forget the last online seat, once its game is over and left.
+pub fn forget_online_seat(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+    }
 }
 
 pub fn load_online_seat(path: &Path) -> Result<SavedOnlineSeat, String> {

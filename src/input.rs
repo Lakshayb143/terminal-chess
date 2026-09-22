@@ -11,14 +11,51 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 /// Something the game loop can act on immediately.
 pub enum Action {
     Submit(String),
-    Click { column: u16, row: u16 },
+    Click {
+        column: u16,
+        row: u16,
+    },
     Cancel,
-    Focus { reverse: bool },
+    /// Tab, or Shift+Tab when `reverse`.
+    Focus {
+        reverse: bool,
+    },
+    /// An arrow key pressed with nothing typed.
+    Arrow(Direction),
+    /// Home, or End when `end`, pressed with nothing typed.
+    Edge {
+        end: bool,
+    },
     Prompt,
     Resize,
     Tick,
-    History { older: bool },
+    /// Page Up, or Page Down when not `older`.
+    History {
+        older: bool,
+    },
+    /// The mouse wheel, up when `older`.
+    Scroll {
+        older: bool,
+    },
+    /// The terminal window gained or lost the focus. Only terminals that
+    /// report focus send these.
+    WindowFocus(bool),
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Direction {
+    /// Up and left go back through a list; down and right go on.
+    pub fn backwards(self) -> bool {
+        matches!(self, Direction::Up | Direction::Left)
+    }
 }
 
 /// Owns raw mode and mouse reporting for as long as the live game runs.
@@ -63,7 +100,7 @@ impl TerminalInput {
         if !self.active {
             return Ok(());
         }
-        print!("\x1b[?2004l\x1b[?1006l\x1b[?1000l");
+        print!("\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1000l");
         io::stdout().flush().map_err(|e| e.to_string())?;
         disable_raw_mode().map_err(|e| format!("could not leave raw mode: {}", e))?;
         self.active = false;
@@ -77,7 +114,8 @@ impl TerminalInput {
         enable_raw_mode().map_err(|e| format!("could not enter raw mode: {}", e))?;
         // 1000 reports button presses/releases; 1006 gives unbounded, precise
         // terminal-cell coordinates. Deliberately do not enable 1002/1003.
-        print!("\x1b[?1000h\x1b[?1006h\x1b[?2004h");
+        // 1004 reports the window gaining and losing focus.
+        print!("\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?1004h");
         if let Err(error) = io::stdout().flush() {
             let _ = disable_raw_mode();
             return Err(error.to_string());
@@ -104,8 +142,8 @@ impl TerminalInput {
                             row: mouse.row,
                         });
                     }
-                    MouseEventKind::ScrollUp => return Ok(Action::History { older: true }),
-                    MouseEventKind::ScrollDown => return Ok(Action::History { older: false }),
+                    MouseEventKind::ScrollUp => return Ok(Action::Scroll { older: true }),
+                    MouseEventKind::ScrollDown => return Ok(Action::Scroll { older: false }),
                     _ => {}
                 },
                 Event::Paste(text) => {
@@ -121,6 +159,8 @@ impl TerminalInput {
                         return Ok(action);
                     }
                 }
+                Event::FocusGained => return Ok(Action::WindowFocus(true)),
+                Event::FocusLost => return Ok(Action::WindowFocus(false)),
                 _ => {}
             }
         }
@@ -156,12 +196,12 @@ impl TerminalInput {
             KeyCode::Tab if self.buffer.is_empty() => Some(Action::Focus {
                 reverse: key.modifiers.contains(KeyModifiers::SHIFT),
             }),
-            KeyCode::Left | KeyCode::Up if self.buffer.is_empty() => {
-                Some(Action::Focus { reverse: true })
-            }
-            KeyCode::Right | KeyCode::Down if self.buffer.is_empty() => {
-                Some(Action::Focus { reverse: false })
-            }
+            KeyCode::Up if self.buffer.is_empty() => Some(Action::Arrow(Direction::Up)),
+            KeyCode::Down if self.buffer.is_empty() => Some(Action::Arrow(Direction::Down)),
+            KeyCode::Left if self.buffer.is_empty() => Some(Action::Arrow(Direction::Left)),
+            KeyCode::Right if self.buffer.is_empty() => Some(Action::Arrow(Direction::Right)),
+            KeyCode::Home if self.buffer.is_empty() => Some(Action::Edge { end: false }),
+            KeyCode::End if self.buffer.is_empty() => Some(Action::Edge { end: true }),
             KeyCode::Char(c) if !c.is_control() => {
                 self.buffer.push(c);
                 Some(Action::Prompt)
@@ -189,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_and_arrows_navigate_controls_when_the_prompt_is_empty() {
+    fn tab_arrows_and_edges_navigate_when_the_prompt_is_empty() {
         let mut input = input();
         assert!(matches!(
             input.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
@@ -201,12 +241,20 @@ mod tests {
         ));
         assert!(matches!(
             input.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-            Some(Action::Focus { reverse: true })
+            Some(Action::Arrow(Direction::Left))
+        ));
+        assert!(matches!(
+            input.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Some(Action::Edge { end: true })
         ));
 
+        // Once something is typed, the keys belong to the text.
         input.buffer.push('e');
         assert!(input
             .key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .is_none());
+        assert!(input
+            .key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
             .is_none());
     }
 }

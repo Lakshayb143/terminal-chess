@@ -16,9 +16,19 @@ use chess_core::{board, search};
 
 use crate::app::cli::{cap_hosted, Mode};
 use crate::app::format::{budget_text, format_score, kind_name, node_count, pv_text, white_pov};
+use crate::app::pages::pgn_lines;
 use crate::app::parse::{nearby_moves, promotion_default, under_specified};
 use crate::app::prompt::read_line;
 use crate::app::screen::{Screen, UiAction};
+use crate::app::settings::Level;
+
+/// Where a game goes after something the player chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum After {
+    Stay,
+    /// Back to the home page.
+    Menu,
+}
 
 /// Make one real game move and emit exactly one matching audio cue. Keeping
 /// this at the mutation boundary means mouse, keyboard, and engine moves can
@@ -61,13 +71,12 @@ pub(crate) fn split_command(input: &str) -> (String, &str) {
     }
 }
 
-/// Returns true when the application should close.
 pub(crate) fn handle_ui_action(
     action: UiAction,
     game: &mut Game,
-    mode: Mode,
+    mode: &mut Mode,
     screen: &mut Screen,
-) -> bool {
+) -> After {
     match action {
         UiAction::MoveInput => {
             screen.focus_move_input();
@@ -88,11 +97,11 @@ pub(crate) fn handle_ui_action(
         }
         UiAction::Undo => {
             screen.confirming = None;
-            undo(game, mode, screen);
+            undo(game, *mode, screen);
         }
         UiAction::Draw => {
             screen.confirming = None;
-            if mode != Mode::TwoPlayer {
+            if *mode != Mode::TwoPlayer {
                 screen.note(
                     screen
                         .theme
@@ -121,7 +130,7 @@ pub(crate) fn handle_ui_action(
                 )));
             }
         }
-        UiAction::DeclineDraw => {}
+        UiAction::DeclineDraw | UiAction::DeclineRematch => {}
         UiAction::Resign => {
             if screen.confirming == Some(UiAction::Resign) {
                 game.resigned = Some(game.pos.side);
@@ -156,14 +165,96 @@ pub(crate) fn handle_ui_action(
         UiAction::ToggleSize => toggle_size(screen),
         UiAction::CyclePieces => cycle_pieces(screen),
         UiAction::Flip => flip_board(screen),
-        UiAction::Rematch => {
-            game.restart();
-            screen.clear_marks();
-            screen.note(screen.theme.good("Rematch started."));
-        }
-        UiAction::Quit => return true,
+        UiAction::Rematch => rematch(game, mode, screen),
+        UiAction::Review => start_review(game, screen),
+        UiAction::Pgn => show_pgn(game, screen),
+        UiAction::Menu => return After::Menu,
     }
-    false
+    After::Stay
+}
+
+/// Play again. Against the engine the colours swap, as between people.
+pub(crate) fn rematch(game: &mut Game, mode: &mut Mode, screen: &mut Screen) {
+    *mode = mode.swapped();
+    game.restart();
+    screen.end_review();
+    screen.clear_marks();
+    screen.cursor = None;
+    screen.focus_move_input();
+    let note = match mode.human() {
+        Some(side) => {
+            screen.flipped = side == chess_core::board::Color::Black;
+            format!("Rematch: you play {}.", side.name())
+        }
+        None => "Rematch started.".to_string(),
+    };
+    screen.note(screen.theme.good(&note));
+}
+
+/// Look back through the game from its first position.
+pub(crate) fn start_review(game: &Game, screen: &mut Screen) {
+    if game.sans.is_empty() {
+        screen.note(screen.theme.dim("No moves have been played yet."));
+        return;
+    }
+    screen.focus_move_input();
+    screen.review(game, 0);
+    screen.note(
+        screen
+            .theme
+            .dim("PgDn or \u{2192} steps through the game; End goes back to it."),
+    );
+}
+
+/// The game as PGN, on a page to copy from.
+pub(crate) fn show_pgn(game: &Game, screen: &mut Screen) {
+    let lines = pgn_lines(game, &screen.player_names);
+    screen.open("PGN", lines);
+}
+
+/// The engine's limits for its next move: its level's, but never more of its
+/// clock than a player could spend on one move and still finish the game.
+pub(crate) fn engine_limits(limits: &Limits, game: &Game) -> Limits {
+    let mut limits = *limits;
+    if let Some(left) = game.clock.remaining(game.pos.side) {
+        // A thirtieth of what is left, and most of the increment.
+        let share = left / 30 + game.clock.increment * 3 / 4;
+        let share = share.min(left / 2).max(Duration::from_millis(50));
+        limits.movetime = Some(limits.movetime.map_or(share, |budget| budget.min(share)));
+    }
+    limits
+}
+
+/// `level` shows the engine's level; `level club` changes it.
+pub(crate) fn set_level(limits: &mut Limits, screen: &mut Screen, rest: &str, hosted: bool) {
+    if rest.is_empty() {
+        let text = match Level::of(limits) {
+            Some(level) => format!("The engine plays at {}: {}", level.label(), level.about()),
+            None => format!(
+                "The engine gets {}. Try `level beginner`, `casual`, `club` or `strong`.",
+                budget_text(limits)
+            ),
+        };
+        screen.note(screen.theme.dim(&text));
+        return;
+    }
+    match Level::named(rest) {
+        Some(level) => {
+            *limits = level.limits();
+            if hosted {
+                cap_hosted(limits);
+            }
+            screen.note(screen.theme.good(&format!(
+                "The engine now plays at {}. {}",
+                level.label(),
+                level.about()
+            )));
+            screen.redraw = true;
+        }
+        None => screen.note(screen.theme.warn(&format!(
+            "`{rest}` is not a level. Try beginner, casual, club or strong."
+        ))),
+    }
 }
 
 pub(crate) fn make_move(game: &mut Game, input: &str, screen: &mut Screen) {
@@ -258,7 +349,11 @@ pub(crate) fn handle_board_click(
     };
 
     if finished {
-        screen.note(screen.theme.dim("The game is over. Try `new` or `undo`."));
+        screen.note(
+            screen
+                .theme
+                .dim("The game is over. Choose Rematch, Review, PGN or Menu, or `undo`."),
+        );
         return;
     }
     if game.paused {
@@ -428,7 +523,7 @@ pub(crate) fn engine_move(
                 let _ = io::stdout().flush();
             }
         };
-        engine.think(pos, limits, &mut report)
+        engine.think(pos, &engine_limits(limits, game), &mut report)
     };
     screen.theme.erase_line();
 
@@ -495,6 +590,7 @@ pub(crate) fn hint(game: &Game, engine: &mut Search, limits: &Limits, screen: &m
         return;
     }
     // A hint should come back quickly even when the engine has a long budget.
+    // A hint is the best move the engine can find, whatever level it plays.
     let budget = Limits {
         depth: limits.depth,
         movetime: Some(
@@ -597,6 +693,10 @@ pub(crate) fn set_time(limits: &mut Limits, screen: &mut Screen, rest: &str, hos
         .and_then(|secs| Duration::try_from_secs_f64(secs).ok());
     match budget {
         Some(budget) => {
+            // Time for a level's engine means the engine at full strength.
+            if Level::of(limits).is_some() {
+                *limits = Limits::default();
+            }
             limits.movetime = Some(budget);
             let note = if hosted && cap_hosted(limits) {
                 format!(
@@ -628,6 +728,9 @@ pub(crate) fn set_depth(limits: &mut Limits, screen: &mut Screen, rest: &str, ho
     }
     match rest.parse::<u32>() {
         Ok(depth) if (1..=search::MAX_DEPTH).contains(&depth) => {
+            if Level::of(limits).is_some() {
+                *limits = Limits::default();
+            }
             limits.depth = depth;
             // A depth asked for by name is a depth to reach, not to give up on.
             limits.movetime = None;

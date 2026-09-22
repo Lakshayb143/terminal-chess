@@ -88,6 +88,8 @@ pub(crate) fn runtime_preferences(screen: &Screen, game: &Game) -> storage::Pref
             .unwrap_or(10.0),
         increment_seconds: game.clock.increment.as_secs_f64(),
         onboarding_complete: true,
+        // The caller knows the engine; this default is replaced.
+        engine_level: "casual".to_string(),
     }
 }
 

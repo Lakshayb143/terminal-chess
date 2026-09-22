@@ -18,23 +18,27 @@ use chess_core::movegen::in_check;
 
 use crate::app::account::{account_menu, AccountContext};
 use crate::app::cli::{Mode, OnlineIntent, Options, StartChoice};
-use crate::app::format::others_online;
+use crate::app::format::{budget_text, others_online};
 use crate::app::online::{random_clock_text, LobbyView, LobbyWatch};
 use crate::app::prompt::ask_guest_name;
 use crate::app::saves::{color_named, restore_game};
 use crate::app::screen::Screen;
+use crate::app::settings::{self, Clock, Level};
 
 /// One thing the home page can start, in the order it is listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Entry {
     White,
     Black,
+    /// White or Black, drawn at random.
+    Either,
     Two,
     Continue,
     Random,
     Create,
     Join,
     Rejoin,
+    Settings,
     Account,
     Quit,
 }
@@ -44,12 +48,14 @@ impl Entry {
         match self {
             Entry::White => 'w',
             Entry::Black => 'b',
+            Entry::Either => 'r',
             Entry::Two => 't',
             Entry::Continue => 'c',
             Entry::Random => 'p',
             Entry::Create => 'o',
             Entry::Join => 'j',
-            Entry::Rejoin => 'r',
+            Entry::Rejoin => 'e',
+            Entry::Settings => 's',
             Entry::Account => 'a',
             Entry::Quit => 'q',
         }
@@ -59,12 +65,14 @@ impl Entry {
         match self {
             Entry::White => "Play White",
             Entry::Black => "Play Black",
+            Entry::Either => "Random side",
             Entry::Two => "Two players",
             Entry::Continue => "Continue saved game",
             Entry::Random => "Play a random opponent",
             Entry::Create => "Create a private game",
             Entry::Join => "Join with a code",
             Entry::Rejoin => "Rejoin online game",
+            Entry::Settings => "Settings",
             Entry::Account => "Account",
             Entry::Quit => "Quit",
         }
@@ -90,6 +98,7 @@ pub(crate) enum Pick {
     Choice(Option<StartChoice>),
     NeedsName(OnlineIntent),
     Account,
+    Settings,
 }
 
 /// The name a game partner sees: the signed-in username, or the guest name
@@ -110,6 +119,10 @@ pub(crate) struct HomeInfo {
     pub(crate) server_url: String,
     /// Theme, clock, engine and sound, already worded for the footer.
     pub(crate) settings: String,
+    /// `Casual engine`, beside the Settings row.
+    pub(crate) engine: String,
+    /// `Casual engine · 10+0 clock`, under the rows that play the engine.
+    pub(crate) against: String,
 }
 
 impl HomeInfo {
@@ -125,44 +138,50 @@ impl HomeInfo {
         let seat = seat_path
             .exists()
             .then(|| storage::load_online_seat(seat_path));
-        HomeInfo {
+        let mut info = HomeInfo {
             saved,
             seat,
             server_url: options.server_url.clone(),
-            settings: settings_line(options, screen),
-        }
+            settings: String::new(),
+            engine: String::new(),
+            against: String::new(),
+        };
+        info.describe(options, screen);
+        info
+    }
+
+    /// Word the settings again, after the settings page changed them.
+    pub(crate) fn describe(&mut self, options: &Options, screen: &Screen) {
+        self.settings = settings_line(options, screen);
+        self.engine = format!("{} engine", engine_text(options));
+        let clock = match options.clock {
+            Some(_) => format!("{} clock", Clock::of(options).text()),
+            None => "no clock".to_string(),
+        };
+        self.against = format!("{} · {}", self.engine, clock);
     }
 }
 
-fn settings_line(options: &Options, screen: &Screen) -> String {
+pub(crate) fn settings_line(options: &Options, screen: &Screen) -> String {
     let clock = match options.clock {
-        Some(initial) => format!(
-            "{}+{} clock",
-            trim_number(initial.as_secs_f64() / 60.0),
-            trim_number(options.increment.as_secs_f64())
-        ),
+        Some(_) => format!("{} clock", Clock::of(options).text()),
         None => "no clock".to_string(),
     };
-    let engine = match options.limits.movetime {
-        Some(budget) => format!("engine {}s", trim_number(budget.as_secs_f64())),
-        None => format!("engine depth {}", options.limits.depth),
-    };
     format!(
-        "{} board · {} · {} · sound {}",
+        "{} board · {} · {} engine · sound {}",
         ui::palette_name(screen.theme.palette),
         clock,
-        engine,
+        engine_text(options),
         screen.sound.mode().name()
     )
 }
 
-/// `10` rather than `10.0`, but `0.5` stays `0.5`.
-fn trim_number(value: f64) -> String {
-    if value.fract().abs() < 1e-9 {
-        format!("{}", value as i64)
-    } else {
-        format!("{:.1}", value)
-    }
+/// `Casual`, or what `--time` and `--depth` asked for.
+fn engine_text(options: &Options) -> String {
+    Level::of(&options.limits).map_or_else(
+        || budget_text(&options.limits),
+        |level| level.label().to_string(),
+    )
 }
 
 /// A clickable menu row, in frame coordinates.
@@ -202,6 +221,8 @@ pub(crate) struct Home {
     /// `Some` while the invite code is being typed.
     code: Option<String>,
     complaint: Option<String>,
+    /// News from a page the player has just come back from.
+    notice: Option<String>,
     start: Game,
     hits: Vec<Hit>,
     board_cache: Option<(PreviewKey, Vec<String>)>,
@@ -215,7 +236,7 @@ pub(crate) struct Home {
 
 impl Home {
     pub(crate) fn new(info: &HomeInfo) -> Home {
-        let mut entries = vec![Entry::White, Entry::Black, Entry::Two];
+        let mut entries = vec![Entry::White, Entry::Black, Entry::Either, Entry::Two];
         if info.saved.is_some() {
             entries.push(Entry::Continue);
         }
@@ -223,8 +244,7 @@ impl Home {
         if info.seat.is_some() {
             entries.push(Entry::Rejoin);
         }
-        entries.push(Entry::Account);
-        entries.push(Entry::Quit);
+        entries.extend([Entry::Settings, Entry::Account, Entry::Quit]);
         // An unfinished game is the likeliest reason to have come back.
         let focus = match &info.saved {
             Some(Ok((game, _))) if outcome(game).is_none() => {
@@ -237,6 +257,7 @@ impl Home {
             focus,
             code: None,
             complaint: None,
+            notice: None,
             start: Game::new(Position::startpos()),
             hits: Vec::new(),
             board_cache: None,
@@ -264,23 +285,33 @@ impl Home {
         account: &AccountContext,
         typed: &str,
     ) -> Option<Pick> {
+        if !matches!(
+            action,
+            Action::Tick | Action::Resize | Action::WindowFocus(_)
+        ) {
+            self.notice = None;
+        }
         match action {
             Action::Quit => Some(Pick::Choice(None)),
-            Action::Resize | Action::Tick => None,
+            Action::Resize | Action::Tick | Action::WindowFocus(_) | Action::Edge { .. } => None,
             Action::Cancel => {
                 self.code = None;
                 self.complaint = None;
                 None
             }
-            Action::Focus { reverse } | Action::History { older: reverse } => {
+            Action::Arrow(direction) => {
                 if !self.joining() {
                     self.complaint = None;
-                    let count = self.entries.len();
-                    self.focus = if reverse {
-                        (self.focus + count - 1) % count
-                    } else {
-                        (self.focus + 1) % count
-                    };
+                    self.step_focus(direction.backwards());
+                }
+                None
+            }
+            Action::Focus { reverse }
+            | Action::History { older: reverse }
+            | Action::Scroll { older: reverse } => {
+                if !self.joining() {
+                    self.complaint = None;
+                    self.step_focus(reverse);
                 }
                 None
             }
@@ -335,6 +366,15 @@ impl Home {
         }
     }
 
+    fn step_focus(&mut self, back: bool) {
+        let count = self.entries.len();
+        self.focus = if back {
+            (self.focus + count - 1) % count
+        } else {
+            (self.focus + 1) % count
+        };
+    }
+
     fn choose(&mut self, entry: Entry, info: &HomeInfo, account: &AccountContext) -> Option<Pick> {
         if let Some(index) = self.entries.iter().position(|&e| e == entry) {
             self.focus = index;
@@ -343,6 +383,7 @@ impl Home {
         match entry {
             Entry::White => Some(Pick::Choice(Some(StartChoice::Mode(Mode::HumanWhite)))),
             Entry::Black => Some(Pick::Choice(Some(StartChoice::Mode(Mode::HumanBlack)))),
+            Entry::Either => Some(Pick::Choice(Some(StartChoice::Mode(Mode::either_side())))),
             Entry::Two => Some(Pick::Choice(Some(StartChoice::Mode(Mode::TwoPlayer)))),
             Entry::Continue => match &info.saved {
                 Some(Ok(_)) => Some(Pick::Choice(Some(StartChoice::Resume))),
@@ -369,6 +410,7 @@ impl Home {
                 }
                 None => None,
             },
+            Entry::Settings => Some(Pick::Settings),
             Entry::Account => Some(Pick::Account),
             Entry::Quit => Some(Pick::Choice(None)),
         }
@@ -530,13 +572,19 @@ impl Home {
         let sections: [(&str, &[Entry]); 3] = [
             (
                 "PLAY",
-                &[Entry::White, Entry::Black, Entry::Two, Entry::Continue],
+                &[
+                    Entry::White,
+                    Entry::Black,
+                    Entry::Either,
+                    Entry::Two,
+                    Entry::Continue,
+                ],
             ),
             (
                 "ONLINE",
                 &[Entry::Random, Entry::Create, Entry::Join, Entry::Rejoin],
             ),
-            ("", &[Entry::Account, Entry::Quit]),
+            ("", &[Entry::Settings, Entry::Account, Entry::Quit]),
         ];
         for (index, (heading, members)) in sections.iter().enumerate() {
             if index > 0 {
@@ -566,6 +614,9 @@ impl Home {
         }
         if let Some(complaint) = &self.complaint {
             lines.push(format!("  {}", theme.warn(&ui::clip_note(complaint, room))));
+        }
+        if let Some(notice) = &self.notice {
+            lines.push(format!("  {}", theme.accent(&ui::clip_note(notice, room))));
         }
         (lines, hits)
     }
@@ -628,6 +679,7 @@ impl Home {
     /// A few words to the right of a row, where a row has something to add.
     fn meta(&self, info: &HomeInfo, account: &AccountContext, entry: Entry) -> Option<String> {
         match entry {
+            Entry::Settings => Some(info.engine.clone()),
             Entry::Continue => match &info.saved {
                 Some(Ok((game, _))) if outcome(game).is_some() => Some("finished".to_string()),
                 Some(Ok((game, _))) => Some(format!("move {}", game.sans.len() / 2 + 1)),
@@ -640,7 +692,7 @@ impl Home {
                 None => None,
             },
             Entry::Account => Some(match account.username() {
-                Some(_) => "your recent games".to_string(),
+                Some(_) => "games, password, keys".to_string(),
                 None => "sign in or sign up".to_string(),
             }),
             _ => None,
@@ -680,15 +732,17 @@ impl Home {
                 theme.dim("Enter to join as Black · Esc to go back"),
             ];
         }
+        let against = || theme.dim(&format!("{} · s changes it", info.against));
         match self.focused() {
             Entry::White => vec![
                 "You move first; the engine answers as Black.".to_string(),
-                theme.dim("Type moves like e4 or Nf3, or click the pieces."),
+                against(),
             ],
             Entry::Black => vec![
                 "The engine opens as White and you reply.".to_string(),
-                theme.dim("The board turns so your pieces are at the bottom."),
+                against(),
             ],
+            Entry::Either => vec!["White or Black, drawn at random.".to_string(), against()],
             Entry::Two => vec![
                 "Two people share this keyboard.".to_string(),
                 theme.dim("The engine stays quiet unless someone asks for a hint."),
@@ -728,10 +782,14 @@ impl Home {
                 ],
                 _ => vec![theme.warn("The last online seat could not be read.")],
             },
+            Entry::Settings => vec![
+                "The engine's level, the clock, and the board.".to_string(),
+                theme.dim(&info.against),
+            ],
             Entry::Account => match account.username() {
                 Some(name) => vec![
                     format!("Signed in as {name}."),
-                    theme.dim("See your recent games or sign out."),
+                    theme.dim("Your games, password and SSH keys."),
                 ],
                 None => vec![
                     "Keep your name and games on every computer.".to_string(),
@@ -864,6 +922,7 @@ fn preview_view(game: &Game, flipped: bool) -> BoardView<'_> {
         captures: &[],
         invalid: None,
         promotions: &[],
+        cursor: None,
     }
 }
 
@@ -989,8 +1048,10 @@ const TITLE: [&str; 3] = [
 /// suspended for as long as one of those is on screen.
 pub(crate) fn run(
     screen: &mut Screen,
-    info: &HomeInfo,
+    info: &mut HomeInfo,
     account: &mut AccountContext,
+    options: &mut Options,
+    config_path: &Path,
 ) -> Result<Option<StartChoice>, String> {
     let mut input = TerminalInput::enter(true)?;
     let mut home = Home::new(info);
@@ -1001,7 +1062,9 @@ pub(crate) fn run(
         drawn: None,
         bytes: None,
     };
-    let pieces = preview_pieces(screen.pieces, screen.image_protocol);
+    let mut pieces = preview_pieces(screen.pieces, screen.image_protocol);
+    print!("\x1b]2;chess\x07");
+    screen.title = None;
     loop {
         home.lobby = lobby.poll();
         let (cols, rows) = ui::terminal_size().unwrap_or((80, 24));
@@ -1047,6 +1110,7 @@ pub(crate) fn run(
                 input.resume()?;
                 shown.clear();
                 outcome?;
+                home.notice = account.notice.take();
             }
             Some(Pick::NeedsName(intent)) => {
                 input.suspend()?;
@@ -1059,6 +1123,17 @@ pub(crate) fn run(
                     return Ok(Some(StartChoice::Online(intent, name)));
                 }
             }
+            Some(Pick::Settings) => {
+                let saved = settings::run(&mut input, options, screen, config_path);
+                input.clear_buffer();
+                info.describe(options, screen);
+                pieces = preview_pieces(screen.pieces, screen.image_protocol);
+                home.board_cache = None;
+                shown.clear();
+                if let Err(error) = saved {
+                    home.complaint = Some(format!("Settings were not saved: {error}"));
+                }
+            }
         }
     }
 }
@@ -1067,7 +1142,7 @@ pub(crate) fn run(
 /// board part is as it was, only the text beside it is rewritten, from
 /// column `beside`, so moving through the menu leaves a picture of the board
 /// alone.
-fn paint(
+pub(crate) fn paint(
     frame: &[String],
     splits: &[usize],
     beside: usize,
@@ -1120,7 +1195,9 @@ mod tests {
                 ))
             }),
             server_url: "ws://127.0.0.1:3000/ws".to_string(),
-            settings: "slate board · 10+0 clock · engine 3s · sound auto".to_string(),
+            settings: "slate board · 10+0 clock · Casual engine · sound auto".to_string(),
+            engine: "Casual engine".to_string(),
+            against: "Casual engine · 10+0 clock".to_string(),
         }
     }
 
@@ -1242,19 +1319,45 @@ mod tests {
 
     #[test]
     fn arrows_wrap_around_the_menu() {
+        use chess::input::Direction;
         let info = info(false, true);
         let account = guest();
         let mut home = Home::new(&info);
-        home.handle(Action::Focus { reverse: true }, &info, &account, "");
+        home.handle(Action::Arrow(Direction::Up), &info, &account, "");
         assert_eq!(home.focused(), Entry::Quit);
-        home.handle(Action::Focus { reverse: true }, &info, &account, "");
+        home.handle(Action::Arrow(Direction::Left), &info, &account, "");
         assert_eq!(home.focused(), Entry::Account);
         home.handle(Action::Focus { reverse: true }, &info, &account, "");
+        assert_eq!(home.focused(), Entry::Settings);
+        home.handle(Action::Focus { reverse: true }, &info, &account, "");
         assert_eq!(home.focused(), Entry::Rejoin);
-        home.handle(Action::Focus { reverse: false }, &info, &account, "");
-        home.handle(Action::Focus { reverse: false }, &info, &account, "");
-        home.handle(Action::Focus { reverse: false }, &info, &account, "");
+        for _ in 0..4 {
+            home.handle(Action::Arrow(Direction::Down), &info, &account, "");
+        }
         assert_eq!(home.focused(), Entry::White);
+    }
+
+    #[test]
+    fn random_side_and_settings_have_their_own_keys() {
+        let info = info(false, false);
+        let account = guest();
+        let mut home = Home::new(&info);
+        assert!(matches!(
+            key(&mut home, &info, &account, "r"),
+            Some(Pick::Choice(Some(StartChoice::Mode(
+                Mode::HumanWhite | Mode::HumanBlack
+            ))))
+        ));
+        assert!(matches!(
+            key(&mut home, &info, &account, "s"),
+            Some(Pick::Settings)
+        ));
+        // Rows that play the engine say how it will play.
+        let mut home = Home::new(&info);
+        let page = home
+            .render(&theme(), &info, &account, ui::Pieces::Glyph, 120, 40)
+            .join("\n");
+        assert!(page.contains("Casual engine · 10+0 clock"), "{page}");
     }
 
     #[test]

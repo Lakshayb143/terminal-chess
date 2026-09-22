@@ -24,21 +24,29 @@ pub(crate) fn help_lines(theme: &Theme) -> Vec<String> {
         ),
         format!(
             "  {}",
-            theme.dim("Use action buttons directly; scroll the move list with the mouse wheel.")
+            theme.dim("Click the buttons, or a move in the list to look back at it.")
         ),
         format!(
             "  {}",
-            theme.dim("Page Up / Page Down scroll this page and the move list.")
+            theme.dim("The wheel scrolls this page and the move list.")
         ),
         String::new(),
         theme.bold("KEYBOARD"),
         format!(
             "  {}",
-            theme.dim("Tab or arrows move focus; Shift+Tab goes back; Enter selects.")
+            theme.dim("Arrows move a cursor on the board; Enter picks up and puts down.")
         ),
         format!(
             "  {}",
-            theme.dim("Start typing at any time to focus the move box.")
+            theme.dim("PgUp and PgDn step through the game; Home is its start, End now.")
+        ),
+        format!(
+            "  {}",
+            theme.dim("Tab reaches the controls and Enter chooses. Escape steps back.")
+        ),
+        format!(
+            "  {}",
+            theme.dim("Start typing at any time to enter a move or a command.")
         ),
         String::new(),
         theme.bold("MOVES"),
@@ -74,10 +82,9 @@ pub(crate) fn help_lines(theme: &Theme) -> Vec<String> {
     lines.push(String::new());
     lines.push(theme.dim("  `moves e2` points at one piece on the board"));
     lines.push(
-        theme.dim(
-            "  `time 5`, `depth 8`, `theme wood`, `pieces art`, `size small` all take a value",
-        ),
+        theme.dim("  `level club`, `theme wood`, `pieces art`, `size small` all take a value"),
     );
+    lines.push(theme.dim("  `time 5` and `depth 8` set the engine by hand, at full strength"));
     lines.push(
         theme.dim("  `save`, `load`, `import game.pgn` and `export game.pgn` keep games local"),
     );

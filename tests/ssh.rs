@@ -203,7 +203,7 @@ async fn a_visitor_plays_as_a_guest_until_their_key_is_linked() {
         .await
         .unwrap();
 
-    let screen = visit(&servers, key, "your recent games").await;
+    let screen = visit(&servers, key, "games, password, keys").await;
     assert!(screen.contains("signed in as carol"));
 }
 

@@ -21,11 +21,12 @@ use chess_protocol::{
 use crate::app::account::AccountContext;
 use crate::app::actions::{
     cycle_pieces, flip_board, open_promotion_menu, set_pieces, set_size, set_sound, set_theme,
-    sound_after_move, split_command, toggle_size,
+    show_pgn, sound_after_move, split_command, start_review, toggle_size, After,
 };
 use crate::app::cli::{names_a_file, Mode, OnlineIntent, Options, HOSTED_FILES};
 use crate::app::format::{kind_name, others_online};
-use crate::app::pages::{export_pgn, history_page, pgn_lines};
+use crate::app::local::{explain_review, step_back};
+use crate::app::pages::{export_pgn, history_page};
 use crate::app::parse::{nearby_moves, promotion_default};
 use crate::app::prompt::read_line;
 use crate::app::saves::{color_named, runtime_preferences};
@@ -61,24 +62,23 @@ pub(crate) fn random_clock_text() -> String {
     )
 }
 
-/// How an online session ended.
+/// How a game, local or online, ended.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Ended {
+    /// Ctrl+C, or the end of piped input: the program ends.
     Done,
-    /// The player stopped looking for a stranger before one turned up and
-    /// wants the menu again.
+    /// Back to the home page.
     Menu,
 }
 
 impl OnlineSession {
-    /// Giving up on finding a stranger goes back to the menu; leaving a game
-    /// ends the program, as it always has.
-    fn leaving(&self) -> Ended {
-        if self.intent == OnlineIntent::Find && self.game_id.is_none() {
-            Ended::Menu
-        } else {
-            Ended::Done
+    /// Back to the menu. A finished game's seat is of no more use, so the
+    /// menu stops offering to rejoin it.
+    fn leave(&self, game: &Game) -> Ended {
+        if outcome(game).is_some() {
+            let _ = storage::forget_online_seat(&self.seat_path);
         }
+        Ended::Menu
     }
 
     pub(crate) fn send(&self, command: ClientCommand, screen: &mut Screen) -> bool {
@@ -243,6 +243,7 @@ pub(crate) fn play_online(
         failure_help: None,
         seeking,
         lobby: None,
+        rematch_offer: None,
     });
     let _fullscreen = ui::Fullscreen::enter(&screen.theme);
     if screen.theme.live && !screen.theme.ascii {
@@ -320,10 +321,18 @@ pub(crate) fn play_online(
         let line = match action {
             InputAction::Submit(line) => {
                 if line.is_empty() && screen.focused != UiAction::MoveInput {
-                    if handle_online_action(screen.focused, &game, &session, &mut screen) {
-                        return Ok(session.leaving());
+                    let chosen = screen.focused;
+                    if handle_online_action(chosen, &game, &session, &mut screen) == After::Menu {
+                        return Ok(session.leave(&game));
                     }
                     continue;
+                }
+                // Enter on the board cursor does what a click would.
+                if line.is_empty() && screen.page.is_none() {
+                    if let Some(square) = screen.cursor {
+                        online_square_chosen(&session, &game, &mut screen, Some(square));
+                        continue;
+                    }
                 }
                 line
             }
@@ -337,12 +346,34 @@ pub(crate) fn play_online(
                 continue;
             }
             InputAction::Focus { reverse } => {
-                // Nothing on an open page can take focus, so the arrows and
-                // Tab move the page itself.
+                // Nothing on an open page can take focus, so Tab moves the
+                // page itself.
                 if screen.page.is_some() {
                     screen.scroll_page(reverse);
                 } else {
                     screen.move_focus(reverse);
+                }
+                continue;
+            }
+            InputAction::Arrow(direction) => {
+                if screen.page.is_some() {
+                    screen.scroll_page(direction.backwards());
+                } else if screen.reviewing.is_some() {
+                    screen.step_review(&game, direction.backwards());
+                } else if screen.focused != UiAction::MoveInput {
+                    screen.move_focus(direction.backwards());
+                } else {
+                    screen.move_cursor(&game, direction);
+                }
+                continue;
+            }
+            InputAction::Edge { end } => {
+                if screen.page.is_none() {
+                    if end {
+                        screen.end_review();
+                    } else if !game.sans.is_empty() {
+                        screen.review(&game, 0);
+                    }
                 }
                 continue;
             }
@@ -351,26 +382,24 @@ pub(crate) fn play_online(
                 continue;
             }
             InputAction::Tick => continue,
+            InputAction::WindowFocus(focused) => {
+                screen.window_focused = focused;
+                continue;
+            }
             InputAction::History { older } => {
-                // An open page is what the wheel and the paging keys are
-                // pointed at; the move list is underneath it.
+                if !screen.scroll_page(older) {
+                    screen.step_review(&game, older);
+                }
+                continue;
+            }
+            InputAction::Scroll { older } => {
                 if !screen.scroll_page(older) {
                     screen.scroll_history(&game, older);
                 }
                 continue;
             }
             InputAction::Cancel => {
-                let changed = screen.focus_move_input()
-                    || screen.page.take().is_some()
-                    || screen.selected.take().is_some()
-                    || screen.confirming.take().is_some()
-                    || !screen.promotions.is_empty();
-                screen.targets.clear();
-                screen.captures.clear();
-                screen.promotions.clear();
-                if changed {
-                    screen.redraw = true;
-                }
+                step_back(&mut screen);
                 continue;
             }
             InputAction::Click { column, row } => {
@@ -380,20 +409,19 @@ pub(crate) fn play_online(
                 }
                 if let Some(action) = screen.action_at(column, row) {
                     screen.focus(action);
-                    if handle_online_action(action, &game, &session, &mut screen) {
-                        return Ok(session.leaving());
+                    if handle_online_action(action, &game, &session, &mut screen) == After::Menu {
+                        return Ok(session.leave(&game));
                     }
                     continue;
                 }
-                screen.confirming = None;
-                let square = screen.square_at(column, row);
-                if online_can_move(&screen, &game) {
-                    if let Some(movement) = online_board_click(&game, &mut screen, square) {
-                        send_online_move(&session, &game, movement, &mut screen);
-                    }
-                } else {
-                    explain_online_wait(&game, &mut screen);
+                if let Some(ply) = screen.history_at(column, row) {
+                    screen.review(&game, ply);
+                    continue;
                 }
+                screen.confirming = None;
+                screen.cursor = None;
+                let square = screen.square_at(column, row);
+                online_square_chosen(&session, &game, &mut screen, square);
                 continue;
             }
             InputAction::Quit => return Ok(Ended::Done),
@@ -432,7 +460,13 @@ pub(crate) fn play_online(
             continue;
         }
         match word.as_str() {
-            "quit" | "exit" | "q" => return Ok(session.leaving()),
+            "quit" | "exit" | "q" | "menu" => {
+                if handle_online_action(UiAction::Menu, &game, &session, &mut screen) == After::Menu
+                {
+                    return Ok(session.leave(&game));
+                }
+                continue;
+            }
             "help" | "h" | "?" => {
                 screen.open("ONLINE GAME", online_help_lines(&screen.theme));
                 continue;
@@ -441,8 +475,25 @@ pub(crate) fn play_online(
                 screen.open("THE GAME SO FAR", history_page(&screen.theme, &game));
                 continue;
             }
+            "review" => {
+                start_review(&game, &mut screen);
+                continue;
+            }
+            "live" | "end" => {
+                screen.end_review();
+                continue;
+            }
+            "rematch" => {
+                let action = if rest.eq_ignore_ascii_case("decline") {
+                    UiAction::DeclineRematch
+                } else {
+                    UiAction::Rematch
+                };
+                handle_online_action(action, &game, &session, &mut screen);
+                continue;
+            }
             "pgn" => {
-                screen.open("PGN", pgn_lines(&game, &screen.player_names));
+                show_pgn(&game, &mut screen);
                 continue;
             }
             "export" => {
@@ -501,11 +552,35 @@ pub(crate) fn play_online(
             _ => {}
         }
 
+        if screen.reviewing.is_some() {
+            explain_review(&game, &mut screen);
+            continue;
+        }
         if !online_can_move(&screen, &game) {
             explain_online_wait(&game, &mut screen);
             continue;
         }
         request_online_move(&session, &game, input, &mut screen);
+    }
+}
+
+/// A square chosen by a click or by Enter on the cursor.
+fn online_square_chosen(
+    session: &OnlineSession,
+    game: &Game,
+    screen: &mut Screen,
+    square: Option<board::Square>,
+) {
+    if screen.reviewing.is_some() {
+        if square.is_some() {
+            explain_review(game, screen);
+        }
+    } else if online_can_move(screen, game) {
+        if let Some(movement) = online_board_click(game, screen, square) {
+            send_online_move(session, game, movement, screen);
+        }
+    } else if square.is_some() {
+        explain_online_wait(game, screen);
     }
 }
 
@@ -631,7 +706,6 @@ pub(crate) fn handle_transport_event(
                 game: snapshot,
                 side,
             } => {
-                session.game_id = Some(snapshot.game_id.clone());
                 session.reconnect_token = Some(reconnect_token);
                 // Servers before version 4 do not say, and a code seats Black.
                 session.side = side
@@ -639,23 +713,37 @@ pub(crate) fn handle_transport_event(
                     .or(session.side)
                     .or(Some(Color::Black));
                 let paired = screen.online.as_ref().is_some_and(|online| online.seeking);
+                // A new game while one is on the board is a rematch.
+                let rematch = session.has_snapshot
+                    && session.game_id.as_deref() != Some(snapshot.game_id.as_str());
+                session.game_id = Some(snapshot.game_id.clone());
                 if let Some(online) = &mut screen.online {
                     online.your_side = session.side;
                     online.seeking = false;
+                    online.invite_code = None;
+                    // A new seat starts with no offer of its own; an old one
+                    // would read as declined.
+                    online.rematch_offer = None;
                 }
-                if paired {
+                if paired || rematch {
                     screen.flipped = session.side == Some(Color::Black);
+                    screen.end_review();
+                    screen.cursor = None;
+                    screen.alert();
                 }
                 session.save_seat()?;
                 apply_online_snapshot(snapshot, session, game, screen, true)?;
-                match (paired, session.side) {
-                    (true, Some(side)) => {
+                match (paired, rematch, session.side) {
+                    (true, _, Some(side)) => {
                         let opponent = &screen.player_names[side.flip().index()];
                         screen.show(vec![screen.theme.good(&format!(
                             "Paired with {opponent}. You play {}.",
                             side.name()
                         ))]);
                     }
+                    (_, true, Some(side)) => screen.show(vec![screen
+                        .theme
+                        .good(&format!("Rematch: you play {}.", side.name()))]),
                     _ => screen.note(screen.theme.good("Connected to the game.")),
                 }
             }
@@ -691,11 +779,12 @@ pub(crate) fn handle_transport_event(
                         online.black_connected = false;
                     }
                 }
-                screen.note(
-                    screen
-                        .theme
-                        .warn("Your opponent disconnected. Their seat is held for 60 seconds."),
-                );
+                let note = if outcome(game).is_some() {
+                    "Your opponent has left."
+                } else {
+                    "Your opponent disconnected. Their seat is held for 60 seconds."
+                };
+                screen.note(screen.theme.warn(note));
             }
             ServerEvent::OpponentReconnected { .. } => {
                 if let Some(online) = &mut screen.online {
@@ -833,7 +922,24 @@ pub(crate) fn apply_online_snapshot(
     let finished_changed = outcome(&updated).is_some() != previous_finished;
 
     screen.player_names = [snapshot.white.name.clone(), snapshot.black.name.clone()];
+    let offer = snapshot.rematch_offer.map(Color::from);
+    let mut rematch_news = None;
     if let Some(online) = &mut screen.online {
+        let mine = online.your_side;
+        let opponent_here = mine.is_some_and(|side| match side.flip() {
+            Color::White => snapshot.white.connected,
+            Color::Black => snapshot.black.connected,
+        });
+        rematch_news = match (online.rematch_offer, offer) {
+            (previous, Some(side)) if previous != Some(side) && Some(side) != mine => {
+                Some("Your opponent asks for a rematch.")
+            }
+            (Some(side), None) if Some(side) == mine && opponent_here => {
+                Some("Your opponent declined the rematch.")
+            }
+            _ => None,
+        };
+        online.rematch_offer = offer;
         online.connection = ConnectionDisplay::Connected;
         online.your_side = session.side;
         online.white_connected = snapshot.white.connected;
@@ -858,8 +964,18 @@ pub(crate) fn apply_online_snapshot(
     }
     if play_move_sound {
         screen.sound.play(sound_after_move(game));
+        // A move from the other side brings a review back to the game, and
+        // calls a player whose window is elsewhere.
+        if session.side == Some(game.pos.side) {
+            screen.end_review();
+            screen.alert();
+        }
     } else if play_end_sound {
         screen.sound.play(sound::Cue::GameEnd);
+    }
+    if let Some(news) = rematch_news {
+        screen.show(vec![screen.theme.accent(news)]);
+        screen.alert();
     }
     screen.redraw = true;
     Ok(())
@@ -889,7 +1005,7 @@ pub(crate) fn handle_online_action(
     game: &Game,
     session: &OnlineSession,
     screen: &mut Screen,
-) -> bool {
+) -> After {
     match action {
         UiAction::MoveInput => {
             screen.focus_move_input();
@@ -910,13 +1026,79 @@ pub(crate) fn handle_online_action(
                 );
             }
         }
+        UiAction::Rematch => offer_rematch(session, game, screen),
+        UiAction::DeclineRematch => {
+            if let Some(game_id) = session.game_id.clone() {
+                session.send(ClientCommand::DeclineRematch { game_id }, screen);
+            }
+        }
+        UiAction::Review => start_review(game, screen),
+        UiAction::Pgn => show_pgn(game, screen),
+        UiAction::Menu => {
+            // Walking away from a game in progress loses it once the seat's
+            // minute is up, so that is asked about first.
+            let playing = session.game_id.is_some()
+                && outcome(game).is_none()
+                && screen
+                    .online
+                    .as_ref()
+                    .is_some_and(|online| !online.seeking && online.black_connected);
+            if !playing || screen.confirming == Some(UiAction::Menu) {
+                return After::Menu;
+            }
+            screen.confirming = Some(UiAction::Menu);
+            screen.focus(UiAction::Menu);
+            screen.note(screen.theme.warn(
+                "Leave? Your seat is held 60 seconds, then the game is lost. \
+                 Confirm leave, or Escape.",
+            ));
+        }
         UiAction::ToggleSize => toggle_size(screen),
         UiAction::CyclePieces => cycle_pieces(screen),
         UiAction::Flip => flip_board(screen),
-        UiAction::Quit => return true,
-        UiAction::Pause | UiAction::Undo | UiAction::Restart | UiAction::Rematch => {}
+        UiAction::Pause | UiAction::Undo | UiAction::Restart => {}
     }
-    false
+    After::Stay
+}
+
+/// Ask to play again, or accept the opponent's asking.
+pub(crate) fn offer_rematch(session: &OnlineSession, game: &Game, screen: &mut Screen) {
+    let Some(online) = &screen.online else {
+        return;
+    };
+    if outcome(game).is_none() {
+        screen.note(screen.theme.dim("A rematch comes after the game."));
+        return;
+    }
+    let opponent_here = online
+        .your_side
+        .is_some_and(|side| online.connected(side.flip()));
+    if !opponent_here {
+        screen.note(
+            screen
+                .theme
+                .dim("Your opponent has left, so there is no one to play again."),
+        );
+        return;
+    }
+    if online.rematch_offer.is_some() && online.rematch_offer == online.your_side {
+        screen.note(
+            screen
+                .theme
+                .dim("Your rematch offer is waiting for your opponent."),
+        );
+        return;
+    }
+    let accepting = online.rematch_offer.is_some();
+    if let Some(game_id) = session.game_id.clone() {
+        if session.send(ClientCommand::OfferRematch { game_id }, screen) && !accepting {
+            screen.note(
+                screen
+                    .theme
+                    .dim("Rematch offered. It starts when your opponent agrees."),
+            );
+        }
+    }
 }
 
 pub(crate) fn offer_or_accept_draw(session: &OnlineSession, game: &Game, screen: &mut Screen) {
@@ -1014,7 +1196,7 @@ pub(crate) fn explain_online_wait(game: &Game, screen: &mut Screen) {
     let message = if screen.online.as_ref().is_some_and(|online| online.seeking) {
         "No opponent yet. You start when someone else looks."
     } else if outcome(game).is_some() {
-        "The game is over. Export the PGN or quit when you are ready."
+        "The game is over. Choose Rematch, Review, PGN or Menu."
     } else if screen
         .online
         .as_ref()
@@ -1201,6 +1383,7 @@ pub(crate) fn online_preferences(
     preferences.clock_enabled = previous.clock_enabled;
     preferences.clock_minutes = previous.clock_minutes;
     preferences.increment_seconds = previous.increment_seconds;
+    preferences.engine_level = previous.engine_level.clone();
     preferences
 }
 
@@ -1208,12 +1391,18 @@ pub(crate) fn online_help_lines(theme: &Theme) -> Vec<String> {
     vec![
         theme.bold("PLAY"),
         "  Click a piece and a highlighted square, or type e4 / Nf3 / e2e4.".to_string(),
+        "  Or move the cursor with the arrow keys; Enter picks up and puts down.".to_string(),
+        "  PgUp and PgDn step back through the game; End returns to it.".to_string(),
         "  The server validates every move and owns both clocks.".to_string(),
         String::new(),
         theme.bold("GAME"),
         "  draw             offer or accept a draw".to_string(),
         "  draw decline     decline the current draw offer".to_string(),
         "  resign           resign the game".to_string(),
+        "  rematch          after the game, offer or accept another".to_string(),
+        "  rematch decline  turn the other player's offer down".to_string(),
+        "  review           look back through the game; End returns".to_string(),
+        "  menu             back to the menu".to_string(),
         "  history · pgn · export [FILE] · fen".to_string(),
         String::new(),
         theme.bold("VIEW"),

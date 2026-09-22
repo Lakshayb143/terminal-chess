@@ -2,9 +2,10 @@
 
 use std::io::{self, Write};
 
+use chess::input::Direction;
 use chess::ui::{BoardView, Theme};
 use chess::{sound, ui};
-use chess_core::board::{self, Color, Move, Piece, PieceKind};
+use chess_core::board::{self, Color, Move, Piece, PieceKind, Position};
 use chess_core::game::{describe, outcome, outcome_detail, score_tag, Game, Outcome};
 use chess_core::movegen::in_check;
 use chess_core::search::Limits;
@@ -12,6 +13,7 @@ use chess_protocol::Lobby;
 
 use crate::app::cli::{Mode, Options};
 use crate::app::format::{budget_text, material, others_online};
+use crate::app::settings::Level;
 
 pub(crate) struct Screen {
     pub(crate) theme: Theme,
@@ -86,6 +88,35 @@ pub(crate) struct Screen {
     pub(crate) last_prompt: Option<String>,
     pub(crate) redraw: bool,
     pub(crate) online: Option<OnlineDisplay>,
+    /// The square the arrow keys have put the board cursor on, while it is
+    /// shown. Enter on it does what a click there would.
+    pub(crate) cursor: Option<board::Square>,
+    /// An earlier position of the game, shown instead of the live one.
+    pub(crate) reviewing: Option<Reviewing>,
+    /// Moves in the list beside the board, which a click shows.
+    pub(crate) history_hits: Vec<HistoryHit>,
+    /// Whether the terminal window has the focus, as far as it has said.
+    /// Terminals that never say are taken to have it.
+    pub(crate) window_focused: bool,
+    /// The window title last set, so it is sent only when it changes.
+    pub(crate) title: Option<String>,
+}
+
+/// A position from earlier in the game, while the player looks back.
+pub(crate) struct Reviewing {
+    /// How many moves had been played: 0 is the starting position.
+    pub(crate) ply: usize,
+    pub(crate) pos: Position,
+    pub(crate) last: Option<Move>,
+}
+
+/// A move in the list, and the position after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryHit {
+    pub(crate) left: usize,
+    pub(crate) row: usize,
+    pub(crate) width: usize,
+    pub(crate) ply: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +140,8 @@ pub(crate) struct OnlineDisplay {
     pub(crate) seeking: bool,
     /// Who else is around, as the server last said.
     pub(crate) lobby: Option<Lobby>,
+    /// Who has offered to play again once the game is over.
+    pub(crate) rematch_offer: Option<Color>,
 }
 
 impl OnlineDisplay {
@@ -148,7 +181,13 @@ pub(crate) enum UiAction {
     CyclePieces,
     Flip,
     Rematch,
-    Quit,
+    DeclineRematch,
+    /// Look back through the game from its first move.
+    Review,
+    /// Show the game as PGN, to copy.
+    Pgn,
+    /// Back to the home page.
+    Menu,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +228,7 @@ pub(crate) struct RenderedBody {
     pub(crate) actions: Vec<RelativeAction>,
     pub(crate) clocks: Vec<ClockRow>,
     pub(crate) history_capacity: usize,
+    pub(crate) history: Vec<HistoryHit>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -202,6 +242,7 @@ pub(crate) struct InlineBoardKey {
     pub(crate) captures: Vec<board::Square>,
     pub(crate) invalid: Option<board::Square>,
     pub(crate) promotions: Vec<(board::Square, Piece)>,
+    pub(crate) cursor: Option<board::Square>,
     pub(crate) palette: ui::Palette,
     pub(crate) metrics: ui::Metrics,
     pub(crate) left: usize,
@@ -297,6 +338,11 @@ impl Screen {
             last_prompt: None,
             redraw: true,
             online: None,
+            cursor: None,
+            reviewing: None,
+            history_hits: Vec::new(),
+            window_focused: true,
+            title: None,
         }
     }
 
@@ -469,6 +515,12 @@ impl Screen {
             } else {
                 &["return goes back", "return"]
             }
+        } else if self.reviewing.is_some() {
+            &[
+                "PgUp/PgDn or arrows step  ·  End back to the game",
+                "arrows step  ·  End returns",
+                "End returns",
+            ]
         } else if outcome(game).is_some() {
             &[
                 "Tab moves focus  ·  Enter selects  ·  type a command",
@@ -515,6 +567,7 @@ impl Screen {
         self.board_hitbox = None;
         self.action_hitboxes.clear();
         self.clock_rows.clear();
+        self.history_hits.clear();
         // Settle how much of an open page is in view before anything asks.
         let page_lines = self.page.as_ref().map(|page| page.lines.len());
         match page_lines {
@@ -539,6 +592,7 @@ impl Screen {
                 actions: Vec::new(),
                 clocks: Vec::new(),
                 history_capacity: 0,
+                history: Vec::new(),
             },
             None => self.board_body(game, mode, limits),
         };
@@ -547,8 +601,10 @@ impl Screen {
             actions,
             clocks,
             history_capacity,
+            history,
         } = rendered;
         self.history_capacity = history_capacity;
+        self.set_title(game, mode);
 
         if !self.theme.live || !self.theme.color {
             println!();
@@ -602,6 +658,13 @@ impl Screen {
                     ..card
                 })
                 .collect();
+            self.history_hits = history
+                .into_iter()
+                .map(|hit| HistoryHit {
+                    row: body_start + hit.row,
+                    ..hit
+                })
+                .collect();
         }
         frame.extend(body);
         // Pad down the window so the prompt always sits on the bottom row.
@@ -610,25 +673,28 @@ impl Screen {
         }
         frame.truncate(self.rows.saturating_sub(1));
 
-        let inline_key = wants_inline_board.then(|| InlineBoardKey {
-            position: game.pos.hash,
-            flipped: self.flipped,
-            last: game.last_move(),
-            check: in_check(&game.pos, game.pos.side)
-                .then_some(game.pos.king[game.pos.side.index()]),
-            selected: self.selected,
-            targets: self.targets.clone(),
-            captures: self.captures.clone(),
-            invalid: self.invalid,
-            promotions: self
-                .promotions
-                .iter()
-                .map(|choice| (choice.square, choice.piece))
-                .collect(),
-            palette: self.theme.palette,
-            metrics: self.metrics,
-            left: self.indent.len() + ui::GUTTER,
-            top: body_start + 1,
+        let inline_key = wants_inline_board.then(|| {
+            let view = self.board_view(game);
+            InlineBoardKey {
+                position: view.pos.hash,
+                flipped: view.flipped,
+                last: view.last,
+                check: view.check,
+                selected: view.selected,
+                targets: view.targets.to_vec(),
+                captures: view.captures.to_vec(),
+                invalid: view.invalid,
+                promotions: view
+                    .promotions
+                    .iter()
+                    .map(|choice| (choice.square, choice.piece))
+                    .collect(),
+                cursor: view.cursor,
+                palette: self.theme.palette,
+                metrics: self.metrics,
+                left: self.indent.len() + ui::GUTTER,
+                top: body_start + 1,
+            }
         });
         let image_changed = inline_key != self.last_inline_board;
         let next_frame: Vec<String> = frame.iter().map(|line| ui::clip(line, self.cols)).collect();
@@ -719,7 +785,8 @@ impl Screen {
     /// avoids retransmitting an inline board image once a second, and it
     /// repaints the rows the last frame really drew, so a window too small
     /// for the player cards has nothing written over.
-    pub(crate) fn draw_clock_tick(&self, game: &Game, mode: Mode, limits: &Limits) {
+    pub(crate) fn draw_clock_tick(&mut self, game: &Game, mode: Mode, limits: &Limits) {
+        self.set_title(game, mode);
         if !self.theme.live || !self.theme.color || self.page.is_some() {
             return;
         }
@@ -741,6 +808,21 @@ impl Screen {
     }
 
     pub(crate) fn board_view<'a>(&'a self, game: &'a Game) -> BoardView<'a> {
+        if let Some(reviewing) = &self.reviewing {
+            let pos = &reviewing.pos;
+            return BoardView {
+                pos,
+                flipped: self.flipped,
+                last: reviewing.last,
+                check: in_check(pos, pos.side).then(|| pos.king[pos.side.index()]),
+                selected: None,
+                targets: &[],
+                captures: &[],
+                invalid: None,
+                promotions: &[],
+                cursor: None,
+            };
+        }
         let pos = &game.pos;
         BoardView {
             pos,
@@ -756,6 +838,7 @@ impl Screen {
             captures: &self.captures,
             invalid: self.invalid,
             promotions: &self.promotions,
+            cursor: self.cursor,
         }
     }
 
@@ -781,6 +864,157 @@ impl Screen {
 
     pub(crate) fn focus_move_input(&mut self) -> bool {
         self.focus(UiAction::MoveInput)
+    }
+
+    // -- looking back through the game --------------------------------------
+
+    /// Show the position after `ply` moves, or the live game when `ply` is
+    /// the number played so far or more.
+    pub(crate) fn review(&mut self, game: &Game, ply: usize) {
+        self.redraw = true;
+        if ply >= game.sans.len() {
+            self.reviewing = None;
+            return;
+        }
+        let mut pos = game.start.clone();
+        for undo in &game.undos[..ply] {
+            pos.make_move(undo.mv);
+        }
+        self.clear_marks();
+        self.cursor = None;
+        self.reviewing = Some(Reviewing {
+            ply,
+            pos,
+            last: ply.checked_sub(1).map(|last| game.undos[last].mv),
+        });
+    }
+
+    /// One move back or on from where the review is, starting from the live
+    /// position. Stepping on past the last move returns to the game.
+    pub(crate) fn step_review(&mut self, game: &Game, back: bool) {
+        let here = self
+            .reviewing
+            .as_ref()
+            .map_or(game.sans.len(), |reviewing| reviewing.ply);
+        if back && here == 0 {
+            return;
+        }
+        let next = if back { here - 1 } else { here + 1 };
+        if self.reviewing.is_none() && !back {
+            return;
+        }
+        self.review(game, next);
+    }
+
+    /// Back to the live game. Returns whether there was a review to leave.
+    pub(crate) fn end_review(&mut self) -> bool {
+        let reviewing = self.reviewing.take().is_some();
+        if reviewing {
+            // Whatever was said was about the position that has gone.
+            self.message.clear();
+            self.redraw = true;
+        }
+        reviewing
+    }
+
+    /// The move in the list at a clicked cell, as the position after it.
+    pub(crate) fn history_at(&self, column: u16, row: u16) -> Option<usize> {
+        let (column, row) = (usize::from(column), usize::from(row));
+        self.history_hits
+            .iter()
+            .find(|hit| hit.row == row && column >= hit.left && column < hit.left + hit.width)
+            .map(|hit| hit.ply)
+    }
+
+    // -- the board cursor -----------------------------------------------------
+
+    /// Show the cursor, or move it one square in `direction` as the board is
+    /// drawn, so up is always up the screen.
+    pub(crate) fn move_cursor(&mut self, game: &Game, direction: Direction) {
+        self.redraw = true;
+        let Some(square) = self.cursor else {
+            // It starts where the eye already is: the piece being moved, the
+            // move just played, or the king's pawn.
+            let home = if game.pos.side == Color::White {
+                board::sq(4, 1)
+            } else {
+                board::sq(4, 6)
+            };
+            self.cursor = Some(
+                self.selected
+                    .or_else(|| game.last_move().map(|mv| mv.to))
+                    .unwrap_or(home),
+            );
+            return;
+        };
+        let (file, rank) = (board::file_of(square) as i8, board::rank_of(square) as i8);
+        let toward = if self.flipped { -1 } else { 1 };
+        let (file, rank) = match direction {
+            Direction::Up => (file, rank + toward),
+            Direction::Down => (file, rank - toward),
+            Direction::Left => (file - toward, rank),
+            Direction::Right => (file + toward, rank),
+        };
+        self.cursor = Some(board::sq(file.clamp(0, 7) as u8, rank.clamp(0, 7) as u8));
+    }
+
+    // -- the window around the game -----------------------------------------
+
+    /// What the terminal window's title says: whose move it is, so a game
+    /// in a window behind others can still be followed.
+    pub(crate) fn title_text(&self, game: &Game, mode: Mode) -> String {
+        let state = if let Some(result) = outcome(game) {
+            format!(
+                "Game over, {} · {}",
+                score_tag(game),
+                outcome_detail(&result)
+            )
+        } else if game.paused {
+            "Paused".to_string()
+        } else if let Some(online) = &self.online {
+            if online.seeking {
+                "Finding an opponent".to_string()
+            } else if online.invite_code.is_some() && !online.black_connected {
+                "Waiting for your friend".to_string()
+            } else if online.your_side == Some(game.pos.side) {
+                match game.clock.initial {
+                    Some(_) => format!("Your move · {}", game.clock.format(game.pos.side)),
+                    None => "Your move".to_string(),
+                }
+            } else {
+                "Opponent's move".to_string()
+            }
+        } else {
+            match mode.human() {
+                Some(side) if side == game.pos.side => "Your move".to_string(),
+                Some(_) => "Engine's move".to_string(),
+                None => format!("{} to move", game.pos.side.name()),
+            }
+        };
+        format!("{state} \u{2014} chess")
+    }
+
+    /// Set the window title if it changed. Terminals keep the title they had
+    /// before on a stack, which [`ui::Fullscreen`] pops on the way out.
+    pub(crate) fn set_title(&mut self, game: &Game, mode: Mode) {
+        if !self.theme.live || !self.theme.color {
+            return;
+        }
+        let title = self.title_text(game, mode);
+        if self.title.as_deref() != Some(title.as_str()) {
+            print!("\x1b]2;{title}\x07");
+            let _ = io::stdout().flush();
+            self.title = Some(title);
+        }
+    }
+
+    /// Ring the terminal's bell, but only while the window is behind others:
+    /// a player watching the board needs no bell to see a move arrive.
+    pub(crate) fn alert(&self) {
+        if self.theme.live && !self.window_focused {
+            print!("\x07");
+            let _ = io::stdout().flush();
+        }
     }
 
     /// Traverse only controls that are enabled in the current frame. The
@@ -831,6 +1065,7 @@ impl Screen {
         let tight = ui::tight(self.rows);
         let mut actions = Vec::new();
         let mut clocks = Vec::new();
+        let mut history = Vec::new();
         let history_capacity;
 
         let mut lines = if self.wide_panel {
@@ -846,6 +1081,10 @@ impl Screen {
             clocks.extend(panel.clocks.into_iter().map(|card| ClockRow {
                 left: panel_left + card.left,
                 ..card
+            }));
+            history.extend(panel.history.into_iter().map(|hit| HistoryHit {
+                left: panel_left + hit.left,
+                ..hit
             }));
             history_capacity = panel.history_capacity;
             ui::beside(&board, &panel.lines, m.board_width(), self.gap())
@@ -932,6 +1171,7 @@ impl Screen {
             actions,
             clocks,
             history_capacity,
+            history,
         }
     }
 
@@ -1057,6 +1297,7 @@ impl Screen {
                 actions: Vec::new(),
                 clocks: Vec::new(),
                 history_capacity: 0,
+                history: Vec::new(),
             };
         }
         let top = if self.flipped {
@@ -1075,7 +1316,7 @@ impl Screen {
         // still running or already decided, so nothing jumps under the mouse
         // at the moment a game ends.
         let buttons = match finished {
-            Some(_) => self.render_buttons(&self.game_over_buttons(), width),
+            Some(_) => self.render_buttons(&self.game_over_buttons(game), width),
             None => self.render_buttons(&self.game_buttons(game, mode), width),
         };
         let button_start = height.saturating_sub(buttons.lines.len() + 3);
@@ -1123,6 +1364,7 @@ impl Screen {
                 result_rows.push(self.theme.dim(&detail));
                 result_rows.push(self.theme.accent(score));
             }
+            result_rows.push(self.theme.dim(&game_length(game)));
             for (offset, line) in result_rows.into_iter().enumerate() {
                 if 3 + offset < button_start {
                     rows[3 + offset] = line;
@@ -1139,16 +1381,26 @@ impl Screen {
             first = 2;
             history_capacity = button_start.saturating_sub(first + 1);
         }
+        let mut history = Vec::new();
         if history_capacity > 0 {
-            let played = history_lines(game);
-            rows[first] = self.history_heading(played.len(), history_capacity);
-            let (start, end) = self.history_bounds(played.len(), history_capacity);
+            let played = history_rows(game);
+            let (start, end) = self.history_window(game, played.len(), history_capacity);
+            rows[first] = self.history_heading(played.len(), start, end);
+            let reviewed = self.reviewing.as_ref().map(|reviewing| reviewing.ply);
             for (i, line) in played[start..end].iter().enumerate() {
-                rows[first + 1 + i] = if self.history_offset == 0 && i + 1 == end - start {
-                    self.theme.bold(line)
-                } else {
-                    self.theme.dim(line)
-                };
+                let latest = reviewed.is_none() && self.history_offset == 0 && i + 1 == end - start;
+                let row = first + 1 + i;
+                rows[row] = self.history_row(line, reviewed, latest);
+                for (left, hit_width, ply) in line.targets() {
+                    if left < width {
+                        history.push(HistoryHit {
+                            left,
+                            row,
+                            width: hit_width.min(width - left),
+                            ply,
+                        });
+                    }
+                }
             }
         }
 
@@ -1170,6 +1422,7 @@ impl Screen {
                 },
             ],
             history_capacity,
+            history,
         }
     }
 
@@ -1192,6 +1445,7 @@ impl Screen {
                 actions: Vec::new(),
                 clocks: Vec::new(),
                 history_capacity: 0,
+                history: Vec::new(),
             };
         }
         let mut lines = vec![
@@ -1202,27 +1456,27 @@ impl Screen {
         // Controls may run wider than the board: below it there is nothing
         // to line up with, and a row saved here is a row of chess.
         let buttons = if outcome(game).is_some() {
-            self.render_buttons(&self.game_over_buttons(), outer_width.max(width))
+            self.render_buttons(&self.game_over_buttons(game), outer_width.max(width))
         } else {
             self.render_buttons(&self.game_buttons(game, mode), outer_width.max(width))
         };
         let mut history_capacity = 0;
         if budget > lines.len() + buttons.lines.len() {
-            if let Some(result) = outcome(game) {
+            if let (Some(result), None) = (outcome(game), &self.reviewing) {
                 lines.push(self.theme.strong(
                     self.theme.palette.accent,
                     &format!("GAME OVER  {}", describe(&result)),
                 ));
             } else {
                 let played = history_lines(game);
-                let (start, end) = self.history_bounds(played.len(), 1);
+                let (start, end) = self.history_window(game, played.len(), 1);
                 let history = played
                     .get(start..end)
                     .and_then(|slice| slice.first())
                     .map(String::as_str)
                     .unwrap_or("No moves yet");
                 let heading = if played.len() > 1 {
-                    "MOVES ↑↓"
+                    "MOVES PgUp"
                 } else {
                     "MOVES"
                 };
@@ -1271,6 +1525,7 @@ impl Screen {
                 },
             ],
             history_capacity,
+            history: Vec::new(),
         }
     }
 
@@ -1303,11 +1558,9 @@ impl Screen {
         let mut role = match player {
             _ if width < 30 => String::new(),
             "Engine" if width >= 34 => {
-                format!(
-                    "{} · {}",
-                    color.name().to_ascii_uppercase(),
-                    budget_text(limits)
-                )
+                let strength = Level::of(limits)
+                    .map_or_else(|| budget_text(limits), |level| level.label().to_string());
+                format!("{} · {}", color.name().to_ascii_uppercase(), strength)
             }
             _ => color.name().to_ascii_uppercase(),
         };
@@ -1389,17 +1642,71 @@ impl Screen {
         (end.saturating_sub(capacity), end)
     }
 
-    pub(crate) fn history_heading(&self, len: usize, capacity: usize) -> String {
+    /// The lines of the move list in view: where the list has been scrolled
+    /// to, moved if need be so that the move being reviewed is among them.
+    pub(crate) fn history_window(
+        &self,
+        game: &Game,
+        len: usize,
+        capacity: usize,
+    ) -> (usize, usize) {
+        let (start, end) = self.history_bounds(len, capacity);
+        let Some(line) = self
+            .reviewing
+            .as_ref()
+            .and_then(|reviewing| reviewing.ply.checked_sub(1))
+            .map(|index| line_of_move(game, index))
+        else {
+            return (start, end);
+        };
+        let shown = capacity.min(len);
+        if line < start {
+            (line, line + shown)
+        } else if line >= end {
+            (line + 1 - shown, line + 1)
+        } else {
+            (start, end)
+        }
+    }
+
+    pub(crate) fn history_heading(&self, len: usize, start: usize, end: usize) -> String {
         if len == 0 {
             return self.theme.label("NO MOVES YET");
         }
-        let (start, end) = self.history_bounds(len, capacity);
-        let range = if len > capacity {
-            format!("  {}-{} / {}  ↑↓", start + 1, end, len)
+        let range = if end - start < len {
+            format!("  {}-{} / {}  PgUp", start + 1, end, len)
         } else {
             String::new()
         };
         format!("{}{}", self.theme.label("MOVES"), self.theme.dim(&range))
+    }
+
+    /// One line of the move list, the move under review picked out.
+    fn history_row(&self, row: &MoveRow, reviewed: Option<usize>, latest: bool) -> String {
+        let style = |san: &str, ply: usize| {
+            if reviewed == Some(ply) {
+                self.theme.focused(self.theme.palette.accent, san)
+            } else if latest {
+                self.theme.bold(san)
+            } else {
+                self.theme.dim(san)
+            }
+        };
+        let number = format!("{:>3}. ", row.number);
+        let number = if latest {
+            self.theme.bold(&number)
+        } else {
+            self.theme.dim(&number)
+        };
+        let white = match &row.white {
+            Some((ply, san)) => style(san, *ply),
+            None => self.theme.dim("..."),
+        };
+        let mut line = format!("{}{}", number, ui::pad(&white, 7));
+        if let Some((ply, san)) = &row.black {
+            line.push_str(&style(san, *ply));
+        }
+        line
     }
 
     pub(crate) fn game_buttons(&self, game: &Game, mode: Mode) -> Vec<ButtonSpec> {
@@ -1459,6 +1766,15 @@ impl Screen {
                 self.flip_button(),
                 self.size_button(),
                 self.pieces_button(),
+                ButtonSpec {
+                    action: UiAction::Menu,
+                    label: if self.confirming == Some(UiAction::Menu) {
+                        "Confirm leave"
+                    } else {
+                        "Menu"
+                    },
+                    enabled: true,
+                },
             ]);
             return buttons;
         }
@@ -1504,42 +1820,68 @@ impl Screen {
             self.flip_button(),
             self.size_button(),
             self.pieces_button(),
+            ButtonSpec {
+                action: UiAction::Menu,
+                label: "Menu",
+                enabled: true,
+            },
         ]
     }
 
-    pub(crate) fn game_over_buttons(&self) -> Vec<ButtonSpec> {
-        if self.online.is_some() {
-            return vec![
-                ButtonSpec {
-                    action: UiAction::Quit,
-                    label: "Quit",
-                    enabled: true,
-                },
-                self.flip_button(),
-                self.size_button(),
-                self.pieces_button(),
-            ];
-        }
-        vec![
-            ButtonSpec {
-                action: UiAction::MoveInput,
-                label: "Move",
-                enabled: true,
-            },
-            ButtonSpec {
+    /// The summary's actions: play again, look back, keep the game, leave.
+    pub(crate) fn game_over_buttons(&self, game: &Game) -> Vec<ButtonSpec> {
+        let mut buttons = Vec::new();
+        match &self.online {
+            Some(online) => {
+                let opponent_here = online.your_side.is_some_and(|side| {
+                    online.connection == ConnectionDisplay::Connected
+                        && online.connected(side.flip())
+                });
+                let (label, enabled) = match online.rematch_offer {
+                    Some(side) if Some(side) == online.your_side => ("Rematch offered", false),
+                    Some(_) => ("Accept rematch", opponent_here),
+                    None => ("Rematch", opponent_here),
+                };
+                buttons.push(ButtonSpec {
+                    action: UiAction::Rematch,
+                    label,
+                    enabled,
+                });
+                if online.rematch_offer.is_some() && online.rematch_offer != online.your_side {
+                    buttons.push(ButtonSpec {
+                        action: UiAction::DeclineRematch,
+                        label: "Decline",
+                        enabled: opponent_here,
+                    });
+                }
+            }
+            None => buttons.push(ButtonSpec {
                 action: UiAction::Rematch,
                 label: "Rematch",
                 enabled: true,
+            }),
+        }
+        buttons.extend([
+            ButtonSpec {
+                action: UiAction::Review,
+                label: "Review",
+                enabled: !game.sans.is_empty(),
             },
             ButtonSpec {
-                action: UiAction::Quit,
-                label: "Quit",
+                action: UiAction::Pgn,
+                label: "PGN",
+                enabled: true,
+            },
+            ButtonSpec {
+                action: UiAction::Menu,
+                label: "Menu",
                 enabled: true,
             },
             self.flip_button(),
             self.size_button(),
             self.pieces_button(),
-        ]
+        ]);
+        buttons
     }
 
     /// Turning the board round is the one view control a game at a shared
@@ -1626,16 +1968,34 @@ impl Screen {
             actions,
             clocks: Vec::new(),
             history_capacity: 0,
+            history: Vec::new(),
         }
     }
 
     pub(crate) fn state_line(&self, game: &Game) -> String {
         let theme = &self.theme;
-        if let Some(result) = outcome(game) {
-            let next = if self.online.is_some() {
-                "export PGN or quit"
+        if let Some(reviewing) = &self.reviewing {
+            let arrows = if theme.ascii {
+                "PgUp/PgDn"
             } else {
-                "choose Rematch or Quit"
+                "\u{2190}\u{2192}"
+            };
+            // Moves keep their own case: SAN reads B as a bishop, b as a file.
+            return format!(
+                "{} {}  {}",
+                theme.strong(theme.palette.accent, "VIEWING"),
+                theme.bold(&move_name(game, reviewing.ply)),
+                theme.dim(&format!("{arrows} step · End back to the game"))
+            );
+        }
+        if let Some(result) = outcome(game) {
+            let wanted = self.online.as_ref().is_some_and(|online| {
+                online.rematch_offer.is_some() && online.rematch_offer != online.your_side
+            });
+            let next = if wanted {
+                "your opponent asks for a rematch"
+            } else {
+                "Rematch, Review, PGN or Menu"
             };
             return format!(
                 "{}  {}",
@@ -1746,7 +2106,9 @@ impl Screen {
 
     pub(crate) fn prompt(&self, game: &Game) -> String {
         let arrow = if self.theme.ascii { ">" } else { "\u{203a}" };
-        let label = if outcome(game).is_some() {
+        let label = if self.reviewing.is_some() {
+            "Viewing"
+        } else if outcome(game).is_some() {
             "Game over"
         } else if self
             .online
@@ -1811,28 +2173,100 @@ pub(crate) fn changed_frame_rows(
         .collect()
 }
 
-/// `1. e4 e5` lines, one per move pair, from whatever side started.
-pub(crate) fn history_lines(game: &Game) -> Vec<String> {
-    let mut lines = Vec::new();
+/// One line of the move list: a move number, and the moves made under it,
+/// each with the number of moves played once it was made.
+pub(crate) struct MoveRow {
+    pub(crate) number: u32,
+    pub(crate) white: Option<(usize, String)>,
+    pub(crate) black: Option<(usize, String)>,
+}
+
+impl MoveRow {
+    /// Where each move sits on its line, as `(column, width, ply)`: the
+    /// number goes with White's move, so a click anywhere on the left half
+    /// finds it.
+    pub(crate) fn targets(&self) -> Vec<(usize, usize, usize)> {
+        const BLACK_COLUMN: usize = 12;
+        let mut targets = Vec::new();
+        if let Some((ply, _)) = &self.white {
+            targets.push((0, BLACK_COLUMN, *ply));
+        }
+        if let Some((ply, san)) = &self.black {
+            targets.push((BLACK_COLUMN, ui::width(san) + 1, *ply));
+        }
+        targets
+    }
+}
+
+/// The move list, one line per move number, from whatever side started.
+pub(crate) fn history_rows(game: &Game) -> Vec<MoveRow> {
+    let mut rows: Vec<MoveRow> = Vec::new();
     let mut number = game.start.fullmove;
     let mut side = game.start.side;
-    let mut line = String::new();
-    for text in &game.sans {
+    for (index, text) in game.sans.iter().enumerate() {
+        let entry = Some((index + 1, text.clone()));
         if side == Color::White {
-            line = format!("{:>3}. {:<7}", number, text);
+            rows.push(MoveRow {
+                number,
+                white: entry,
+                black: None,
+            });
         } else {
-            if line.is_empty() {
-                line = format!("{:>3}. {:<7}", number, "...");
+            match rows.last_mut() {
+                Some(row) if row.number == number && row.black.is_none() => row.black = entry,
+                _ => rows.push(MoveRow {
+                    number,
+                    white: None,
+                    black: entry,
+                }),
             }
-            line.push_str(text);
             number += 1;
-            lines.push(line.trim_end().to_string());
-            line.clear();
         }
         side = side.flip();
     }
-    if !line.is_empty() {
-        lines.push(line.trim_end().to_string());
+    rows
+}
+
+/// Which line of the move list the move at `index` is on.
+pub(crate) fn line_of_move(game: &Game, index: usize) -> usize {
+    // A game that began with Black to move has its first line to itself.
+    let offset = usize::from(game.start.side == Color::Black);
+    (index + offset) / 2
+}
+
+/// `14... Nf6`, the move that led to the position after `ply` moves.
+pub(crate) fn move_name(game: &Game, ply: usize) -> String {
+    let Some(index) = ply.checked_sub(1) else {
+        return "the start".to_string();
+    };
+    let offset = usize::from(game.start.side == Color::Black);
+    let number = game.start.fullmove as usize + (index + offset) / 2;
+    let dots = if (index + offset) % 2 == 0 {
+        "."
+    } else {
+        "..."
+    };
+    format!("{number}{dots} {}", game.sans[index])
+}
+
+/// `38 moves`, counting a move by each side as one.
+pub(crate) fn game_length(game: &Game) -> String {
+    match game.sans.len().div_ceil(2) {
+        1 => "1 move".to_string(),
+        moves => format!("{moves} moves"),
     }
-    lines
+}
+
+/// `1. e4 e5` lines, one per move pair, from whatever side started.
+pub(crate) fn history_lines(game: &Game) -> Vec<String> {
+    history_rows(game)
+        .iter()
+        .map(|row| {
+            let white = row.white.as_ref().map_or("...", |(_, san)| san.as_str());
+            let black = row.black.as_ref().map_or("", |(_, san)| san.as_str());
+            format!("{:>3}. {:<7}{}", row.number, white, black)
+                .trim_end()
+                .to_string()
+        })
+        .collect()
 }

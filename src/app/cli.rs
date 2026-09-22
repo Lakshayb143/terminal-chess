@@ -1,10 +1,12 @@
 //! Command-line options and the help text.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chess::{sound, storage, ui};
 use chess_core::search::{self, Limits};
+
+use crate::app::settings::Level;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -30,6 +32,37 @@ impl Mode {
             "black" => Some(Mode::HumanBlack),
             "two" => Some(Mode::TwoPlayer),
             _ => None,
+        }
+    }
+
+    /// White or Black against the engine, drawn at random.
+    pub(crate) fn either_side() -> Mode {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |time| time.subsec_nanos());
+        // The low bits of a clock reading are the ones that vary.
+        if (nanos / 1_000).is_multiple_of(2) {
+            Mode::HumanWhite
+        } else {
+            Mode::HumanBlack
+        }
+    }
+
+    /// The side the human has, or `None` in a two-player game.
+    pub(crate) fn human(self) -> Option<chess_core::board::Color> {
+        match self {
+            Mode::HumanWhite => Some(chess_core::board::Color::White),
+            Mode::HumanBlack => Some(chess_core::board::Color::Black),
+            Mode::TwoPlayer => None,
+        }
+    }
+
+    /// The same game with the colours the other way round.
+    pub(crate) fn swapped(self) -> Mode {
+        match self {
+            Mode::HumanWhite => Mode::HumanBlack,
+            Mode::HumanBlack => Mode::HumanWhite,
+            Mode::TwoPlayer => Mode::TwoPlayer,
         }
     }
 }
@@ -126,8 +159,12 @@ USAGE:
 GAME:
     -w, --white          play White against the engine (asked for if omitted)
     -b, --black          play Black against the engine
+    -r, --random         play a side drawn at random against the engine
     -2, --two            two players at one keyboard, no engine
-    -t, --time <SECS>    seconds the engine may think per move (default: 3)
+    -l, --level <NAME>   engine strength: beginner, casual, club or strong
+                         (default: casual, or what Settings last chose)
+    -t, --time <SECS>    seconds the engine may think per move, at full
+                         strength, instead of a level
     -d, --depth <N>      cap the search depth; without --time, search to
                          exactly this depth however long it takes
         --clock <MINS>   starting time for each player (default: 10)
@@ -180,6 +217,8 @@ impl Options {
         let mut options = Options {
             mode: None,
             fen: None,
+            // Full strength, for --time and --depth to adjust; a level
+            // replaces it below when neither is given.
             limits: Limits::default(),
             ascii: false,
             color: None,
@@ -206,6 +245,8 @@ impl Options {
         // Tracked so that `--depth` alone means "this depth, no clock", while
         // `--depth` with `--time` means "this depth, but stop when time runs out".
         let mut timed = false;
+        let mut searched = false;
+        let mut level = None;
         let mut args = args.peekable();
 
         while let Some(arg) = args.next() {
@@ -219,6 +260,14 @@ impl Options {
                 }
                 "-w" | "--white" => options.mode = Some(Mode::HumanWhite),
                 "-b" | "--black" => options.mode = Some(Mode::HumanBlack),
+                "-r" | "--random" => options.mode = Some(Mode::either_side()),
+                "-l" | "--level" => {
+                    let name = value("--level")?;
+                    level = Some(Level::named(&name).ok_or(format!(
+                        "--level wants beginner, casual, club or strong, not '{}'",
+                        name
+                    ))?);
+                }
                 "-2" | "--two" => options.mode = Some(Mode::TwoPlayer),
                 "--ascii" => options.ascii = true,
                 "--compact" | "--small" => options.compact = true,
@@ -258,6 +307,7 @@ impl Options {
                             .map_err(|_| format!("--time {} is too long", text))?,
                     );
                     timed = true;
+                    searched = true;
                 }
                 "-d" | "--depth" => {
                     let text = value("--depth")?;
@@ -271,6 +321,7 @@ impl Options {
                     if !timed {
                         options.limits.movetime = None;
                     }
+                    searched = true;
                 }
                 "--clock" => {
                     let text = value("--clock")?;
@@ -321,6 +372,18 @@ impl Options {
         // `--time` after `--depth` has to put the clock back.
         if timed && options.limits.movetime.is_none() {
             options.limits.movetime = Some(Limits::default().movetime.unwrap());
+        }
+        match (level, searched) {
+            (Some(_), true) => {
+                return Err("--level cannot be combined with --time or --depth".to_string())
+            }
+            (Some(level), false) => options.limits = level.limits(),
+            (None, false) => {
+                options.limits = Level::named(&preferences.engine_level)
+                    .unwrap_or(Level::Casual)
+                    .limits()
+            }
+            (None, true) => {}
         }
         if options.online.is_some()
             && !(options.server_url.starts_with("ws://")

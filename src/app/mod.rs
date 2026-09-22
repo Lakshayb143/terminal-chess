@@ -14,6 +14,7 @@ pub(crate) mod parse;
 pub(crate) mod prompt;
 pub(crate) mod saves;
 pub(crate) mod screen;
+pub(crate) mod settings;
 
 #[cfg(test)]
 mod tests;

@@ -119,6 +119,10 @@ impl Palette {
     }
 }
 
+/// The keyboard cursor's frame. Squares are mid-toned so that both near-white
+/// and near-black pieces read on them, which makes near-black readable too.
+const CURSOR: Rgb = hex(0x101418);
+
 /// Squares are deliberately mid-toned: white pieces are drawn in white and
 /// black pieces in near-black, and both have to stay legible on either colour.
 pub const THEMES: [(&str, Palette); 4] = [
@@ -1338,6 +1342,7 @@ impl Theme {
             // Brackets, parentheses and stars are all one column wide, so a
             // plain board can mark squares without any of it sliding sideways.
             let (open, close) = match mark {
+                _ if view.cursor == Some(s) => ('{', '}'),
                 Some(Mark::Check) => ('[', ']'),
                 Some(Mark::Invalid) => ('!', '!'),
                 Some(Mark::Selected) => ('<', '>'),
@@ -1353,6 +1358,11 @@ impl Theme {
         let d = self.depth;
         let bg = p.square(light, mark, d);
         let middle = m.cell_h / 2;
+        if view.cursor == Some(s) {
+            if let Some(frame) = self.cursor_row(view, s, m, row, bg) {
+                return frame;
+            }
+        }
 
         match piece {
             Some(piece) => {
@@ -1388,6 +1398,59 @@ impl Theme {
             ),
             None => format!("\x1b[{}m{}\x1b[0m", d.bg(bg), " ".repeat(m.cell_w)),
         }
+    }
+
+    /// A row of the square under the keyboard cursor, where the cursor takes
+    /// it over: a bar across the top and bottom rows of a big square, and
+    /// brackets either side of the piece on a small one. `None` for a row the
+    /// ordinary drawing keeps.
+    fn cursor_row(
+        &self,
+        view: &BoardView,
+        s: Square,
+        m: Metrics,
+        row: usize,
+        bg: Rgb,
+    ) -> Option<String> {
+        let d = self.depth;
+        let middle = m.cell_h / 2;
+        let bars = m.cell_h >= 3 && !self.ascii;
+        if bars && (row == 0 || row + 1 == m.cell_h) {
+            let bar = if row == 0 { "\u{2580}" } else { "\u{2584}" };
+            return Some(format!(
+                "\x1b[{};{}m{}\x1b[0m",
+                d.bg(bg),
+                d.fg(CURSOR),
+                bar.repeat(m.cell_w)
+            ));
+        }
+        if bars || row != middle {
+            return None;
+        }
+        // The piece or dot the square would show, with the outer columns
+        // turned into brackets.
+        let inner = match (view.pos.at(s), view.mark(s).1) {
+            (Some(piece), _) => self.glyph(piece).to_string(),
+            (None, Some(Mark::Capture | Mark::Invalid)) => "×".to_string(),
+            (None, Some(Mark::Target)) => "\u{2022}".to_string(),
+            (None, _) => String::new(),
+        };
+        let inner = center(&inner, m.cell_w.saturating_sub(2));
+        let fg = match view.pos.at(s).map(|piece| piece.color) {
+            Some(Color::White) => format!("{};1", d.fg(self.palette.white_piece)),
+            Some(Color::Black) => d.fg(self.palette.black_piece),
+            None => d.fg(CURSOR),
+        };
+        Some(format!(
+            "\x1b[{};1;{}m[\x1b[0;{};{}m{}\x1b[{};1;{}m]\x1b[0m",
+            d.bg(bg),
+            d.fg(CURSOR),
+            d.bg(bg),
+            fg,
+            inner,
+            d.bg(bg),
+            d.fg(CURSOR),
+        ))
     }
 
     /// Compose the board at a protocol-independent pixel resolution. Terminal
@@ -1473,6 +1536,24 @@ impl Theme {
                             if dx * dx + dy * dy <= radius * radius {
                                 let destination = ((origin_y + y) * board_w + origin_x + x) * 4;
                                 pixels[destination..destination + 3].copy_from_slice(&marker);
+                            }
+                        }
+                    }
+                }
+
+                // The keyboard cursor: a heavy frame at the square's edge,
+                // outside the capture frame so both can show at once.
+                if view.cursor == Some(square) {
+                    let thickness = (tile / 16).max(3);
+                    for y in 0..tile_h {
+                        for x in 0..tile_w {
+                            let edge = x < thickness
+                                || x >= tile_w - thickness
+                                || y < thickness
+                                || y >= tile_h - thickness;
+                            if edge {
+                                let destination = ((origin_y + y) * board_w + origin_x + x) * 4;
+                                pixels[destination..destination + 3].copy_from_slice(&CURSOR);
                             }
                         }
                     }
@@ -1569,6 +1650,9 @@ pub struct BoardView<'a> {
     pub invalid: Option<Square>,
     /// A temporary, chess-client-style promotion menu drawn over one file.
     pub promotions: &'a [PromotionOption],
+    /// The square the keyboard cursor is on. It is drawn as a frame rather
+    /// than a colour, so it shows whatever else the square is marked for.
+    pub cursor: Option<Square>,
 }
 
 impl BoardView<'_> {
@@ -1622,7 +1706,9 @@ impl Fullscreen {
     pub fn enter(theme: &Theme) -> Fullscreen {
         let active = theme.live && theme.color;
         if active {
-            print!("\x1b[?1049h\x1b[2J\x1b[H");
+            // Keep the window's title on the terminal's title stack, since
+            // the game sets its own; terminals without one ignore this.
+            print!("\x1b[22;0t\x1b[?1049h\x1b[2J\x1b[H");
             let _ = io::stdout().flush();
         }
         Fullscreen { active }
@@ -1632,7 +1718,7 @@ impl Fullscreen {
 impl Drop for Fullscreen {
     fn drop(&mut self) {
         if self.active {
-            print!("\x1b[?25h\x1b[?1049l");
+            print!("\x1b[?25h\x1b[?1049l\x1b[23;0t");
             let _ = io::stdout().flush();
         }
     }
@@ -1756,6 +1842,7 @@ mod tests {
             captures: &[],
             invalid: None,
             promotions: &[],
+            cursor: None,
         };
 
         let board = theme.board_image(&view).to_rgba8();
@@ -1820,11 +1907,71 @@ mod tests {
             captures: &[d5],
             invalid: None,
             promotions: &[],
+            cursor: None,
         };
         assert_eq!(view.mark(e4).1, Some(Mark::Selected));
         assert_eq!(view.mark(d5).1, Some(Mark::Capture));
         assert_eq!(view.mark(board::sq(4, 1)).1, Some(Mark::Last));
         assert_eq!(view.mark(board::sq(0, 0)), (false, None));
+    }
+
+    #[test]
+    fn the_cursor_is_drawn_as_a_shape_at_every_size() {
+        let position = Position::startpos();
+        let e2 = board::sq(4, 1);
+        let view = BoardView {
+            pos: &position,
+            flipped: false,
+            last: None,
+            check: None,
+            selected: None,
+            targets: &[],
+            captures: &[],
+            invalid: None,
+            promotions: &[],
+            cursor: Some(e2),
+        };
+        let plain = |line: &str| {
+            let mut out = String::new();
+            let mut escape = false;
+            for c in line.chars() {
+                match (escape, c) {
+                    (_, '\x1b') => escape = true,
+                    (true, 'm') => escape = false,
+                    (true, _) => {}
+                    (false, c) => out.push(c),
+                }
+            }
+            out
+        };
+        // Small squares: brackets round the pawn, and still three columns.
+        let theme = Theme::new(true, false, false, THEMES[0].1);
+        let small = theme.board_lines(&view, Metrics::COMPACT);
+        let rank2 = plain(&small[7]);
+        assert!(rank2.contains("[\u{2659}]"), "{rank2}");
+        assert_eq!(width(&small[7]), width(&small[6]));
+
+        // Big squares: bars over and under, the piece left alone.
+        let big = Metrics {
+            cell_w: 8,
+            cell_h: 4,
+            art: false,
+        };
+        let lines = theme.board_lines(&view, big);
+        let top = 1 + 6 * 4;
+        assert!(plain(&lines[top]).contains(&"\u{2580}".repeat(8)));
+        assert!(plain(&lines[top + 3]).contains(&"\u{2584}".repeat(8)));
+        assert!(plain(&lines[top + 2]).contains('\u{2659}'));
+        assert_eq!(width(&lines[top]), width(&lines[top + 1]));
+
+        // Without colour: braces, which no other mark uses.
+        let mono = Theme::new(false, false, false, THEMES[0].1);
+        assert!(mono.board_lines(&view, Metrics::COMPACT)[7].contains("{\u{2659}}"));
+
+        // A picture gets a frame in the cursor's colour at the square's edge.
+        let image = theme.board_image(&view).to_rgba8();
+        let (x, y) = (4 * 96 + 1, 6 * 96 + 48);
+        assert_eq!(&image.get_pixel(x, y).0[..3], &CURSOR);
     }
 
     #[test]
